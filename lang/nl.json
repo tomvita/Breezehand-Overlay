@@ -18,6 +18,8 @@
     "OVERLAYS": "Overlays",
     "OVERLAYS_ABBR": "Overlays",
     "OVERLAY": "Overlay",
+    "CHEATS": "Cheats",
+    "NOTES": "Notities",
     "HIDDEN_OVERLAYS": "Verborgen overlays",
     "PACKAGES": "Pakketten",
     "PACKAGE": "Pakket",

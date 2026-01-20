@@ -30,7 +30,10 @@
 #include <ultra.hpp>
 #include <tesla.hpp>
 #include <utils.hpp>
+#include <dmntcht.h>
 #include <set>
+#include <iomanip>
+#include <sstream>
 
 
 using namespace ult;
@@ -6641,6 +6644,8 @@ private:
     bool useDefaultMenu = false;
     bool useOverlayLaunchArgs = false;
     std::string hiddenMenuMode, dropdownSection;
+    u8 m_cheatFontSize = 21;
+    tsl::elm::List *cheatList = nullptr;
     //bool initializingSpawn = false;
     //std::string defaultLang = "en";
 
@@ -6653,6 +6658,7 @@ public:
      */
     MainMenu(const std::string& hiddenMenuMode = "", const std::string& sectionName = "") : hiddenMenuMode(hiddenMenuMode), dropdownSection(sectionName) {
         std::lock_guard<std::mutex> lock(transitionMutex);
+        dmntchtInitialize();
         //tsl::gfx::FontManager::clearCache();
         {
             //std::lock_guard<std::mutex> lock(jumpItemMutex);
@@ -6672,6 +6678,7 @@ public:
      */
     ~MainMenu() {
         std::lock_guard<std::mutex> lock(transitionMutex);
+        dmntchtExit();
     }
     
     /**
@@ -6743,12 +6750,12 @@ public:
         bool noClickableItems = false;
         
         if (menuMode == OVERLAYS_STR) {
-            createOverlaysMenu(list);
+            createCheatsMenu(list);
         } else if (menuMode == PACKAGES_STR) {
             noClickableItems = createPackagesMenu(list);
         }
     
-        auto* rootFrame = new tsl::elm::OverlayFrame(CAPITAL_ULTRAHAND_PROJECT_NAME, versionLabel, noClickableItems, menuMode+hiddenMenuMode+dropdownSection, "", "", "");
+        auto* rootFrame = new tsl::elm::OverlayFrame(CAPITAL_ULTRAHAND_PROJECT_NAME, versionLabel, noClickableItems, (menuMode == OVERLAYS_STR ? "\uE0E3 Notes" : ""), "", "", "");
         
         list->jumpToItem(jumpItemName, jumpItemValue, jumpItemExactMatch.load(acquire));
         //if (g_overlayFilename != "ovlmenu.ovl") {
@@ -6763,136 +6770,72 @@ public:
     }
     
         
-    void createOverlaysMenu(tsl::elm::List* list) {
+    void createCheatsMenu(tsl::elm::List* list) {
         inOverlaysPage.store(true, std::memory_order_release);
         inPackagesPage.store(false, std::memory_order_release);
     
-        addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? OVERLAYS : HIDDEN_OVERLAYS)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+FAVORITE);
+        addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " + ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " + FAVORITE);
         
-        std::vector<std::string> overlayFiles = getFilesListByWildcards(OVERLAY_PATH+"*.ovl");
-        
-        #if !USING_FSTREAM_DIRECTIVE
-        if (!isFile(OVERLAYS_INI_FILEPATH)) {
-            FILE* createFile = fopen(OVERLAYS_INI_FILEPATH.c_str(), "w");
-            if (createFile) fclose(createFile);
+        bool hasCheatProcess = false;
+        dmntchtHasCheatProcess(&hasCheatProcess);
+        if (!hasCheatProcess) {
+            dmntchtForceOpenCheatProcess();
+            dmntchtHasCheatProcess(&hasCheatProcess);
         }
-        #else
-        if (!isFile(OVERLAYS_INI_FILEPATH)) {
-            std::ofstream createFile(OVERLAYS_INI_FILEPATH);
-            createFile.close();
-        }
-        #endif
-    
-        if (overlayFiles.empty()) return;
-    
-        std::set<std::string> overlaySet;
-        bool drawHiddenTab = false;
-        
-        // Scope to immediately free INI data after processing
-        {
-            auto overlaysIniData = getParsedDataFromIniFile(OVERLAYS_INI_FILEPATH);
-            bool overlaysNeedsUpdate = false;
-            bool foundOvlmenu = false;
-    
-            // Filter in one pass, remove ovlmenu and dot files
-            overlayFiles.erase(
-                std::remove_if(overlayFiles.begin(), overlayFiles.end(),
-                    [&foundOvlmenu](const std::string& file) {
-                        const std::string fileName = getNameFromPath(file);
-                        if (!foundOvlmenu && fileName == "ovlmenu.ovl") {
-                            foundOvlmenu = true;
-                            return true;
-                        }
-                        return fileName.front() == '.';
-                    }),
-                overlayFiles.end()
-            );
-    
-            // Pre-allocate string buffers to avoid repeated allocations
-            std::string overlayFileName, overlayEntryKey;
-            overlayFileName.reserve(64);
-            overlayEntryKey.reserve(256);
-    
-            for (auto& overlayFile : overlayFiles) {
-                overlayFileName = getNameFromPath(overlayFile);
-                overlayFile.clear(); // Free memory immediately
-                
-                auto it = overlaysIniData.find(overlayFileName);
-                if (it == overlaysIniData.end()) {
-                    const auto& [result, overlayName, overlayVersion, usingLibUltrahand, supportsAMS110] = getOverlayInfo(OVERLAY_PATH + overlayFileName);
-                    if (result != ResultSuccess) continue;
-    
-                    auto& overlaySection = overlaysIniData[overlayFileName];
-                    overlaySection[PRIORITY_STR] = "20";
-                    overlaySection[STAR_STR] = FALSE_STR;
-                    overlaySection[HIDE_STR] = FALSE_STR;
-                    overlaySection[USE_LAUNCH_ARGS_STR] = FALSE_STR;
-                    overlaySection[LAUNCH_ARGS_STR] = "";
-                    overlaySection["custom_name"] = "";
-                    overlaySection["custom_version"] = "";
-                    overlaysNeedsUpdate = true;
-    
-                    // Build entry key with single allocation
-                    //overlayEntryKey.clear();
-                    //overlayEntryKey.reserve(4 + overlayName.size() + 1 + overlayName.size() + 1 + 
-                    //                       overlayVersion.size() + 1 + overlayFileName.size() + 8);
 
-                    overlayEntryKey = "0020" + overlayName + ':' + overlayName + ':' + 
-                                      overlayVersion + ':' + overlayFileName + ':' + 
-                                      (usingLibUltrahand ? '1' : '0') + ':' + 
-                                      (supportsAMS110 ? '1' : '0') + ":0";
-                    overlaySet.emplace(std::move(overlayEntryKey));
-                } else {
-                    const std::string& hide = getValueOrDefault(it->second, HIDE_STR, FALSE_STR);
-                    const bool isHidden = (hide == TRUE_STR);
+        if (!hasCheatProcess) {
+            list->addItem(new tsl::elm::ListItem("No game running"));
+            return;
+        }
+
+        u64 cheatCount = 0;
+        this->cheatList = list; // Store the list pointer
+
+        // Get process metadata to retrieve Title ID
+        DmntCheatProcessMetadata metadata;
+        std::string notesPath;
+        if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+            std::stringstream ss;
+            ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+            notesPath = ss.str();
+        }
+        auto notesData = getParsedDataFromIniFile(notesPath);
+
+        if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+            std::vector<DmntCheatEntry> cheats(cheatCount);
+            if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                for (const auto& cheat : cheats) {
+                    // Use mini items with left box (Zing style) and auto-scrolling
+                    auto* item = new tsl::elm::ToggleListItem(cheat.definition.readable_name, cheat.enabled, "", "", true);
+                    item->setUseLeftBox(true);
                     
-                    if (isHidden) {
-                        if (!hideUnsupported || !requiresLNY2 || 
-                            usingLNY2(OVERLAY_PATH + overlayFileName) || 
-                            getValueOrDefault(it->second, "force_support", FALSE_STR) == TRUE_STR) {
-                            drawHiddenTab = true;
+                    auto it = notesData.find(cheat.definition.readable_name);
+                    if (it != notesData.end()) {
+                        auto noteIt = it->second.find("note");
+                        if (noteIt != it->second.end()) {
+                            item->setNote(noteIt->second);
                         }
                     }
                     
-                    if (inHiddenMode.load(std::memory_order_acquire) == isHidden) {
-                        const auto& [result, overlayName, overlayVersion, usingLibUltrahand, supportsAMS110] = getOverlayInfo(OVERLAY_PATH + overlayFileName);
-                        if (result != ResultSuccess) continue;
-                        
-                        const std::string& priority = (it->second.find(PRIORITY_STR) != it->second.end()) ? formatPriorityString(it->second[PRIORITY_STR]) : "0020";
-                        const std::string& starred = getValueOrDefault(it->second, STAR_STR, FALSE_STR);
-                        const std::string& customName = getValueOrDefault(it->second, "custom_name", "");
-                        const std::string& customVersion = getValueOrDefault(it->second, "custom_version", "");
-                        
-                        const std::string& assignedName = !customName.empty() ? customName : overlayName;
-                        const std::string& assignedVersion = !customVersion.empty() ? customVersion : overlayVersion;
-                        const bool forceAMS110Support = getValueOrDefault(it->second, "force_support", FALSE_STR) == TRUE_STR;
-    
-                        // Build entry key with single allocation
-                        //overlayEntryKey.clear();
-                        //const bool isStarred = (starred == TRUE_STR);
-                        //const size_t estimatedSize = (isStarred ? 3 : 0) + priority.size() + 
-                        //                            assignedName.size() * 2 + assignedVersion.size() + 
-                        //                            overlayFileName.size() + 10;
-                        //overlayEntryKey.reserve(estimatedSize);
-                        
-                        overlayEntryKey = (starred == TRUE_STR ? "-1:" : "") + priority + assignedName + ':' + 
-                                          assignedName + ':' + assignedVersion + ':' + overlayFileName + ':' + 
-                                          (usingLibUltrahand ? '1' : '0') + ':' + 
-                                          (supportsAMS110 ? '1' : '0') + ':' + 
-                                          (forceAMS110Support ? '1' : '0');
-                        overlaySet.emplace(std::move(overlayEntryKey));
-                    }
+                    // Use the managed cheat font size
+                    item->setFontSize(m_cheatFontSize);
+
+                    item->setClickListener([cheat](bool state) {
+                        dmntchtToggleCheat(cheat.cheat_id);
+                        return true;
+                    });
+                    list->addItem(item);
                 }
+            } else {
+                list->addItem(new tsl::elm::ListItem("Failed to retrieve cheats"));
             }
-            
-            if (overlaysNeedsUpdate) {
-                saveIniFileData(OVERLAYS_INI_FILEPATH, overlaysIniData);
-            }
-        } // overlaysIniData freed here
-        
-        overlayFiles.clear();
-        overlayFiles.shrink_to_fit();
-        
+        } else {
+            list->addItem(new tsl::elm::ListItem("No cheats found"));
+        }
+    }
+
+    /* LEGACY OVERLAY CODE - DISABLED
+    void legacyCreateOverlaysMenu(tsl::elm::List* list) {
         if (overlaySet.empty()) {
             addSelectionIsEmptyDrawer(list);
         } else {
@@ -6922,145 +6865,10 @@ public:
             };
 
 
-            // Process overlay set and add to list
-            for (const auto& taintedOverlayFileName : overlaySet) {
-                overlayFileName.clear();
-                overlayName.clear();
-                overlayVersion.clear();
-                const bool overlayStarred = (taintedOverlayFileName.compare(0, 3, "-1:") == 0);
-                bool usingLibUltrahand = false;
-                bool supportsAMS110 = false;
-                bool forceAMS110Support = false;
-                
-                // Parse from the end - optimized with fewer branches
-                const size_t len = taintedOverlayFileName.size();
-                size_t pos = len;
-                size_t positions[6];
-                size_t count = 0;
-                
-                // Unrolled loop for better performance on ARMv8-A
-                while (pos > 0 && count < 6) {
-                    pos = taintedOverlayFileName.rfind(':', pos - 1);
-                    if (pos == std::string::npos) break;
-                    positions[count++] = pos;
-                }
-                
-                if (count == 6) {
-                    // Direct character access instead of substr for single chars
-                    forceAMS110Support = (taintedOverlayFileName[positions[0] + 1] == '1');
-                    supportsAMS110 = (taintedOverlayFileName[positions[1] + 1] == '1');
-                    usingLibUltrahand = (taintedOverlayFileName[positions[2] + 1] == '1');
-                    overlayFileName.assign(taintedOverlayFileName, positions[3] + 1, positions[2] - positions[3] - 1);
-                    overlayVersion.assign(taintedOverlayFileName, positions[4] + 1, positions[3] - positions[4] - 1);
-                    overlayName.assign(taintedOverlayFileName, positions[5] + 1, positions[4] - positions[5] - 1);
-                }
-    
-                const bool requiresAMS110Handling = (requiresLNY2 && !supportsAMS110 && !forceAMS110Support);
-                if (hideUnsupported && requiresAMS110Handling)
-                    continue;
-    
-                const std::string overlayFile = OVERLAY_PATH + overlayFileName;
-                if (!isFile(overlayFile)) continue;
-                
-                // Build newOverlayName with single allocation
-                newOverlayName.clear();
-                if (overlayStarred) {
-                    newOverlayName.reserve(STAR_SYMBOL.size() + 2 + overlayName.size() + 1 + overlayFileName.size());
-                    newOverlayName = STAR_SYMBOL;
-                    newOverlayName += "  ";
-                    newOverlayName += overlayName;
-                } else {
-                    newOverlayName = overlayName;
-                }
-                newOverlayName += '?';
-                newOverlayName += overlayFileName;
-                
-                const bool newStarred = !overlayStarred;
-                
-                tsl::elm::ListItem* listItem = new tsl::elm::ListItem(newOverlayName, "");
-                listItem->enableShortHoldKey();
-                listItem->enableLongHoldKey();
-                
-                if (!hideOverlayVersions) {
-                    displayVersion = getFirstLongEntry(overlayVersion);
-                    if (cleanVersionLabels) displayVersion = cleanVersionLabel(displayVersion);
-                    listItem->setValue(displayVersion, true);
-                    listItem->setValueColor(usingLibUltrahand ? (useLibultrahandVersions ? tsl::ultOverlayVersionTextColor : tsl::overlayVersionTextColor) : tsl::overlayVersionTextColor);
-                }
-                listItem->setTextColor(requiresAMS110Handling ? tsl::warningTextColor : usingLibUltrahand ? (useLibultrahandTitles ? tsl::ultOverlayTextColor : tsl::overlayTextColor) : tsl::overlayTextColor);
-                
-                if (overlayFileName == lastOverlayFilename) {
-                    lastOverlayFilename = "";
-                    jumpItemName = newOverlayName;
-                    jumpItemValue = hideOverlayVersions ? "" : displayVersion;
-                    jumpItemExactMatch.store(true, std::memory_order_release);
-                }
-                                
-                listItem->setClickListener([listItem, overlayFile, newStarred, overlayFileName, overlayName, overlayVersion, requiresAMS110Handling, supportsAMS110, buildOverlayReturnName](s64 keys) {
-                    if (runningInterpreter.load(std::memory_order_acquire)) return false;
-                    
-                    if (simulatedMenu.load(std::memory_order_acquire)) {
-                        keys |= SYSTEM_SETTINGS_KEY;
-                    }
-                    
-                    // Check for single key press (no other keys)
-                    const s64 cleanKeys = keys & ALL_KEYS_MASK;
-                    
-                    if ((keys & KEY_A && cleanKeys == KEY_A)) {
-                        if (!requiresAMS110Handling) {
-                            disableSound.store(true, std::memory_order_release);
-                            
-                            std::string useOverlayLaunchArgs, overlayLaunchArgs;
-                            {
-                                auto overlaysIniData = getParsedDataFromIniFile(OVERLAYS_INI_FILEPATH);
-                                auto sectionIt = overlaysIniData.find(overlayFileName);
-                                if (sectionIt != overlaysIniData.end()) {
-                                    auto useArgsIt = sectionIt->second.find(USE_LAUNCH_ARGS_STR);
-                                    if (useArgsIt != sectionIt->second.end()) useOverlayLaunchArgs = useArgsIt->second;
-                                    auto argsIt = sectionIt->second.find(LAUNCH_ARGS_STR);
-                                    if (argsIt != sectionIt->second.end()) overlayLaunchArgs = argsIt->second;
-                                }
-                                removeQuotes(overlayLaunchArgs);
-                            }
-                            
-                            {
-                                auto iniData = getParsedDataFromIniFile(ULTRAHAND_CONFIG_INI_PATH);
-                                auto& ultrahandSection = iniData[ULTRAHAND_PROJECT_NAME];
-                                if (inHiddenMode.load(std::memory_order_acquire)) ultrahandSection[IN_HIDDEN_OVERLAY_STR] = TRUE_STR;
-                                ultrahandSection[IN_OVERLAY_STR] = TRUE_STR;
-                                saveIniFileData(ULTRAHAND_CONFIG_INI_PATH, iniData);
-                            }
-                            
-                            launchComboHasTriggered.store(true, std::memory_order_acquire);
-                            ult::launchingOverlay.store(true, std::memory_order_release);
-                            if (useOverlayLaunchArgs == TRUE_STR) tsl::setNextOverlay(overlayFile, overlayLaunchArgs);
-                            else tsl::setNextOverlay(overlayFile);
-                            
-                            tsl::Overlay::get()->close(true);
-                            return true;
-                        
-                        } else {
-                            if (tsl::notification) {
-                                tsl::notification->showNow(ult::NOTIFY_HEADER+INCOMPATIBLE_WARNING, 22);
-                            }
-                            
-                            return true;
-                        }
-                    }
-                    
-                    if (keys & STAR_KEY && cleanKeys == STAR_KEY) {
-                        if (!overlayFile.empty()) {
-                            setIniFileValue(OVERLAYS_INI_FILEPATH, overlayFileName, STAR_STR, newStarred ? TRUE_STR : FALSE_STR);
-                        }
-                        
-                        skipJumpReset.store(true, std::memory_order_release);
-                        jumpItemName = buildOverlayReturnName(!newStarred, overlayFileName, overlayName);
-                        jumpItemValue = hideOverlayVersions ? "" : overlayVersion;
-                        jumpItemExactMatch.store(true, std::memory_order_release);
 
 
                         
-                        wasInHiddenMode = inHiddenMode.load(std::memory_order_acquire);
+
                         if (wasInHiddenMode) {
                             inMainMenu.store(false, std::memory_order_release);
                             reloadMenu2 = true;
@@ -7138,6 +6946,8 @@ public:
             list->addItem(listItem);
         }
     }
+    */
+
     
     bool createPackagesMenu(tsl::elm::List* list) {
         if (!isFile(PACKAGE_PATH + PACKAGE_FILENAME)) {
@@ -7488,6 +7298,52 @@ public:
      */
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         
+        if (keysHeld & (KEY_ZL)) {
+            if (keysDown & KEY_R) {
+                m_cheatFontSize = std::min(static_cast<int>(m_cheatFontSize) + 1, 30);
+                if (cheatList && menuMode == OVERLAYS_STR) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                        // Use static_cast since we know these are ListItems and RTTI is disabled
+                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                    }
+                    cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                }
+                return true;
+            }
+            if (keysDown & KEY_L) {
+                m_cheatFontSize = std::max(static_cast<int>(m_cheatFontSize) - 1, 10);
+                if (cheatList && menuMode == OVERLAYS_STR) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                    }
+                    cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                }
+                return true;
+            }
+        }
+
+        // Y button toggles notes visibility
+        if (keysDown & KEY_Y) {
+            ult::showCheatNotes = !ult::showCheatNotes;
+            if (cheatList && menuMode == OVERLAYS_STR) {
+                struct ListProxy : public tsl::elm::List {
+                    using tsl::elm::List::m_items;
+                };
+                // Reset calculated heights to force recalculation with new note visibility
+                for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                    static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize); // This resets height
+                }
+                cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+            }
+            return true;
+        }
+
         bool isHolding = (lastCommandIsHold && runningInterpreter.load(std::memory_order_acquire));
         if (isHolding) {
             processHold(keysDown, keysHeld, holdStartTick, isHolding, [&]() {

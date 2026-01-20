@@ -18,6 +18,8 @@
     "OVERLAYS": "插件",
     "OVERLAYS_ABBR": "插件",
     "OVERLAY": "插件",
+    "CHEATS": "金手指",
+    "NOTES": "备注",
     "HIDDEN_OVERLAYS": "已隐藏插件",
     "PACKAGES": "插件包",
     "PACKAGE": "插件包",
