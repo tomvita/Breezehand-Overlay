@@ -6983,8 +6983,13 @@ public:
                     backItem->setFontSize(m_cheatFontSize);
                     backItem->setClickListener([](u64 keys) {
                         if (keys & KEY_A) {
+                            if (!g_cheatFolderNameStack.empty()) {
+                                jumpItemName = "\uE132 " + g_cheatFolderNameStack.back();
+                                jumpItemExactMatch.store(true, release);
+                                skipJumpReset.store(true, release);
+                                g_cheatFolderNameStack.pop_back();
+                            }
                             if (!g_cheatFolderIndexStack.empty()) g_cheatFolderIndexStack.pop_back();
-                            if (!g_cheatFolderNameStack.empty()) g_cheatFolderNameStack.pop_back();
                             refreshPage.store(true, std::memory_order_release);
                             return true;
                         }
@@ -7857,6 +7862,17 @@ public:
         // Common condition for back key handling
         const bool backKeyPressed = !isTouching && ((((keysDown & KEY_B)) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
         
+        if (inMainMenu.load(acquire) && menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty() && backKeyPressed) {
+            jumpItemName = "\uE132 " + g_cheatFolderNameStack.back();
+            jumpItemExactMatch.store(true, release);
+            skipJumpReset.store(true, release);
+            g_cheatFolderNameStack.pop_back();
+            g_cheatFolderIndexStack.pop_back();
+            refreshPage.store(true, release);
+            triggerExitSound.store(true, release);
+            return true;
+        }
+
         if (!dropdownSection.empty() && !returningToMain) {
             simulatedNextPage.exchange(false, std::memory_order_acq_rel);
             simulatedMenu.exchange(false, std::memory_order_acq_rel);
