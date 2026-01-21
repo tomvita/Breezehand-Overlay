@@ -8177,5 +8177,11 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
+    
+    // If launched with arguments (manual/forwarder launch), ensure we start visible
+    if (argc > 1) {
+        ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::TRUE_STR);
+    }
+
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }
