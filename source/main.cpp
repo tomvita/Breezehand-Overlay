@@ -99,6 +99,9 @@ static size_t nestedMenuCount = 0;
 
 // Command mode globals
 static const std::vector<std::string> commandSystems = {DEFAULT_STR, ERISTA_STR, MARIKO_STR};
+
+static std::vector<u32> g_cheatFolderIndexStack; // Indices of folder starts in the flat cheat list
+static std::vector<std::string> g_cheatFolderNameStack;
 static const std::vector<std::string> commandModes = {DEFAULT_STR, HOLD_STR, SLOT_STR, TOGGLE_STR, OPTION_STR, FORWARDER_STR, TEXT_STR, TABLE_STR, TRACKBAR_STR, STEP_TRACKBAR_STR, NAMED_STEP_TRACKBAR_STR};
 static const std::vector<std::string> commandGroupings = {DEFAULT_STR, "split", "split2", "split3", "split4", "split5"};
 static const std::string MODE_PATTERN = ";mode=";
@@ -6307,6 +6310,8 @@ namespace CheatUtils {
     }
 
     void ClearCheats() {
+        g_cheatFolderIndexStack.clear();
+        g_cheatFolderNameStack.clear();
         u64 count = 0;
         if (R_SUCCEEDED(dmntchtGetCheatCount(&count)) && count > 0) {
             // dmntcht doesn't have a ClearAll, so we remove one by one.
@@ -6780,7 +6785,11 @@ public:
             noClickableItems = createPackagesMenu(list);
         }
     
-        auto* rootFrame = new tsl::elm::OverlayFrame(CAPITAL_ULTRAHAND_PROJECT_NAME, versionLabel, noClickableItems, (menuMode == OVERLAYS_STR ? "\uE0E3 Notes" : ""), "", "", "");
+        std::string frameTitle = CAPITAL_ULTRAHAND_PROJECT_NAME;
+        if (menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty()) {
+            frameTitle = g_cheatFolderNameStack.back();
+        }
+        auto* rootFrame = new tsl::elm::OverlayFrame(frameTitle, versionLabel, noClickableItems, (menuMode == OVERLAYS_STR ? "\uE0E3 Notes" : ""), "", "", "");
         
         list->jumpToItem(jumpItemName, jumpItemValue, jumpItemExactMatch.load(acquire));
         //if (g_overlayFilename != "ovlmenu.ovl") {
@@ -6799,7 +6808,7 @@ public:
         inOverlaysPage.store(true, std::memory_order_release);
         inPackagesPage.store(false, std::memory_order_release);
     
-        addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " + ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " + FAVORITE);
+        addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " + ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " + ult::SETTINGS);
         
         bool hasCheatProcess = false;
         dmntchtHasCheatProcess(&hasCheatProcess);
@@ -6814,9 +6823,8 @@ public:
         }
 
         u64 cheatCount = 0;
-        this->cheatList = list; // Store the list pointer
+        this->cheatList = list;
 
-        // Get process metadata to retrieve Title ID
         DmntCheatProcessMetadata metadata;
         std::string notesPath;
         if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
@@ -6829,37 +6837,100 @@ public:
         if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
             std::vector<DmntCheatEntry> cheats(cheatCount);
             if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
-                for (const auto& cheat : cheats) {
-                    u32 key_mask = 0;
-                    if (cheat.definition.num_opcodes >= 1) {
-                         u32 firstOp = cheat.definition.opcodes[0];
-                         if ((firstOp & 0xF0000000) == 0x80000000) {
-                             key_mask = firstOp & 0x0FFFFFFF;
-                         }
-                    }
-                    std::string displayName = CheatUtils::GetComboKeyGlyphs(key_mask) + cheat.definition.readable_name;
-                    auto* item = new CheatUtils::CheatToggleItem(displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
-
-                    auto it = notesData.find(cheat.definition.readable_name);
-                    if (it != notesData.end()) {
-                        auto noteIt = it->second.find("note");
-                        if (noteIt != it->second.end()) {
-                            item->setNote(noteIt->second);
-                        }
-                    }
-
-                    item->setStateChangedListener([cheat](bool state) {
-                        dmntchtToggleCheat(cheat.cheat_id);
-                    });
-
-                    item->setClickListener([cheat](u64 keys) {
-                        if (keys & KEY_X) {
-                            tsl::changeTo<CheatMenu>(cheat.cheat_id, cheat.definition.readable_name);
+                
+                if (!g_cheatFolderNameStack.empty()) {
+                    auto* backItem = new tsl::elm::ListItem(".. [Back]");
+                    backItem->setFontSize(m_cheatFontSize);
+                    backItem->setClickListener([](u64 keys) {
+                        if (keys & KEY_A) {
+                            if (!g_cheatFolderIndexStack.empty()) g_cheatFolderIndexStack.pop_back();
+                            if (!g_cheatFolderNameStack.empty()) g_cheatFolderNameStack.pop_back();
+                            refreshPage.store(true, std::memory_order_release);
                             return true;
                         }
                         return false;
                     });
-                    list->addItem(item);
+                    list->addItem(backItem);
+                }
+
+                u32 currentDepth = 0;
+                u32 targetDepth = g_cheatFolderIndexStack.size();
+                bool inTargetFolder = (targetDepth == 0);
+                u32 targetMatchCount = 0;
+
+                for (u32 i = 0; i < cheatCount; i++) {
+                    const auto& cheat = cheats[i];
+                    u32 opcode = (cheat.definition.num_opcodes > 0) ? cheat.definition.opcodes[0] : 0;
+                    bool isFolderStart = (opcode == 0x20000000);
+                    bool isFolderEnd = (opcode == 0x20000001);
+
+                    if (isFolderStart) {
+                        if (inTargetFolder && currentDepth == targetDepth) {
+                            std::string folderName = "\uE132 " + std::string(cheat.definition.readable_name);
+                            auto* folderItem = new tsl::elm::ListItem(folderName);
+                            folderItem->setFontSize(m_cheatFontSize);
+                            u32 folderIdx = i;
+                            std::string rawName = cheat.definition.readable_name;
+                            folderItem->setClickListener([folderIdx, rawName](u64 keys) {
+                                if (keys & KEY_A) {
+                                    g_cheatFolderIndexStack.push_back(folderIdx);
+                                    g_cheatFolderNameStack.push_back(rawName);
+                                    refreshPage.store(true, std::memory_order_release);
+                                    return true;
+                                }
+                                return false;
+                            });
+                            list->addItem(folderItem);
+                        }
+                        currentDepth++;
+                        if (!inTargetFolder && currentDepth <= targetDepth) {
+                            if (i == g_cheatFolderIndexStack[currentDepth - 1]) {
+                                targetMatchCount = currentDepth;
+                                if (targetMatchCount == targetDepth) inTargetFolder = true;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (isFolderEnd) {
+                        if (currentDepth == targetDepth && inTargetFolder) inTargetFolder = false;
+                        if (currentDepth > 0) currentDepth--;
+                        if (targetMatchCount > currentDepth) {
+                            targetMatchCount = currentDepth;
+                            inTargetFolder = (targetMatchCount == targetDepth);
+                        }
+                        continue;
+                    }
+
+                    if (inTargetFolder && currentDepth == targetDepth) {
+                        u32 key_mask = 0;
+                        if (cheat.definition.num_opcodes >= 1) {
+                             u32 firstOp = cheat.definition.opcodes[0];
+                             if ((firstOp & 0xF0000000) == 0x80000000) key_mask = firstOp & 0x0FFFFFFF;
+                        }
+                        std::string displayName = CheatUtils::GetComboKeyGlyphs(key_mask) + cheat.definition.readable_name;
+                        auto* item = new CheatUtils::CheatToggleItem(displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
+
+                        auto it = notesData.find(cheat.definition.readable_name);
+                        if (it != notesData.end()) {
+                            auto noteIt = it->second.find("note");
+                            if (noteIt != it->second.end()) item->setNote(noteIt->second);
+                        }
+                        
+                        item->setStateChangedListener([cheat](bool state) {
+                            dmntchtToggleCheat(cheat.cheat_id);
+                        });
+
+                        item->setClickListener([cheat](u64 keys) {
+                            if (keys & KEY_X) {
+                                tsl::changeTo<CheatMenu>(cheat.cheat_id, cheat.definition.readable_name);
+                                return true;
+                            }
+                            return false;
+                        });
+
+                        list->addItem(item);
+                    }
                 }
             } else {
                 list->addItem(new tsl::elm::ListItem("Failed to retrieve cheats"));
@@ -7114,7 +7185,7 @@ public:
             bool firstItem = true;
             for (const auto& taintedPackageName : packageSet) {
                 if (firstItem) {
-                    addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? PACKAGES : HIDDEN_PACKAGES)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+FAVORITE);
+                    addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? PACKAGES : HIDDEN_PACKAGES)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+SETTINGS);
                     firstItem = false;
                 }
                 
