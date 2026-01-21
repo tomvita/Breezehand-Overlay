@@ -6802,6 +6802,8 @@ private:
     bool useOverlayLaunchArgs = false;
     std::string hiddenMenuMode, dropdownSection;
     u8 m_cheatFontSize = 21;
+    std::string m_notesPath = "";
+    bool m_notesLoaded = false;
     tsl::elm::List *cheatList = nullptr;
     //bool initializingSpawn = false;
     //std::string defaultLang = "en";
@@ -6959,9 +6961,18 @@ public:
         if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
             std::stringstream ss;
             ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
-            notesPath = ss.str();
+            m_notesPath = ss.str();
         }
-        auto notesData = getParsedDataFromIniFile(notesPath);
+
+        if (!m_notesLoaded && !m_notesPath.empty()) {
+            std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+            if (!fontSizeStr.empty()) {
+                m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+            }
+            m_notesLoaded = true;
+        }
+
+        auto notesData = getParsedDataFromIniFile(m_notesPath);
 
         if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
             std::vector<DmntCheatEntry> cheats(cheatCount);
@@ -7551,6 +7562,22 @@ public:
                 // Display game info before User Guide
                 DmntCheatProcessMetadata metadata;
                 if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                    this->cheatList = list;
+                    
+                    if (m_notesPath.empty()) {
+                        std::stringstream ss;
+                        ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+                        m_notesPath = ss.str();
+                    }
+
+                    if (!m_notesLoaded && !m_notesPath.empty()) {
+                        std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+                        if (!fontSizeStr.empty()) {
+                            m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+                        }
+                        m_notesLoaded = true;
+                    }
+
                     CheatUtils::EnsureMetadata();
                     std::string tidStr = CheatUtils::GetTitleIdString();
                     std::string bidStr = CheatUtils::GetBuildIdString();
@@ -7616,21 +7643,21 @@ public:
         if (keysHeld & (KEY_ZL)) {
             if (keysDown & KEY_R) {
                 m_cheatFontSize = std::min(static_cast<int>(m_cheatFontSize) + 1, 30);
-                if (cheatList && menuMode == OVERLAYS_STR) {
+                if (cheatList) {
                     struct ListProxy : public tsl::elm::List {
                         using tsl::elm::List::m_items;
                     };
                     for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
-                        // Use static_cast since we know these are ListItems and RTTI is disabled
                         static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
                     }
                     cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                    if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
                 }
                 return true;
             }
             if (keysDown & KEY_L) {
                 m_cheatFontSize = std::max(static_cast<int>(m_cheatFontSize) - 1, 10);
-                if (cheatList && menuMode == OVERLAYS_STR) {
+                if (cheatList) {
                     struct ListProxy : public tsl::elm::List {
                         using tsl::elm::List::m_items;
                     };
@@ -7638,6 +7665,7 @@ public:
                         static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
                     }
                     cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                    if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
                 }
                 return true;
             }
