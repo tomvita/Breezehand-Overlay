@@ -1747,22 +1747,21 @@ void addHelpInfo(tsl::elm::List* list) {
     std::vector<std::string> sectionLines = {
         SETTINGS_MENU,
         SCRIPT_OVERLAY,
-        STAR_FAVORITE,
-        APP_SETTINGS
+        SETTINGS,
+        NOTES
     };
 
     std::vector<std::string> infoLines = {
         "\uE0B5 (" + ON_MAIN_MENU + ")",
         "\uE0B6 (" + ON_A_COMMAND + ")",
-        "\uE0E2 (" + ON_OVERLAY_PACKAGE + ")",
-        "\uE0E3 (" + ON_OVERLAY_PACKAGE + ")"
+        "\uE0E2 (" + ON_OVERLAY + ")",
+        "\uE0E3 (" + ON_OVERLAY + ")"
     };
 
     std::vector<std::vector<std::string>> dummyTableData;
 
     // Draw the table with the defined lines
     drawTable(list, dummyTableData, sectionLines, infoLines, xOffset, 20, 9, 4);
-    //drawTable(list, sectionLines, infoLines, xOffset, 19, 12, 4, DEFAULT_STR, DEFAULT_STR, LEFT_STR, false, false, true, "none", false);
 }
 
 

@@ -6448,23 +6448,131 @@ namespace CheatUtils {
                 }
             } else if (!currentCheat.empty()) {
                 bool enabled = (line.find("true") != std::string::npos || line.find("on") != std::string::npos || line.find("1") != std::string::npos);
+                
                 u64 cheatCount = 0;
-                dmntchtGetCheatCount(&cheatCount);
-                if (cheatCount > 0) {
-                     std::vector<DmntCheatEntry> cheats(cheatCount);
-                     dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount);
-                     for (auto& cheat : cheats) {
-                         if (std::string(cheat.definition.readable_name) == currentCheat) {
-                             if (cheat.enabled != enabled) {
-                                 dmntchtToggleCheat(cheat.cheat_id);
-                             }
-                             break;
-                         }
-                     }
+                if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+                    std::vector<DmntCheatEntry> cheats(cheatCount);
+                    if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                        for (const auto& cheat : cheats) {
+                            if (currentCheat == cheat.definition.readable_name) {
+                                if (cheat.enabled != enabled) {
+                                    dmntchtToggleCheat(cheat.cheat_id);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
-                currentCheat.clear();
             }
         }
+    }
+
+    bool TryDownloadCheats(bool notify = true) {
+        EnsureMetadata();
+        std::string tid = GetTitleIdString();
+        std::string bid = GetBuildIdString();
+        std::string bid_low = ult::stringToLowercase(bid);
+
+        std::string title = tid;
+        std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tid + "/title.txt";
+        if (ult::isFile(titleFilePath)) {
+            std::ifstream tfile(titleFilePath);
+            if (std::getline(tfile, title)) ult::trim(title);
+        }
+        
+        std::string configPath = "sdmc:/config/ultrahand/cheat_url.txt";
+        if (!ult::isFile(configPath)) {
+            configPath = "sdmc:/config/ultrahand/cheat_url_txt";
+        }
+        
+        if (!ult::isFile(configPath)) {
+            if (notify) tsl::notification->show("Config not found\ncheat_url.txt");
+            return false;
+        }
+        
+        std::vector<std::string> urls;
+        std::ifstream file(configPath);
+        std::string line;
+        while (std::getline(file, line)) {
+            ult::trim(line);
+            if (!line.empty()) urls.push_back(line);
+        }
+        
+        if (urls.empty()) {
+            if (notify) tsl::notification->show("URL list is empty");
+            return false;
+        }
+
+        if (g_cheatDownloadIndex >= (int)urls.size()) {
+            if (notify) tsl::notification->show("End of URL list\n(NotFound)");
+            return false;
+        }
+        
+        std::string targetDir = "sdmc:/switch/breeze/cheats/" + tid + "/";
+        ult::createDirectory(targetDir);
+        std::string dest = targetDir + bid + ".txt";
+        
+        static constexpr SocketInitConfig socketInitConfig = {
+            .tcp_tx_buf_size     = 16 * 1024,
+            .tcp_rx_buf_size     = 16 * 1024*2,
+            .tcp_tx_buf_max_size = 64 * 1024,
+            .tcp_rx_buf_max_size = 64 * 1024*2,
+            .udp_tx_buf_size     = 512,
+            .udp_rx_buf_size     = 512,
+            .sb_efficiency       = 1,
+            .bsd_service_type    = BsdServiceType_Auto
+        };
+        bool socketInitialized = R_SUCCEEDED(socketInitialize(&socketInitConfig));
+
+        for (size_t i = g_cheatDownloadIndex; i < urls.size(); i++) {
+            std::string rawUrl = urls[i];
+            rawUrl = ReplaceAll(rawUrl, "{TID}", tid);
+            rawUrl = ReplaceAll(rawUrl, "{BID}", bid);
+            rawUrl = ReplaceAll(rawUrl, "{bid}", bid_low);
+            rawUrl = ReplaceAll(rawUrl, "{bid_lowercase}", bid_low);
+            rawUrl = ReplaceAll(rawUrl, "{TITLE}", title);
+
+            bool found = false;
+            for (int v = 15; v >= 1; v--) {
+                std::string vUrl = rawUrl;
+                size_t lastDot = vUrl.find_last_of('.');
+                if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
+                    vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
+                } else {
+                    continue;
+                }
+
+                LogDownload(vUrl);
+                if (ult::downloadFile(vUrl, dest, true, true)) {
+                     found = true;
+                     break;
+                }
+            }
+            
+            if (!found) {
+                LogDownload(rawUrl);
+                if (ult::downloadFile(rawUrl, dest, true, true)) {
+                    found = true;
+                }
+            }
+            
+            if (found) {
+                if (socketInitialized) socketExit();
+                g_cheatDownloadIndex = i + 1;
+                if (CheatUtils::ParseCheats(dest)) {
+                    if (notify) tsl::notification->show("Downloaded & Loaded!");
+                    return true;
+                } else {
+                    if (notify) tsl::notification->show("Downloaded but empty");
+                    return false;
+                }
+            }
+        }
+        
+        if (socketInitialized) socketExit();
+        g_cheatDownloadIndex = urls.size();
+        if (notify) tsl::notification->show("No cheats found\nat current sources");
+        return false;
     }
 
     void AddComboKeyToCheat(u32 cheat_id, u32 key_mask) {
@@ -6810,7 +6918,7 @@ public:
         if (menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty()) {
             frameTitle = g_cheatFolderNameStack.back();
         }
-        auto* rootFrame = new tsl::elm::OverlayFrame(frameTitle, versionLabel, noClickableItems, (menuMode == OVERLAYS_STR ? "\uE0E3 Notes" : ""), "", "", "");
+        auto* rootFrame = new tsl::elm::OverlayFrame(frameTitle, versionLabel, noClickableItems, menuMode, "", "", "");
         
         list->jumpToItem(jumpItemName, jumpItemValue, jumpItemExactMatch.load(acquire));
         //if (g_overlayFilename != "ovlmenu.ovl") {
@@ -6957,6 +7065,33 @@ public:
                 list->addItem(new tsl::elm::ListItem("Failed to retrieve cheats"));
             }
         } else {
+            // Auto-load Logic
+            static u64 lastAutoLoadTid = 0;
+            static u64 lastAutoLoadBid = 0;
+            bool alreadyTried = (lastAutoLoadTid == metadata.title_id && lastAutoLoadBid == *((u64*)metadata.main_nso_build_id));
+
+            if (!alreadyTried) {
+                lastAutoLoadTid = metadata.title_id;
+                lastAutoLoadBid = *((u64*)metadata.main_nso_build_id);
+
+                std::string tidStr = CheatUtils::GetTitleIdString();
+                std::string bidStr = CheatUtils::GetBuildIdString();
+                std::string localPath = "sdmc:/switch/breeze/cheats/" + tidStr + "/" + bidStr + ".txt";
+
+                if (ult::isFile(localPath)) {
+                    if (CheatUtils::ParseCheats(localPath)) {
+                        refreshPage.store(true, std::memory_order_release);
+                        return;
+                    }
+                }
+
+                // Fallback to Download
+                if (CheatUtils::TryDownloadCheats(false)) { // false = quiet mode
+                    refreshPage.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+
             list->addItem(new tsl::elm::ListItem("No cheats found"));
         }
     }
@@ -7404,7 +7539,49 @@ public:
             noClickableItems = drawCommandsMenu(list, packageIniPath, packageConfigIniPath, packageHeader, "", pageLeftName, pageRightName,
                 PACKAGE_PATH, LEFT_STR, "package.ini", this->dropdownSection, 0, pathPattern, pathPatternOn, pathPatternOff, usingPages, false);
     
-            if (!hideUserGuide && dropdownSection.empty()) addHelpInfo(list);
+            if (!hideUserGuide && dropdownSection.empty()) {
+                // Display game info before User Guide
+                DmntCheatProcessMetadata metadata;
+                if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                    CheatUtils::EnsureMetadata();
+                    std::string tidStr = CheatUtils::GetTitleIdString();
+                    std::string bidStr = CheatUtils::GetBuildIdString();
+                    
+                    std::string titleStr = "";
+                    std::string versionStr = "";
+                    static NsApplicationControlData appControlData;
+                    size_t appControlDataSize = 0;
+                    NacpLanguageEntry *languageEntry = nullptr;
+                    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData, sizeof(NsApplicationControlData), &appControlDataSize))) {
+                        if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp, &languageEntry)) && languageEntry) {
+                            titleStr = languageEntry->name;
+                        }
+                        versionStr = appControlData.nacp.display_version;
+                    }
+
+                    if (titleStr.empty()) {
+                        titleStr = tidStr;
+                        std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
+                        if (ult::isFile(titleFilePath)) {
+                            std::ifstream tfile(titleFilePath);
+                            if (std::getline(tfile, titleStr)) ult::trim(titleStr);
+                        }
+                    }
+                    
+                    auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+                    titleItem->setFontSize(m_cheatFontSize);
+                    list->addItem(titleItem);
+
+                    auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+                    tidItem->setFontSize(m_cheatFontSize);
+                    list->addItem(tidItem);
+
+                    auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+                    bidItem->setFontSize(m_cheatFontSize);
+                    list->addItem(bidItem);
+                }
+                addHelpInfo(list);
+            }
         }
         
         return noClickableItems;
@@ -8275,8 +8452,9 @@ public:
         deleteFileOrDirectory(RELOADING_FLAG_FILEPATH);
         unpackDeviceInfo();
 
-        // Initialize dmntcht
+        // Initialize dmntcht and ns
         dmntchtInitialize();
+        nsInitialize();
         
         // CheckButtons thread removed
     }
@@ -8292,6 +8470,7 @@ public:
         // thread cleanup removed
 
         dmntchtExit();
+        nsExit();
 
         closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
 
@@ -8790,113 +8969,10 @@ tsl::elm::Element* CheatMenu::createUI() {
     auto* downloadItem = new tsl::elm::ListItem("Download from URL");
     downloadItem->setClickListener([](u64 keys) {
         if (keys & KEY_A) {
-            CheatUtils::EnsureMetadata();
-            std::string tid = CheatUtils::GetTitleIdString();
-            std::string bid = CheatUtils::GetBuildIdString();
-            std::string bid_low = ult::stringToLowercase(bid);
-
-            std::string title = tid;
-            std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tid + "/title.txt";
-            if (ult::isFile(titleFilePath)) {
-                std::ifstream tfile(titleFilePath);
-                if (std::getline(tfile, title)) ult::trim(title);
+            if (CheatUtils::TryDownloadCheats(true)) {
+                refreshPage.store(true, std::memory_order_release);
+                tsl::goBack();
             }
-            
-            std::string configPath = "sdmc:/config/ultrahand/cheat_url.txt";
-            if (!ult::isFile(configPath)) {
-                configPath = "sdmc:/config/ultrahand/cheat_url_txt";
-            }
-            
-            if (!ult::isFile(configPath)) {
-                tsl::notification->show("Config not found\ncheat_url.txt");
-                return true;
-            }
-            
-            std::vector<std::string> urls;
-            std::ifstream file(configPath);
-            std::string line;
-            while (std::getline(file, line)) {
-                ult::trim(line);
-                if (!line.empty()) urls.push_back(line);
-            }
-            
-            if (urls.empty()) {
-                tsl::notification->show("URL list is empty");
-                return true;
-            }
-
-            if (g_cheatDownloadIndex >= (int)urls.size()) {
-                tsl::notification->show("End of URL list\n(NotFound)");
-                return true;
-            }
-            
-            std::string targetDir = "sdmc:/switch/breeze/cheats/" + tid + "/";
-            ult::createDirectory(targetDir);
-            std::string dest = targetDir + bid + ".txt";
-            
-            // Initialize socket for the entire batch of attempts
-            static constexpr SocketInitConfig socketInitConfig = {
-                .tcp_tx_buf_size     = 16 * 1024,
-                .tcp_rx_buf_size     = 16 * 1024*2,
-                .tcp_tx_buf_max_size = 64 * 1024,
-                .tcp_rx_buf_max_size = 64 * 1024*2,
-                .udp_tx_buf_size     = 512,
-                .udp_rx_buf_size     = 512,
-                .sb_efficiency       = 1,
-                .bsd_service_type    = BsdServiceType_Auto
-            };
-            bool socketInitialized = R_SUCCEEDED(socketInitialize(&socketInitConfig));
-
-            for (size_t i = g_cheatDownloadIndex; i < urls.size(); i++) {
-                std::string rawUrl = urls[i];
-                rawUrl = ReplaceAll(rawUrl, "{TID}", tid);
-                rawUrl = ReplaceAll(rawUrl, "{BID}", bid);
-                rawUrl = ReplaceAll(rawUrl, "{bid}", bid_low);
-                rawUrl = ReplaceAll(rawUrl, "{bid_lowercase}", bid_low);
-                rawUrl = ReplaceAll(rawUrl, "{TITLE}", title);
-
-                bool found = false;
-                // Try .v15.txt down to .v1.txt
-                for (int v = 15; v >= 1; v--) {
-                    std::string vUrl = rawUrl;
-                    size_t lastDot = vUrl.find_last_of('.');
-                    if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
-                        vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
-                    } else {
-                        continue; // Only try versioning if it looks like a .txt file
-                    }
-
-                    LogDownload(vUrl);
-                    if (ult::downloadFile(vUrl, dest, true, true)) {
-                         found = true;
-                         break;
-                    }
-                }
-                
-                if (!found) {
-                    LogDownload(rawUrl);
-                    if (ult::downloadFile(rawUrl, dest, true, true)) {
-                        found = true;
-                    }
-                }
-                
-                if (found) {
-                    if (socketInitialized) socketExit();
-                    g_cheatDownloadIndex = i + 1;
-                    if (CheatUtils::ParseCheats(dest)) {
-                        tsl::notification->show("Downloaded & Loaded!");
-                        refreshPage.store(true, std::memory_order_release);
-                        tsl::goBack();
-                    } else {
-                        tsl::notification->show("Downloaded but empty");
-                    }
-                    return true;
-                }
-            }
-            
-            if (socketInitialized) socketExit();
-            g_cheatDownloadIndex = urls.size();
-            tsl::notification->show("No cheats found\nat current sources");
             return true;
         }
         return false;
