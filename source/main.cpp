@@ -102,6 +102,26 @@ static const std::vector<std::string> commandSystems = {DEFAULT_STR, ERISTA_STR,
 
 static std::vector<u32> g_cheatFolderIndexStack; // Indices of folder starts in the flat cheat list
 static std::vector<std::string> g_cheatFolderNameStack;
+
+static int g_cheatDownloadIndex = 0;
+
+static std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
+    if(from.empty()) return str;
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += (to.length() > 0 ? to.length() : 1);
+    }
+    return str;
+}
+
+static void LogDownload(const std::string& url) {
+    FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "a");
+    if (logFile) {
+        fprintf(logFile, "%s\n", url.c_str());
+        fclose(logFile);
+    }
+}
 static const std::vector<std::string> commandModes = {DEFAULT_STR, HOLD_STR, SLOT_STR, TOGGLE_STR, OPTION_STR, FORWARDER_STR, TEXT_STR, TABLE_STR, TRACKBAR_STR, STEP_TRACKBAR_STR, NAMED_STEP_TRACKBAR_STR};
 static const std::vector<std::string> commandGroupings = {DEFAULT_STR, "split", "split2", "split3", "split4", "split5"};
 static const std::string MODE_PATTERN = ";mode=";
@@ -6377,6 +6397,7 @@ namespace CheatUtils {
 
 
     void SaveCheatsToDir(const std::string& directory) {
+        ult::createDirectory(directory);
         std::string bid = GetBuildIdString();
         std::string path = directory + bid + ".txt";
         std::string togglePath = directory + "toggles.txt";
@@ -8766,6 +8787,122 @@ tsl::elm::Element* CheatMenu::createUI() {
     });
     list->addItem(loadFileItem);
 
+    auto* downloadItem = new tsl::elm::ListItem("Download from URL");
+    downloadItem->setClickListener([](u64 keys) {
+        if (keys & KEY_A) {
+            CheatUtils::EnsureMetadata();
+            std::string tid = CheatUtils::GetTitleIdString();
+            std::string bid = CheatUtils::GetBuildIdString();
+            std::string bid_low = ult::stringToLowercase(bid);
+
+            std::string title = tid;
+            std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tid + "/title.txt";
+            if (ult::isFile(titleFilePath)) {
+                std::ifstream tfile(titleFilePath);
+                if (std::getline(tfile, title)) ult::trim(title);
+            }
+            
+            std::string configPath = "sdmc:/config/ultrahand/cheat_url.txt";
+            if (!ult::isFile(configPath)) {
+                configPath = "sdmc:/config/ultrahand/cheat_url_txt";
+            }
+            
+            if (!ult::isFile(configPath)) {
+                tsl::notification->show("Config not found\ncheat_url.txt");
+                return true;
+            }
+            
+            std::vector<std::string> urls;
+            std::ifstream file(configPath);
+            std::string line;
+            while (std::getline(file, line)) {
+                ult::trim(line);
+                if (!line.empty()) urls.push_back(line);
+            }
+            
+            if (urls.empty()) {
+                tsl::notification->show("URL list is empty");
+                return true;
+            }
+
+            if (g_cheatDownloadIndex >= (int)urls.size()) {
+                tsl::notification->show("End of URL list\n(NotFound)");
+                return true;
+            }
+            
+            std::string targetDir = "sdmc:/switch/breeze/cheats/" + tid + "/";
+            ult::createDirectory(targetDir);
+            std::string dest = targetDir + bid + ".txt";
+            
+            // Initialize socket for the entire batch of attempts
+            static constexpr SocketInitConfig socketInitConfig = {
+                .tcp_tx_buf_size     = 16 * 1024,
+                .tcp_rx_buf_size     = 16 * 1024*2,
+                .tcp_tx_buf_max_size = 64 * 1024,
+                .tcp_rx_buf_max_size = 64 * 1024*2,
+                .udp_tx_buf_size     = 512,
+                .udp_rx_buf_size     = 512,
+                .sb_efficiency       = 1,
+                .bsd_service_type    = BsdServiceType_Auto
+            };
+            bool socketInitialized = R_SUCCEEDED(socketInitialize(&socketInitConfig));
+
+            for (size_t i = g_cheatDownloadIndex; i < urls.size(); i++) {
+                std::string rawUrl = urls[i];
+                rawUrl = ReplaceAll(rawUrl, "{TID}", tid);
+                rawUrl = ReplaceAll(rawUrl, "{BID}", bid);
+                rawUrl = ReplaceAll(rawUrl, "{bid}", bid_low);
+                rawUrl = ReplaceAll(rawUrl, "{bid_lowercase}", bid_low);
+                rawUrl = ReplaceAll(rawUrl, "{TITLE}", title);
+
+                bool found = false;
+                // Try .v15.txt down to .v1.txt
+                for (int v = 15; v >= 1; v--) {
+                    std::string vUrl = rawUrl;
+                    size_t lastDot = vUrl.find_last_of('.');
+                    if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
+                        vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
+                    } else {
+                        continue; // Only try versioning if it looks like a .txt file
+                    }
+
+                    LogDownload(vUrl);
+                    if (ult::downloadFile(vUrl, dest, true, true)) {
+                         found = true;
+                         break;
+                    }
+                }
+                
+                if (!found) {
+                    LogDownload(rawUrl);
+                    if (ult::downloadFile(rawUrl, dest, true, true)) {
+                        found = true;
+                    }
+                }
+                
+                if (found) {
+                    if (socketInitialized) socketExit();
+                    g_cheatDownloadIndex = i + 1;
+                    if (CheatUtils::ParseCheats(dest)) {
+                        tsl::notification->show("Downloaded & Loaded!");
+                        refreshPage.store(true, std::memory_order_release);
+                        tsl::goBack();
+                    } else {
+                        tsl::notification->show("Downloaded but empty");
+                    }
+                    return true;
+                }
+            }
+            
+            if (socketInitialized) socketExit();
+            g_cheatDownloadIndex = urls.size();
+            tsl::notification->show("No cheats found\nat current sources");
+            return true;
+        }
+        return false;
+    });
+    list->addItem(downloadItem);
+
     list->addItem(new tsl::elm::CategoryHeader("Combo Keys"));
 
     if (this->cheat_id != 0) {
@@ -8864,6 +9001,13 @@ int main(int argc, char* argv[]) {
     // If launched with arguments (manual/forwarder launch), ensure we start visible
     if (argc > 1) {
         ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::TRUE_STR);
+    }
+
+    // Clear download log
+    {
+        ult::createDirectory("sdmc:/config/ultrahand/");
+        FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "w");
+        if (logFile) fclose(logFile);
     }
 
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
