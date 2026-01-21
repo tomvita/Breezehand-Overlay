@@ -6997,7 +6997,15 @@ public:
                         if (inTargetFolder && currentDepth == targetDepth) {
                             std::string folderName = "\uE132 " + std::string(cheat.definition.readable_name);
                             auto* folderItem = new tsl::elm::ListItem(folderName);
+                            folderItem->setUseWrapping(true);
                             folderItem->setFontSize(m_cheatFontSize);
+                            
+                            auto it = notesData.find(cheat.definition.readable_name);
+                            if (it != notesData.end()) {
+                                auto noteIt = it->second.find("note");
+                                if (noteIt != it->second.end()) folderItem->setNote(noteIt->second);
+                            }
+                            
                             u32 folderIdx = i;
                             std::string rawName = cheat.definition.readable_name;
                             folderItem->setClickListener([folderIdx, rawName](u64 keys) {
@@ -7569,14 +7577,17 @@ public:
                     }
                     
                     auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+                    titleItem->setUseWrapping(true);
                     titleItem->setFontSize(m_cheatFontSize);
                     list->addItem(titleItem);
 
                     auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+                    tidItem->setUseWrapping(true);
                     tidItem->setFontSize(m_cheatFontSize);
                     list->addItem(tidItem);
 
                     auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+                    bidItem->setUseWrapping(true);
                     bidItem->setFontSize(m_cheatFontSize);
                     list->addItem(bidItem);
                 }
