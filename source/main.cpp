@@ -6539,6 +6539,13 @@ namespace CheatUtils {
             if (ult::downloadFile(rawUrl, dest, true, true)) {
                 found = true;
                 
+                size_t lastSlash = rawUrl.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    std::string notesUrl = rawUrl.substr(0, lastSlash + 1) + "notes.txt";
+                    LogDownload(notesUrl);
+                    ult::downloadFile(notesUrl, targetDir + "notes.txt", true, true);
+                }
+                
                 // Base exists - check for higher versions v1, v2, ... v15
                 for (int v = 1; v <= 15; v++) {
                     std::string vUrl = rawUrl;
@@ -7117,10 +7124,10 @@ public:
                 }
 
                 // Fallback to Download
-                if (CheatUtils::TryDownloadCheats(false)) { // false = quiet mode
-                    refreshPage.store(true, std::memory_order_release);
-                    return;
-                }
+                // if (CheatUtils::TryDownloadCheats(false)) { // false = quiet mode
+                //     refreshPage.store(true, std::memory_order_release);
+                //     return;
+                // }
             }
 
             list->addItem(new tsl::elm::ListItem("No cheats found"));
