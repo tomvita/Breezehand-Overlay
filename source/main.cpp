@@ -6534,12 +6534,12 @@ namespace CheatUtils {
 
             bool found = false;
             
-            // Check base URL first (no version)
+            // Check base URL first
             LogDownload(rawUrl);
             if (ult::downloadFile(rawUrl, dest, true, true)) {
                 found = true;
                 
-                // Only check versions if base URL succeeded
+                // Base exists - check for higher versions v1, v2, ... v15
                 for (int v = 1; v <= 15; v++) {
                     std::string vUrl = rawUrl;
                     size_t lastDot = vUrl.find_last_of('.');
@@ -6550,14 +6550,13 @@ namespace CheatUtils {
                     }
 
                     LogDownload(vUrl);
-                    if (ult::downloadFile(vUrl, dest, true, true)) {
-                        // Continue checking for higher versions
-                    } else {
-                        // No higher version exists, stop checking
+                    if (!ult::downloadFile(vUrl, dest, true, true)) {
+                        // Version doesn't exist - stop, use last successful download
                         break;
                     }
                 }
             }
+            // If base doesn't exist, skip versions for this source
             
             if (found) {
                 if (socketInitialized) socketExit();
@@ -7708,26 +7707,35 @@ public:
 
         // X button switches to CheatMenu (Settings for cheats)
         if (keysDown & KEY_X) {
-            if (menuMode == OVERLAYS_STR && this->cheatList) {
-                struct ListProxy : public tsl::elm::List {
-                    using tsl::elm::List::m_items;
-                };
-                for (auto* item : static_cast<ListProxy*>(this->cheatList)->m_items) {
-                    if (item && item->hasFocus()) {
-                         // Use static_cast since RTTI is disabled.
-                         // Error items ("No cheats found") are plain ListItems, but they won't have focus search triggered usually,
-                         // or we can check they aren't the error text.
-                         auto* listItem = static_cast<tsl::elm::ListItem*>(item);
-                         if (listItem->getText() != "No cheats found" && listItem->getText() != "Failed to retrieve cheats") {
-                             auto* cheatItem = static_cast<CheatUtils::CheatToggleItem*>(listItem);
-                             tsl::changeTo<CheatMenu>(cheatItem->cheat_id, cheatItem->getText());
-                             return true;
-                         }
+            if (menuMode == OVERLAYS_STR) {
+                u32 cheatId = 0;
+                std::string cheatName = "";
+                
+                if (this->cheatList) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(this->cheatList)->m_items) {
+                        if (item && item->hasFocus()) {
+                             auto* listItem = static_cast<tsl::elm::ListItem*>(item);
+                             std::string text = listItem->getText();
+                             // Only cast to CheatToggleItem if it's actually a cheat item
+                             if (!text.empty() && text != "No cheats found" && text != "Failed to retrieve cheats") {
+                                 auto* cheatItem = static_cast<CheatUtils::CheatToggleItem*>(listItem);
+                                 if (cheatItem->cheat_id != 0) {
+                                     cheatId = cheatItem->cheat_id;
+                                     cheatName = text;
+                                 }
+                             }
+                             break;
+                        }
                     }
                 }
+                
+                tsl::changeTo<CheatMenu>(cheatId, cheatName);
+                return true;
             }
         }
-
         bool isHolding = (lastCommandIsHold && runningInterpreter.load(std::memory_order_acquire));
         if (isHolding) {
             processHold(keysDown, keysHeld, holdStartTick, isHolding, [&]() {
