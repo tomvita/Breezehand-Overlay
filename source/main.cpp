@@ -6694,6 +6694,7 @@ private:
 public:
     ComboSetItem(const std::string& text, u32 id) : tsl::elm::ListItem(text), cheat_id(id), defaultText(text) {
         this->setNote("Press A to start capture");
+        this->setAlwaysShowNote(true);
     }
 
     virtual void draw(tsl::gfx::Renderer* renderer) override {
@@ -6968,6 +6969,10 @@ public:
             std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
             if (!fontSizeStr.empty()) {
                 m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+            }
+            std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+            if (!showNotesStr.empty()) {
+                ult::showCheatNotes = (showNotesStr == "true");
             }
             m_notesLoaded = true;
         }
@@ -7580,6 +7585,10 @@ public:
                         if (!fontSizeStr.empty()) {
                             m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
                         }
+                        std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+                        if (!showNotesStr.empty()) {
+                            ult::showCheatNotes = (showNotesStr == "true");
+                        }
                         m_notesLoaded = true;
                     }
 
@@ -7679,6 +7688,7 @@ public:
         // Y button toggles notes visibility
         if (keysDown & KEY_Y) {
             ult::showCheatNotes = !ult::showCheatNotes;
+            if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "show_notes", ult::showCheatNotes ? "true" : "false");
             if (cheatList && menuMode == OVERLAYS_STR) {
                 struct ListProxy : public tsl::elm::List {
                     using tsl::elm::List::m_items;
