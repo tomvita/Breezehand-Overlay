@@ -6533,26 +6533,29 @@ namespace CheatUtils {
             rawUrl = ReplaceAll(rawUrl, "{TITLE}", title);
 
             bool found = false;
-            for (int v = 15; v >= 1; v--) {
-                std::string vUrl = rawUrl;
-                size_t lastDot = vUrl.find_last_of('.');
-                if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
-                    vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
-                } else {
-                    continue;
-                }
-
-                LogDownload(vUrl);
-                if (ult::downloadFile(vUrl, dest, true, true)) {
-                     found = true;
-                     break;
-                }
-            }
             
-            if (!found) {
-                LogDownload(rawUrl);
-                if (ult::downloadFile(rawUrl, dest, true, true)) {
-                    found = true;
+            // Check base URL first (no version)
+            LogDownload(rawUrl);
+            if (ult::downloadFile(rawUrl, dest, true, true)) {
+                found = true;
+                
+                // Only check versions if base URL succeeded
+                for (int v = 1; v <= 15; v++) {
+                    std::string vUrl = rawUrl;
+                    size_t lastDot = vUrl.find_last_of('.');
+                    if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
+                        vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
+                    } else {
+                        break;
+                    }
+
+                    LogDownload(vUrl);
+                    if (ult::downloadFile(vUrl, dest, true, true)) {
+                        // Continue checking for higher versions
+                    } else {
+                        // No higher version exists, stop checking
+                        break;
+                    }
                 }
             }
             
