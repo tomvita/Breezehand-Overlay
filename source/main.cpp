@@ -7732,15 +7732,8 @@ public:
         }
         
         if (!inHiddenMode.load(std::memory_order_acquire)) {
-            std::string pageLeftName, pageRightName, pathPattern, pathPatternOn, pathPatternOff;
-            bool usingPages = false;
-            
-            const PackageHeader packageHeader = getPackageHeaderFromIni(PACKAGE_PATH);
-            noClickableItems = drawCommandsMenu(list, packageIniPath, packageConfigIniPath, packageHeader, "", pageLeftName, pageRightName,
-                PACKAGE_PATH, LEFT_STR, "package.ini", this->dropdownSection, 0, pathPattern, pathPatternOn, pathPatternOff, usingPages, false);
-    
+            // Display game info at the top
             if (!hideUserGuide && dropdownSection.empty()) {
-                // Display game info before User Guide
                 DmntCheatProcessMetadata metadata;
                 if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
                     this->cheatList = list;
@@ -7788,6 +7781,10 @@ public:
                         }
                     }
                     
+                    // Add "Current Game" category header
+                    auto* categoryHeader = new tsl::elm::CategoryHeader("Current Game");
+                    list->addItem(categoryHeader);
+                    
                     auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
                     titleItem->setUseWrapping(true);
                     titleItem->setFontSize(m_cheatFontSize);
@@ -7803,6 +7800,16 @@ public:
                     bidItem->setFontSize(m_cheatFontSize);
                     list->addItem(bidItem);
                 }
+            }
+            
+            std::string pageLeftName, pageRightName, pathPattern, pathPatternOn, pathPatternOff;
+            bool usingPages = false;
+            
+            const PackageHeader packageHeader = getPackageHeaderFromIni(PACKAGE_PATH);
+            noClickableItems = drawCommandsMenu(list, packageIniPath, packageConfigIniPath, packageHeader, "", pageLeftName, pageRightName,
+                PACKAGE_PATH, LEFT_STR, "package.ini", this->dropdownSection, 0, pathPattern, pathPatternOn, pathPatternOff, usingPages, false);
+    
+            if (!hideUserGuide && dropdownSection.empty()) {
                 addHelpInfo(list);
             }
         }
