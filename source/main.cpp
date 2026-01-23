@@ -30,7 +30,10 @@
 #include <ultra.hpp>
 #include <tesla.hpp>
 #include <utils.hpp>
+#include <dmntcht.h>
 #include <set>
+#include <iomanip>
+#include <sstream>
 
 
 using namespace ult;
@@ -41,6 +44,10 @@ constexpr auto acq_rel = std::memory_order_acq_rel;
 constexpr auto release = std::memory_order_release;
 
 static std::mutex transitionMutex;
+
+// Forward declaration for helper to break dependency cycle
+void TransitionToMainMenu(const std::string& arg1, const std::string& arg2);
+void SwapToMainMenu();
 
 
 // Placeholder replacement
@@ -84,12 +91,37 @@ static bool reloadMenu2 = false;
 //static bool reloadMenu3 = false;
 static bool triggerMenuReload = false;
 static bool triggerMenuReload2 = false;
+static bool inOverlay = false;
+static bool toPackages = false;
 
 
 static size_t nestedMenuCount = 0;
 
 // Command mode globals
 static const std::vector<std::string> commandSystems = {DEFAULT_STR, ERISTA_STR, MARIKO_STR};
+
+static std::vector<u32> g_cheatFolderIndexStack; // Indices of folder starts in the flat cheat list
+static std::vector<std::string> g_cheatFolderNameStack;
+
+static int g_cheatDownloadIndex = 0;
+
+static std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
+    if(from.empty()) return str;
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += (to.length() > 0 ? to.length() : 1);
+    }
+    return str;
+}
+
+static void LogDownload(const std::string& url) {
+    FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "a");
+    if (logFile) {
+        fprintf(logFile, "%s\n", url.c_str());
+        fclose(logFile);
+    }
+}
 static const std::vector<std::string> commandModes = {DEFAULT_STR, HOLD_STR, SLOT_STR, TOGGLE_STR, OPTION_STR, FORWARDER_STR, TEXT_STR, TABLE_STR, TRACKBAR_STR, STEP_TRACKBAR_STR, NAMED_STEP_TRACKBAR_STR};
 static const std::vector<std::string> commandGroupings = {DEFAULT_STR, "split", "split2", "split3", "split4", "split5"};
 static const std::string MODE_PATTERN = ";mode=";
@@ -1596,152 +1628,7 @@ public:
         //return returnRootFrame(list, CAPITAL_ULTRAHAND_PROJECT_NAME, versionLabel);
     }
 
-    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
-        
-        // Handle delete item continuous hold behavior
-        if (isHolding) {
-            processHold(keysDown, keysHeld, holdStartTick, isHolding, [this]() {
-                if (requestOverlayExit()) {
-                    ult::launchingOverlay.store(true, std::memory_order_release);
-                    tsl::Overlay::get()->close();
-                }
-            });
-        }
-
-        const bool isRunningInterp = runningInterpreter.load(acquire);
-        
-        if (isRunningInterp) {
-            return handleRunningInterpreter(keysDown, keysHeld);
-        }
-        
-        if (lastRunningInterpreter.exchange(false, std::memory_order_acq_rel)) {
-            isDownloadCommand.store(false, release);
-            if (lastSelectedListItem) {
-                lastSelectedListItem->setValue(commandSuccess.load(acquire) ? CHECKMARK_SYMBOL : CROSSMARK_SYMBOL);
-                lastSelectedListItem->enableClickAnimation();
-                lastSelectedListItem = nullptr;
-            }
-
-            closeInterpreterThread();
-            resetPercentages();
-
-            if (!commandSuccess.load()) {
-                triggerRumbleDoubleClick.store(true, std::memory_order_release);
-            }
-
-            if (!limitedMemory && useSoundEffects) {
-                reloadSoundCacheNow.store(true, std::memory_order_release);
-                //ult::Audio::initialize();
-            }
-            //lastRunningInterpreter.store(false, std::memory_order_release);
-            return true;
-        }
-        
-        if (goBackAfter.exchange(false, std::memory_order_acq_rel)) {
-            disableSound.store(true, std::memory_order_release);
-            simulatedBack.store(true, std::memory_order_release);
-            return true;
-        }
-
-        //if (refreshPage.load(acquire)) {
-        //    //tsl::goBack();tsl::changeTo<UltrahandSettingsMenu>(targetMenu);
-        //    tsl::swapTo<UltrahandSettingsMenu>("languageMenu");
-        //    refreshPage.store(false, release);
-        //}
-        
-        if (inSettingsMenu && !inSubSettingsMenu) {
-            if (!returningToSettings) {
-                //if (simulatedNextPage.load(acquire))
-                //    simulatedNextPage.store(false, release);
-                //if (simulatedMenu.load(acquire))
-                //    simulatedMenu.store(false, release);
-                simulatedNextPage.exchange(false, std::memory_order_acq_rel);
-                simulatedMenu.exchange(false, std::memory_order_acq_rel);
-                
-                const bool isTouching = stillTouching.load(acquire);
-                const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
-                
-                if (backKeyPressed) {
-
-                    allowSlide.exchange(false, std::memory_order_acq_rel);
-                    unlockedSlide.exchange(false, std::memory_order_acq_rel);
-                    inSettingsMenu = false;
-                    returningToMain = (lastMenu != "hiddenMenuMode");
-                    returningToHiddenMain = !returningToMain;
-                    lastMenu = "settingsMenu";
-                    
-                    if (reloadMenu) {
-                        //sl::pop(2);
-                        tsl::swapTo<MainMenu>(SwapDepth(3), lastMenuMode);
-                        reloadMenu = false;
-                    } else {
-                        tsl::goBack();
-                    }
-                    return true;
-                }
-            } else {
-                returningToSettings = false;
-            }
-        } else if (inSubSettingsMenu) {
-            simulatedNextPage.exchange(false, std::memory_order_acq_rel);
-            simulatedMenu.exchange(false, std::memory_order_acq_rel);
-            
-            const bool isTouching = stillTouching.load(acquire);
-            const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
-            
-            if (backKeyPressed) {
-                if (exitOnBack) {
-                    ult::launchingOverlay.store(true, std::memory_order_release);
-                    tsl::Overlay::get()->close();
-                    return true;
-                }
-
-                if (softwareHasUpdated) {
-                    // Instead of going back, trigger the reload directly
-                    //disableSound.store(true, std::memory_order_release);
-
-                    setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_OVERLAY_STR, TRUE_STR);
-
-                    ult::launchingOverlay.store(true, std::memory_order_release);
-                    tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl", "--skipCombo --comboReturn");
-                    tsl::Overlay::get()->close();
-                    return true;
-                }
-
-                allowSlide.exchange(false, std::memory_order_acq_rel);
-                unlockedSlide.exchange(false, std::memory_order_acq_rel);
-                inSubSettingsMenu = false;
-                returningToSettings = true;
-                
-                if (reloadMenu2) {
-                    //tsl::goBack(2);
-                    tsl::swapTo<UltrahandSettingsMenu>(SwapDepth(3));
-                    reloadMenu2 = false;
-                } else {
-                    tsl::goBack();
-                }
-                return true;
-            }
-        }
-        
-        if (returningToSettings && !(keysDown & KEY_B)) {
-            returningToSettings = false;
-            inSettingsMenu = true;
-            tsl::impl::parseOverlaySettings();
-        }
-        
-        if (triggerExit.exchange(false, std::memory_order_acq_rel)) {
-            ult::launchingOverlay.store(true, std::memory_order_release);
-
-            if (softwareHasUpdated && requestOverlayExit()) {
-            } else {
-                tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl");
-            }
-            tsl::Overlay::get()->close(); // Close the overlay
-        }
-        
-        return false;
-    }
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override;
 };
 
 
@@ -2237,264 +2124,7 @@ public:
      * @param rightJoyStick Information about the right joystick input.
      * @return `true` if the input was handled within the overlay, `false` otherwise.
      */
-    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
-        
-        //const bool isRunningInterp = runningInterpreter.load(acquire);
-        //
-        //if (isRunningInterp) {
-        //    return handleRunningInterpreter(keysDown, keysHeld);
-        //}
-        //
-        //if (lastRunningInterpreter.load(acquire)) {
-        //    isDownloadCommand.store(false, release);
-        //    if (lastSelectedListItem)
-        //        lastSelectedListItem->setValue(commandSuccess.load(acquire) ? CHECKMARK_SYMBOL : CROSSMARK_SYMBOL);
-        //    closeInterpreterThread();
-        //    lastRunningInterpreter.store(false, std::memory_order_release);
-        //    return true;
-        //}
-        
-        if (goBackAfter.exchange(false, std::memory_order_acq_rel)) {
-            disableSound.store(true, std::memory_order_release);
-            simulatedBack.store(true, std::memory_order_release);
-            return true;
-        }
-
-        static bool runAfter = false;
-        if (runAfter) {
-            runAfter = false;
-            // Reset navigation state properly
-            inSettingsMenu = false;
-            inSubSettingsMenu = false;
-            
-            // Clear the current selection
-            ////g_overlayFilename = "";
-            //entryName = "";
-            
-            // Determine return destination
-            if (lastMenu != "hiddenMenuMode")
-                returningToMain = true;
-            else
-                returningToHiddenMain = true;
-            
-            // Determine pop count and hidden mode settings
-            int popCount;
-            if (lastMenu == "hiddenMenuMode") {
-                popCount = 3;
-                inMainMenu.store(false, std::memory_order_release);
-                inHiddenMode.store(true, std::memory_order_release);
-                if (entryMode == OVERLAY_STR)
-                    setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_HIDDEN_OVERLAY_STR, TRUE_STR);
-                else
-                    popCount = 2;
-            } else {
-                popCount = 2;
-            }
-            
-            runningInterpreter.store(false, release);
-            jumpItemName = rootTitle;
-            jumpItemValue = rootVersion;
-            //g_overlayFilename = "";
-            jumpItemExactMatch.store(false, release);
-            skipJumpReset.store(true, release);
-            
-            tsl::swapTo<MainMenu>(SwapDepth(popCount), lastMenuMode);
-            return true;
-        }
-
-        // Handle delete item continuous hold behavior
-        if (isHolding) {
-            processHold(keysDown, keysHeld, holdStartTick, isHolding, [this]() {
-                std::string targetPath;
-                bool hasTarget = false;
-        
-                if (!entryName.empty() && entryMode == OVERLAY_STR) {
-                    targetPath = OVERLAY_PATH + entryName;
-                    hasTarget = true;
-                } else if (!entryName.empty()) {
-                    targetPath = PACKAGE_PATH + entryName + "/";
-                    hasTarget = true;
-                }
-        
-                if (hasTarget) {
-                    deleteFileOrDirectory(targetPath);
-                    removeIniSection(settingsIniPath, entryName);
-        
-                    if (lastSelectedListItem) {
-                        //lastSelectedListItem->enableClickAnimation();
-                        //lastSelectedListItem->triggerClickAnimation();
-                        lastSelectedListItem->setValue(CHECKMARK_SYMBOL);
-                        //lastSelectedListItem->disableClickAnimation();
-                        lastSelectedListItem = nullptr;
-                    }
-        
-                    triggerRumbleDoubleClick.store(true, std::memory_order_release);
-                    triggerMoveSound.store(true, std::memory_order_release);
-                    runAfter = true;
-                } else if (lastSelectedListItem) {
-                    lastSelectedListItem->setValue(CROSSMARK_SYMBOL);
-                    lastSelectedListItem = nullptr;
-                }
-            }, nullptr, false); // false = do NOT reset storedCommands
-        }
-
-
-        if (inSettingsMenu && !inSubSettingsMenu) {
-            if (!returningToSettings) {
-                if (simulatedNextPage.load(acquire))
-                    simulatedNextPage.store(false, release);
-                if (simulatedMenu.load(acquire))
-                    simulatedMenu.store(false, release);
-
-                const bool isTouching = stillTouching.load(acquire);
-                const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
-    
-                // Note: Original code uses !stillTouching without .load() - preserving this exactly
-                if (backKeyPressed) {
-                    if (allowSlide.load(acquire))
-                        allowSlide.store(false, release);
-                    if (unlockedSlide.load(acquire))
-                        unlockedSlide.store(false, release);
-                    inSettingsMenu = false;
-                    
-                    // Determine return destination
-                    if (lastMenu != "hiddenMenuMode")
-                        returningToMain = true;
-                    else
-                        returningToHiddenMain = true;
-                    
-                    if (reloadMenu) {
-                        reloadMenu = false;
-                        
-                        // Determine pop count and hidden mode settings
-                        size_t popCount;
-                        if (lastMenu == "hiddenMenuMode") {
-                            popCount = 3;
-                            inMainMenu.store(false, std::memory_order_release);
-                            inHiddenMode.store(true, std::memory_order_release);
-                            if (entryMode == OVERLAY_STR)
-                                setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_HIDDEN_OVERLAY_STR, TRUE_STR);
-                            else
-                                popCount = 2;
-                        } else {
-                            popCount = 2;
-                        }
-                        
-                        //tsl::pop(popCount);
-                        //{
-                        //    //std::lock_guard<std::mutex> lock(jumpItemMutex);
-                        jumpItemName = rootTitle;
-                        jumpItemValue = rootVersion;
-                        //g_overlayFilename = "";
-                        jumpItemExactMatch.store(false, release);
-                        skipJumpReset.store(true, release);
-                        //}
-                        
-                        tsl::swapTo<MainMenu>(SwapDepth(popCount), lastMenuMode);
-                    } else {
-                        tsl::goBack();
-                    }
-                    
-                    lastMenu = "settingsMenu";
-                    return true;
-                }
-            }
-        } else if (inSubSettingsMenu) {
-            simulatedNextPage.exchange(false, std::memory_order_acq_rel);
-            simulatedMenu.exchange(false, std::memory_order_acq_rel);
-            
-            // Note: Original code uses stillTouching.load() here - preserving this difference
-            const bool isTouching = stillTouching.load(acquire);
-            const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
-            
-            
-            if (backKeyPressed) {
-                allowSlide.exchange(false, std::memory_order_acq_rel);
-                unlockedSlide.exchange(false, std::memory_order_acq_rel);
-                
-
-                if (dropdownSelection == MODE_STR) {
-                    modeTitle = LAUNCH_MODES;
-                    reloadMenu2 = true;
-                }
-
-
-                else if (dropdownSelection.rfind("mode_combo_", 0) != 0) {
-                    inSubSettingsMenu = false;
-                    returningToSettings = true;
-                }
-    
-                // Step 1: Go back one menu level
-                // Step 2: If reload is needed, change to SettingsMenu with focus
-                if (reloadMenu2) {
-                    reloadMenu2 = false;
-                    //tsl::goBack(2);
-                    
-                    //{
-                    //    //std::lock_guard<std::mutex> lock(jumpItemMutex);
-                    // Provide jump target context
-                    jumpItemName = modeTitle;
-                    jumpItemValue = "";
-                    jumpItemExactMatch.store(true, release);
-                    //g_overlayFilename = "";
-                    //}
-    
-                    tsl::swapTo<SettingsMenu>(
-                        SwapDepth(2),
-                        rootEntryName,
-                        rootEntryMode,
-                        rootTitle,
-                        rootVersion
-                    );
-                } else {
-                    if (modeComboModified) {
-                        // Go back to MODE_STR screen to refresh the combo display
-                        jumpItemName = modeTitle;  // Focus on the mode that was just edited
-                        jumpItemValue = "";
-                        jumpItemExactMatch.store(true, release);
-                        //g_overlayFilename = "";
-                        
-                        tsl::swapTo<SettingsMenu>(
-                            SwapDepth(2),
-                            rootEntryName,
-                            rootEntryMode,
-                            rootTitle,
-                            rootVersion,
-                            MODE_STR  // Go back to the modes list screen
-                        );
-                        // Keep modeComboModified true for the next level up
-                    } else {
-                        tsl::goBack();
-                    }
-                }
-
-                if (modeComboModified) {
-                    modeComboModified = false;
-                    //jumpItemName = MODES;
-                    //jumpItemValue = "";
-                    //jumpItemExactMatch.store(true, release);
-                    ////g_overlayFilename = "";
-
-                    //reloadMenu2 = true;
-                }
-    
-                return true;
-            }
-        }
-        
-        if (returningToSettings && !(keysDown & KEY_B)) {
-            returningToSettings = false;
-            inSettingsMenu = true;
-        }
-    
-        if (triggerExit.exchange(false, std::memory_order_acq_rel)) {
-            ult::launchingOverlay.store(true, std::memory_order_release);
-            tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl");
-            tsl::Overlay::get()->close();
-        }
-        
-        return false;
-    }
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override;
 };
 
 
@@ -4657,7 +4287,8 @@ bool drawCommandsMenu(
                                     inPackageMenu = false;
 
                                     tsl::shiftItemFocus(listItem);
-                                    tsl::changeTo<MainMenu>("", optionName);
+                                    //tsl::changeTo<MainMenu>("", optionName);
+                                    TransitionToMainMenu("", optionName);
                                     return true;
                                 } else if (keys & SCRIPT_KEY && !(keys & ~SCRIPT_KEY & ALL_KEYS_MASK)) {
                                     //if (inMainMenu.load(acquire)) {
@@ -6449,7 +6080,7 @@ public:
                 //} else {
                 //    tsl::changeTo<MainMenu>();
                 //}
-                tsl::swapTo<MainMenu>();
+                SwapToMainMenu();
             } else {
                 //tsl::clearGlyphCacheNow.store(true, release);
                 tsl::goBack();
@@ -6625,15 +6256,716 @@ public:
 };
 
 
-bool toPackages = false;
-bool inOverlay = false;
-/**
- * @brief The `MainMenu` class handles the main menu overlay functionality.
- *
- * This class manages the main menu overlay, allowing users to navigate and access various submenus.
- * It provides functions for creating, updating, and navigating the main menu, as well as handling user interactions related to menu navigation.
- */
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <sstream>
+#include <iomanip>
+#include <fstream>
+#include <algorithm>
+#include <cctype>
+
+// --- Cheat / Combo Key Globals & Structs ---
+
+// toggles/thread removed
+
+
+
+// CheatUtils namespace moved before CheatMenu in previous edits, leaving this clean
+class CheatMenu : public tsl::Gui {
+private:
+    u32 cheat_id;
+    std::string cheat_name;
+public:
+    CheatMenu(u32 id = 0, const std::string& name = "") : cheat_id(id), cheat_name(name) { }
+
+    virtual tsl::elm::Element* createUI() override;
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override;
+};
+
+// --- Cheat Utils ---
+namespace CheatUtils {
+    DmntCheatProcessMetadata metadata;
+    char build_id[0x20];
+    bool metadata_loaded = false;
+
+    void EnsureMetadata() {
+        if (!metadata_loaded) {
+             if (R_FAILED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                 return;
+             }
+             std::memcpy(build_id, metadata.main_nso_build_id, 0x20);
+             metadata_loaded = true;
+        }
+    }
+
+    std::string GetBuildIdString() {
+        EnsureMetadata();
+        std::stringstream ss;
+        ss << std::hex << std::uppercase << std::setfill('0');
+        for (int i = 0; i < 8; i++) ss << std::setw(2) << (int)build_id[i];
+        return ss.str();
+    }
+
+    std::string GetTitleIdString() {
+        EnsureMetadata();
+        std::stringstream ss;
+        ss << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << metadata.title_id;
+        return ss.str();
+    }
+
+    void SaveToggles(const std::string& path) {
+        FILE* file = fopen(path.c_str(), "w");
+        if (!file) return;
+
+        u64 cheatCount = 0;
+        if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+            std::vector<DmntCheatEntry> cheats(cheatCount);
+            if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                for (const auto& cheat : cheats) {
+                    fprintf(file, "[%s]\n%s\n\n", cheat.definition.readable_name, cheat.enabled ? "true" : "false");
+                }
+            }
+        }
+        fclose(file);
+    }
+
+    void ClearCheats() {
+        g_cheatFolderIndexStack.clear();
+        g_cheatFolderNameStack.clear();
+        u64 count = 0;
+        if (R_SUCCEEDED(dmntchtGetCheatCount(&count)) && count > 0) {
+            // dmntcht doesn't have a ClearAll, so we remove one by one.
+            // Note: Since IDs might shift or re-index, simpler to just get list and remove.
+            // Removing a cheat might invalidate others if index based, but we use IDs.
+            std::vector<DmntCheatEntry> cheats(count);
+            if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), count, 0, &count))) {
+                 for (const auto& cheat : cheats) {
+                     dmntchtRemoveCheat(cheat.cheat_id);
+                 }
+            }
+        }
+    }
+
+    bool ParseCheats(const std::string& path) {
+        // Clear existing cheats before loading new ones
+        ClearCheats();
+        FILE *pfile;
+        pfile = fopen(path.c_str(), "rb");
+        if (pfile != NULL) {
+            fseek(pfile, 0, SEEK_END);
+            size_t len = ftell(pfile);
+            u8 *s = new u8[len];
+            fseek(pfile, 0, SEEK_SET);
+            fread(s, 1, len, pfile);
+            // if (strcmp(m_cheatcode_path + (strlen(m_cheatcode_path) - 20), logtext("%02X%02X%02X%02X%02X%02X%02X%02X.txt", build_id[0], build_id[1], build_id[2], build_id[3], build_id[4], build_id[5], build_id[6], build_id[7]).data) != 0) {
+            //     for (size_t i = 0; i < len; i++) {
+            //         if (s[i] == '{') s[i] = '[';
+            //         if (s[i] == '}') s[i] = ']';
+            //     }
+            // }
+            DmntCheatEntry cheatentry;
+            cheatentry.definition.num_opcodes = 0;
+            cheatentry.enabled = false;
+            u8 label_len = 0;
+            size_t i = 0;
+            while (i < len) {
+                if (std::isspace(static_cast<unsigned char>(s[i]))) {
+                    /* Just ignore whitespace. */
+                    i++;
+                } else if (s[i] == '[') {
+                    if (cheatentry.definition.num_opcodes != 0) {
+                        if (cheatentry.enabled==true)
+                        dmntchtSetMasterCheat(&(cheatentry.definition));
+                        else
+                        dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+                    }
+                    /* Parse a normal cheat set to off */
+                    cheatentry.definition.num_opcodes = 0;
+                    cheatentry.enabled = false;
+                    /* Extract name bounds. */
+                    size_t j = i + 1;
+                    while (s[j] != ']') {
+                        j++;
+                        if (j >= len) {
+                            return false;
+                        }
+                    }
+                    /* s[i+1:j] is cheat name. */
+                    const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                    std::memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
+                    cheatentry.definition.readable_name[cheat_name_len] = 0;
+                    label_len = cheat_name_len;
+
+                    /* Skip onwards. */
+                    i = j + 1;
+                } else if (s[i] == '(') {
+                    size_t j = i + 1;
+                    while (s[j] != ')') {
+                        j++;
+                        if (j >= len) {
+                            return false;
+                        }
+                    }
+                    i = j + 1;
+                } else if (s[i] == '{') {
+                    if (cheatentry.definition.num_opcodes != 0) {
+                        dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+                    }
+                    /* We're parsing a master cheat. Turn it on */
+                    cheatentry.definition.num_opcodes = 0;
+                    cheatentry.enabled = true;
+                    /* Extract name bounds */
+                    size_t j = i + 1;
+                    while (s[j] != '}') {
+                        j++;
+                        if (j >= len) {
+                            return false;
+                        }
+                    }
+
+                    /* s[i+1:j] is cheat name. */
+                    const size_t cheat_name_len = std::min(j - i - 1, sizeof(cheatentry.definition.readable_name));
+                    memcpy(cheatentry.definition.readable_name, &s[i + 1], cheat_name_len);
+                    cheatentry.definition.readable_name[cheat_name_len] = 0;
+                    label_len = cheat_name_len;
+                    // strcpy(cheatentry.definition.readable_name,"master code");
+
+                    /* Skip onwards. */
+                    i = j + 1;
+                } else if (std::isxdigit(static_cast<unsigned char>(s[i]))) {
+                    if (label_len == 0)
+                        return false;
+                    /* Bounds check the opcode count. */
+                    if (cheatentry.definition.num_opcodes >= sizeof(cheatentry.definition.opcodes) / 4) {
+                        if (cheatentry.definition.num_opcodes != 0) {
+                            dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+                        }
+                        return false;
+                    }
+
+                    /* We're parsing an instruction, so validate it's 8 hex digits. */
+                    for (size_t j = 1; j < 8; j++) {
+                        /* Validate 8 hex chars. */
+                        if (i + j >= len || !std::isxdigit(static_cast<unsigned char>(s[i + j]))) {
+                            if (cheatentry.definition.num_opcodes != 0) {
+                                dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+                            }
+                            return false;
+                        }
+                    }
+
+                    /* Parse the new opcode. */
+                    char hex_str[9] = {0};
+                    std::memcpy(hex_str, &s[i], 8);
+                    cheatentry.definition.opcodes[cheatentry.definition.num_opcodes++] = std::strtoul(hex_str, NULL, 16);
+
+                    /* Skip onwards. */
+                    i += 8;
+                } else {
+                    /* Unexpected character encountered. */
+                    if (cheatentry.definition.num_opcodes != 0) {
+                        dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+                    }
+                    return false;
+                }
+            }
+            if (cheatentry.definition.num_opcodes != 0) {
+                dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled, &(cheatentry.cheat_id));
+            }
+            fclose(pfile); // take note that if any error occured above this isn't closed
+            return true;
+        }
+        return false;
+    }
+
+
+    void SaveCheatsToDir(const std::string& directory, bool append = false) {
+        ult::createDirectory(directory);
+        std::string bid = GetBuildIdString();
+        std::string tid = GetTitleIdString();
+        std::string path = directory + bid + ".txt";
+        std::string togglePath = directory + "toggles.txt";
+
+        FILE* file = nullptr;
+        if (append) {
+            file = fopen("sdmc:/switch/breeze/cheats/log.txt", "a");
+            if (file) {
+                time_t now = time(nullptr);
+                struct tm *local_time = localtime(&now);
+                fprintf(file, "%02d-%02d-%04d %02d:%02d:%02d %s\n",
+                        local_time->tm_mday,
+                        local_time->tm_mon + 1,
+                        local_time->tm_year + 1900,
+                        local_time->tm_hour,
+                        local_time->tm_min,
+                        local_time->tm_sec,
+                        path.c_str());
+            }
+        } else {
+            file = fopen(path.c_str(), "w");
+        }
+
+        if (file) {
+            fprintf(file, "[Breezehand %s TID: %s BID: %s]\n\n", APP_VERSION, tid.c_str(), bid.c_str());
+
+            u64 cheatCount = 0;
+            if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+                std::vector<DmntCheatEntry> cheats(cheatCount);
+                if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                    for (u32 i = 0; i < cheatCount; i++) {
+                        const auto& cheat = cheats[i];
+                        if (i == 0 && cheat.cheat_id == 0) {
+                            fprintf(file, "{%s}\n", cheat.definition.readable_name);
+                        } else {
+                            fprintf(file, "[%s]\n", cheat.definition.readable_name);
+                        }
+
+                        for (u32 j = 0; j < cheat.definition.num_opcodes; j++) {
+                            u32 op = cheat.definition.opcodes[j];
+                            u32 opcode = (op >> 28) & 0xF;
+                            u8 T = (op >> 24) & 0xF;
+
+                            if ((opcode == 9) && (((op >> 8) & 0xF) == 0)) {
+                                fprintf(file, "%08X\n", op);
+                                continue;
+                            }
+
+                            if (opcode == 0xC) {
+                                opcode = (op >> 24) & 0xFF;
+                                T = (op >> 20) & 0xF;
+                                u8 X = (op >> 8) & 0xF;
+                                if (opcode == 0xC0) opcode = opcode * 16 + X;
+                            }
+                            
+                            if (opcode == 10) {
+                                u8 O = (op >> 8) & 0xF;
+                                if (O == 2 || O == 4 || O == 5) T = 8;
+                                else T = 4;
+                            }
+
+                            switch (opcode) {
+                                case 0:
+                                case 1:
+                                case 0xC06:
+                                    fprintf(file, "%08X ", cheat.definition.opcodes[j++]);
+                                case 9:
+                                case 0xC04:
+                                    fprintf(file, "%08X ", cheat.definition.opcodes[j++]);
+                                case 3:
+                                case 10:
+                                    fprintf(file, "%08X ", cheat.definition.opcodes[j]);
+                                    if (T == 8 || (T == 0 && opcode == 3)) {
+                                        j++;
+                                        fprintf(file, "%08X ", cheat.definition.opcodes[j]);
+                                    }
+                                    break;
+                                case 4:
+                                case 6:
+                                case 0xC4:
+                                    fprintf(file, "%08X ", cheat.definition.opcodes[j++]);
+                                case 5:
+                                case 7:
+                                case 0xC00:
+                                case 0xC02:
+                                    fprintf(file, "%08X ", cheat.definition.opcodes[j++]);
+                                case 2:
+                                case 8:
+                                case 0xC1:
+                                case 0xC2:
+                                    // Fallthrough to default
+                                default:
+                                    fprintf(file, "%08X", cheat.definition.opcodes[j]);
+                                    break;
+                            }
+                            fprintf(file, "\n");
+                        }
+                        fprintf(file, "\n");
+                    }
+                }
+            }
+            fclose(file);
+        }
+
+        if (!append) SaveToggles(togglePath);
+    }
+
+    void SaveCheatsToFile() {
+        SaveCheatsToDir("sdmc:/switch/breeze/cheats/" + GetTitleIdString() + "/");
+    }
+
+    void LoadToggles(const std::string& path) {
+        if (!isFile(path)) return;
+        
+        std::ifstream file(path);
+        std::string line;
+        std::string currentCheat;
+        
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            if (line[0] == '[') {
+                size_t end = line.find(']');
+                if (end != std::string::npos) {
+                    currentCheat = line.substr(1, end - 1);
+                }
+            } else if (!currentCheat.empty()) {
+                bool enabled = (line.find("true") != std::string::npos || line.find("on") != std::string::npos || line.find("1") != std::string::npos);
+                
+                u64 cheatCount = 0;
+                if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+                    std::vector<DmntCheatEntry> cheats(cheatCount);
+                    if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                        for (const auto& cheat : cheats) {
+                            if (currentCheat == cheat.definition.readable_name) {
+                                if (cheat.enabled != enabled) {
+                                    dmntchtToggleCheat(cheat.cheat_id);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool TryDownloadCheats(bool notify = true) {
+        EnsureMetadata();
+        std::string tid = GetTitleIdString();
+        std::string bid = GetBuildIdString();
+        std::string bid_low = ult::stringToLowercase(bid);
+
+        std::string title = tid;
+        std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tid + "/title.txt";
+        if (ult::isFile(titleFilePath)) {
+            std::ifstream tfile(titleFilePath);
+            if (std::getline(tfile, title)) ult::trim(title);
+        }
+        
+        std::string configPath = "sdmc:/config/ultrahand/cheat_url.txt";
+        if (!ult::isFile(configPath)) {
+            configPath = "sdmc:/config/ultrahand/cheat_url_txt";
+        }
+        
+        if (!ult::isFile(configPath)) {
+            if (notify) tsl::notification->show("Config not found\ncheat_url.txt");
+            return false;
+        }
+        
+        std::vector<std::string> urls;
+        std::ifstream file(configPath);
+        std::string line;
+        while (std::getline(file, line)) {
+            ult::trim(line);
+            if (!line.empty()) urls.push_back(line);
+        }
+        
+        if (urls.empty()) {
+            if (notify) tsl::notification->show("URL list is empty");
+            return false;
+        }
+
+        if (g_cheatDownloadIndex >= (int)urls.size()) {
+            if (notify) tsl::notification->show("End of URL list\n(NotFound)");
+            return false;
+        }
+        
+        std::string targetDir = "sdmc:/switch/breeze/cheats/" + tid + "/";
+        ult::createDirectory(targetDir);
+        std::string dest = targetDir + bid + ".txt";
+        
+        static constexpr SocketInitConfig socketInitConfig = {
+            .tcp_tx_buf_size     = 16 * 1024,
+            .tcp_rx_buf_size     = 16 * 1024*2,
+            .tcp_tx_buf_max_size = 64 * 1024,
+            .tcp_rx_buf_max_size = 64 * 1024*2,
+            .udp_tx_buf_size     = 512,
+            .udp_rx_buf_size     = 512,
+            .sb_efficiency       = 1,
+            .bsd_service_type    = BsdServiceType_Auto
+        };
+        bool socketInitialized = R_SUCCEEDED(socketInitialize(&socketInitConfig));
+
+        for (size_t i = g_cheatDownloadIndex; i < urls.size(); i++) {
+            std::string rawUrl = urls[i];
+            rawUrl = ReplaceAll(rawUrl, "{TID}", tid);
+            rawUrl = ReplaceAll(rawUrl, "{BID}", bid);
+            rawUrl = ReplaceAll(rawUrl, "{bid}", bid_low);
+            rawUrl = ReplaceAll(rawUrl, "{bid_lowercase}", bid_low);
+            rawUrl = ReplaceAll(rawUrl, "{TITLE}", title);
+
+            bool found = false;
+            
+            // Check base URL first
+            LogDownload(rawUrl);
+            if (ult::downloadFile(rawUrl, dest, true, true)) {
+                found = true;
+                
+                size_t lastSlash = rawUrl.find_last_of('/');
+                if (lastSlash != std::string::npos) {
+                    std::string notesUrl = rawUrl.substr(0, lastSlash + 1) + "notes.txt";
+                    LogDownload(notesUrl);
+                    ult::downloadFile(notesUrl, targetDir + "notes.txt", true, true);
+                }
+                
+                // Base exists - check for higher versions v1, v2, ... v15
+                for (int v = 1; v <= 15; v++) {
+                    std::string vUrl = rawUrl;
+                    size_t lastDot = vUrl.find_last_of('.');
+                    if (lastDot != std::string::npos && vUrl.substr(lastDot) == ".txt") {
+                        vUrl = vUrl.substr(0, lastDot) + ".v" + ult::to_string(v) + ".txt";
+                    } else {
+                        break;
+                    }
+
+                    LogDownload(vUrl);
+                    if (!ult::downloadFile(vUrl, dest, true, true)) {
+                        // Version doesn't exist - stop, use last successful download
+                        break;
+                    }
+                }
+            }
+            // If base doesn't exist, skip versions for this source
+            
+            if (found) {
+                if (socketInitialized) socketExit();
+                g_cheatDownloadIndex = i + 1;
+                if (CheatUtils::ParseCheats(dest)) {
+                    if (notify) tsl::notification->show("Downloaded & Loaded!");
+                    return true;
+                } else {
+                    if (notify) tsl::notification->show("Downloaded but empty");
+                    return false;
+                }
+            }
+        }
+        
+        if (socketInitialized) socketExit();
+        g_cheatDownloadIndex = urls.size();
+        if (notify) tsl::notification->show("No cheats found\nat current sources");
+        return false;
+    }
+
+    void AddComboKeyToCheat(u32 cheat_id, u32 key_mask) {
+        if (key_mask == 0) return; // No key?
+
+        u64 count = 0;
+        dmntchtGetCheatCount(&count);
+        std::vector<DmntCheatEntry> cheats(count);
+        dmntchtGetCheats(cheats.data(), count, 0, &count);
+
+        for (auto& cheat : cheats) {
+            if (cheat.cheat_id == cheat_id) {
+                // Check if already has a conditional
+                bool hasConditional = false;
+                if (cheat.definition.num_opcodes >= 1) {
+                     u32 firstOp = cheat.definition.opcodes[0];
+                     if ((firstOp & 0xF0000000) == 0x80000000) {
+                         // Update existing mask
+                         cheat.definition.opcodes[0] = 0x80000000 | key_mask;
+                         hasConditional = true;
+                     }
+                }
+
+                if (!hasConditional) {
+                    // Shift opcodes to make room for start (0x80000xxx) and end (0x20000000)
+                    if (cheat.definition.num_opcodes + 2 <= 0x40) { // Max opcodes check
+                        for (int i = cheat.definition.num_opcodes - 1; i >= 0; i--) {
+                            cheat.definition.opcodes[i + 1] = cheat.definition.opcodes[i];
+                        }
+                        cheat.definition.opcodes[0] = 0x80000000 | key_mask;
+                        cheat.definition.opcodes[cheat.definition.num_opcodes + 1] = 0x20000000;
+                        cheat.definition.num_opcodes += 2;
+                    } else {
+                        tsl::notification->show("Too many opcodes to add combo!");
+                        return;
+                    }
+                }
+                
+                // Refresh in dmntcht
+                dmntchtRemoveCheat(cheat.cheat_id);
+                u32 outId = 0;
+                dmntchtAddCheat(&cheat.definition, cheat.enabled, &outId);
+                
+                // Persist
+                SaveCheatsToFile();
+                return;
+            }
+        }
+    }
+
+    void RemoveComboKeyFromCheat(u32 cheat_id) {
+        u64 count = 0;
+        dmntchtGetCheatCount(&count);
+        std::vector<DmntCheatEntry> cheats(count);
+        dmntchtGetCheats(cheats.data(), count, 0, &count);
+
+        for (auto& cheat : cheats) {
+            if (cheat.cheat_id == cheat_id) {
+                if (cheat.definition.num_opcodes >= 2) {
+                    u32 first = cheat.definition.opcodes[0];
+                    u32 last = cheat.definition.opcodes[cheat.definition.num_opcodes - 1];
+                    
+                    if ((first & 0xF0000000) == 0x80000000 && (last & 0xF0000000) == 0x20000000) {
+                        // Remove first (shift left)
+                        for (u32 i = 0; i < cheat.definition.num_opcodes - 1; i++) {
+                            cheat.definition.opcodes[i] = cheat.definition.opcodes[i+1];
+                        }
+                         // Remove last (which is now at num-2 because of shift)
+                        cheat.definition.num_opcodes -= 2;
+
+                        // Refresh
+                        dmntchtRemoveCheat(cheat.cheat_id);
+                        u32 outId = 0;
+                        dmntchtAddCheat(&cheat.definition, cheat.enabled, &outId);
+                        
+                        SaveCheatsToFile();
+                        tsl::notification->show("Combo key removed");
+                    } else {
+                         tsl::notification->show("No combo key found");
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+
+class ComboSetItem : public tsl::elm::ListItem {
+private:
+    u32 cheat_id;
+    u64 holdStartTick = 0;
+    u64 capturedKeys = 0;
+    bool capturing = false;
+    std::string defaultText;
+
+    // Helper to get string name for key mask (Reused from deleted overlay, simplified)
+    std::string getKeyNames(u64 key) {
+        std::string names;
+        if (key & KEY_A) names += "A+";
+        if (key & KEY_B) names += "B+";
+        if (key & KEY_X) names += "X+";
+        if (key & KEY_Y) names += "Y+";
+        if (key & KEY_L) names += "L+";
+        if (key & KEY_R) names += "R+";
+        if (key & KEY_ZL) names += "ZL+";
+        if (key & KEY_ZR) names += "ZR+";
+        if (key & KEY_PLUS) names += "+ +";
+        if (key & KEY_MINUS) names += "- +";
+        if (key & KEY_DLEFT) names += "DLeft+";
+        if (key & KEY_DUP) names += "DUp+";
+        if (key & KEY_DRIGHT) names += "DRight+";
+        if (key & KEY_DDOWN) names += "DDown+";
+        if (key & KEY_LSTICK) names += "LS+";
+        if (key & KEY_RSTICK) names += "RS+";
+        if (!names.empty()) names.pop_back(); // Remove last +
+        return names;
+    }
+
+public:
+    ComboSetItem(const std::string& text, u32 id) : tsl::elm::ListItem(text), cheat_id(id), defaultText(text) {
+        this->setNote("Press A to start capture");
+        this->setAlwaysShowNote(true);
+    }
+
+    virtual void draw(tsl::gfx::Renderer* renderer) override {
+        tsl::elm::ListItem::draw(renderer);
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState joyStickPosLeft, HidAnalogStickState joyStickPosRight) override {
+        if (capturing) {
+            u64 keys = keysHeld & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R | KEY_ZL | KEY_ZR | KEY_PLUS | KEY_MINUS | KEY_DLEFT | KEY_DUP | KEY_DRIGHT | KEY_DDOWN | KEY_LSTICK | KEY_RSTICK);
+            
+            if (keys != 0) {
+                if (holdStartTick == 0) {
+                    holdStartTick = armGetSystemTick();
+                    capturedKeys = keys;
+                    this->setNote("Capture: " + getKeyNames(keys) + " (1s)");
+                } else {
+                    if (keys == capturedKeys) {
+                        u64 diff = armGetSystemTick() - holdStartTick;
+                        if (armTicksToNs(diff) >= 1000000000ULL) { // 1 second
+                            if (cheat_id != 0) {
+                                CheatUtils::AddComboKeyToCheat(cheat_id, capturedKeys);
+                                tsl::notification->show("Combo Key Set: " + getKeyNames(capturedKeys));
+                                capturing = false;
+                                 // Auto-return & Refresh
+                                 refreshPage.store(true, std::memory_order_release);
+                                 tsl::goBack();
+                                 return true;
+                            }
+                        } else {
+                             // Countdown/feedback
+                             float elapsed = armTicksToNs(diff) / 1000000000.0f;
+                             char buf[64];
+                             std::snprintf(buf, sizeof(buf), "Capture: %s (%.1fs)", getKeyNames(capturedKeys).c_str(), 1.0f - elapsed);
+                             this->setNote(buf);
+                        }
+                    } else {
+                        // Keys changed, reset timer
+                        holdStartTick = armGetSystemTick();
+                        capturedKeys = keys;
+                        this->setNote("Capture: " + getKeyNames(keys) + " (1s)");
+                    }
+                }
+            } else {
+                holdStartTick = 0;
+                capturedKeys = 0;
+                this->setNote("Hold keys for 1 second");
+            }
+            // Consume EVERYTHING including B while capturing
+            return true;
+        }
+
+        if (!this->hasFocus()) {
+            holdStartTick = 0;
+            capturedKeys = 0;
+            capturing = false;
+            this->setNote("Press A to start capture");
+        }
+
+        return tsl::elm::ListItem::handleInput(keysDown, keysHeld, touchPos, joyStickPosLeft, joyStickPosRight);
+    }
+
+    virtual bool onClick(u64 keys) override {
+        if (keys & KEY_A) {
+            if (!capturing) {
+                capturing = true;
+                holdStartTick = 0;
+                capturedKeys = 0;
+                this->setNote("Hold keys for 2 seconds");
+                return true;
+            }
+        }
+        return tsl::elm::ListItem::onClick(keys);
+    }
+    
+    // Override click listener to do nothing or show info
+};
+    class CheatToggleItem : public tsl::elm::ToggleListItem {
+    public:
+        u32 cheat_id;
+        CheatToggleItem(const std::string& name, bool state, u32 id, u8 fontSize) 
+            : tsl::elm::ToggleListItem(name, state, "", "", true), cheat_id(id) {
+            this->setUseLeftBox(true);
+            this->setFontSize(fontSize);
+        }
+    };
+    std::string GetComboKeyGlyphs(u32 key_mask) {
+        if (key_mask == 0) return "";
+        std::string glyphs;
+        for (const auto& info : ult::KEYS_INFO) {
+            if (key_mask & (u32)info.key) {
+                glyphs += info.glyph;
+            }
+        }
+        if (!glyphs.empty()) glyphs += " ";
+        return glyphs;
+    }
+} // namespace CheatUtils
+
 class MainMenu : public tsl::Gui {
+
 private:
     std::string packageIniPath = PACKAGE_PATH + PACKAGE_FILENAME;
     std::string packageConfigIniPath = PACKAGE_PATH + CONFIG_FILENAME;
@@ -6641,6 +6973,10 @@ private:
     bool useDefaultMenu = false;
     bool useOverlayLaunchArgs = false;
     std::string hiddenMenuMode, dropdownSection;
+    u8 m_cheatFontSize = 21;
+    std::string m_notesPath = "";
+    bool m_notesLoaded = false;
+    tsl::elm::List *cheatList = nullptr;
     //bool initializingSpawn = false;
     //std::string defaultLang = "en";
 
@@ -6653,6 +6989,8 @@ public:
      */
     MainMenu(const std::string& hiddenMenuMode = "", const std::string& sectionName = "") : hiddenMenuMode(hiddenMenuMode), dropdownSection(sectionName) {
         std::lock_guard<std::mutex> lock(transitionMutex);
+        // dmntchtInitialize moved to Overlay::initServices to support background thread
+        //dmntchtInitialize();
         //tsl::gfx::FontManager::clearCache();
         {
             //std::lock_guard<std::mutex> lock(jumpItemMutex);
@@ -6672,6 +7010,8 @@ public:
      */
     ~MainMenu() {
         std::lock_guard<std::mutex> lock(transitionMutex);
+        // dmntchtExit moved to Overlay::exitServices
+        //dmntchtExit();
     }
     
     /**
@@ -6743,12 +7083,16 @@ public:
         bool noClickableItems = false;
         
         if (menuMode == OVERLAYS_STR) {
-            createOverlaysMenu(list);
+            createCheatsMenu(list);
         } else if (menuMode == PACKAGES_STR) {
             noClickableItems = createPackagesMenu(list);
         }
     
-        auto* rootFrame = new tsl::elm::OverlayFrame(CAPITAL_ULTRAHAND_PROJECT_NAME, versionLabel, noClickableItems, menuMode+hiddenMenuMode+dropdownSection, "", "", "");
+        std::string frameTitle = CAPITAL_ULTRAHAND_PROJECT_NAME;
+        if (menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty()) {
+            frameTitle = g_cheatFolderNameStack.back();
+        }
+        auto* rootFrame = new tsl::elm::OverlayFrame(frameTitle, versionLabel, noClickableItems, menuMode, "", "", "");
         
         list->jumpToItem(jumpItemName, jumpItemValue, jumpItemExactMatch.load(acquire));
         //if (g_overlayFilename != "ovlmenu.ovl") {
@@ -6763,136 +7107,197 @@ public:
     }
     
         
-    void createOverlaysMenu(tsl::elm::List* list) {
+    void createCheatsMenu(tsl::elm::List* list) {
         inOverlaysPage.store(true, std::memory_order_release);
         inPackagesPage.store(false, std::memory_order_release);
     
-        addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? OVERLAYS : HIDDEN_OVERLAYS)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+FAVORITE);
+        addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " + ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " + ult::SETTINGS);
         
-        std::vector<std::string> overlayFiles = getFilesListByWildcards(OVERLAY_PATH+"*.ovl");
-        
-        #if !USING_FSTREAM_DIRECTIVE
-        if (!isFile(OVERLAYS_INI_FILEPATH)) {
-            FILE* createFile = fopen(OVERLAYS_INI_FILEPATH.c_str(), "w");
-            if (createFile) fclose(createFile);
+        bool hasCheatProcess = false;
+        dmntchtHasCheatProcess(&hasCheatProcess);
+        if (!hasCheatProcess) {
+            dmntchtForceOpenCheatProcess();
+            dmntchtHasCheatProcess(&hasCheatProcess);
         }
-        #else
-        if (!isFile(OVERLAYS_INI_FILEPATH)) {
-            std::ofstream createFile(OVERLAYS_INI_FILEPATH);
-            createFile.close();
+
+        if (!hasCheatProcess) {
+            list->addItem(new tsl::elm::ListItem("No game running"));
+            return;
         }
-        #endif
-    
-        if (overlayFiles.empty()) return;
-    
-        std::set<std::string> overlaySet;
-        bool drawHiddenTab = false;
-        
-        // Scope to immediately free INI data after processing
-        {
-            auto overlaysIniData = getParsedDataFromIniFile(OVERLAYS_INI_FILEPATH);
-            bool overlaysNeedsUpdate = false;
-            bool foundOvlmenu = false;
-    
-            // Filter in one pass, remove ovlmenu and dot files
-            overlayFiles.erase(
-                std::remove_if(overlayFiles.begin(), overlayFiles.end(),
-                    [&foundOvlmenu](const std::string& file) {
-                        const std::string fileName = getNameFromPath(file);
-                        if (!foundOvlmenu && fileName == "ovlmenu.ovl") {
-                            foundOvlmenu = true;
+
+        u64 cheatCount = 0;
+        this->cheatList = list;
+
+        DmntCheatProcessMetadata metadata;
+        std::string notesPath;
+        if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+            std::stringstream ss;
+            ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+            m_notesPath = ss.str();
+        }
+
+        if (!m_notesLoaded && !m_notesPath.empty()) {
+            std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+            if (!fontSizeStr.empty()) {
+                m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+            }
+            std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+            if (!showNotesStr.empty()) {
+                ult::showCheatNotes = (showNotesStr == "true");
+            }
+            m_notesLoaded = true;
+        }
+
+        auto notesData = getParsedDataFromIniFile(m_notesPath);
+
+        if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
+            std::vector<DmntCheatEntry> cheats(cheatCount);
+            if (R_SUCCEEDED(dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+                
+                if (!g_cheatFolderNameStack.empty()) {
+                    auto* backItem = new tsl::elm::ListItem(".. [Back]");
+                    backItem->setFontSize(m_cheatFontSize);
+                    backItem->setClickListener([](u64 keys) {
+                        if (keys & KEY_A) {
+                            if (!g_cheatFolderNameStack.empty()) {
+                                jumpItemName = "\uE132 " + g_cheatFolderNameStack.back();
+                                jumpItemExactMatch.store(true, release);
+                                skipJumpReset.store(true, release);
+                                g_cheatFolderNameStack.pop_back();
+                            }
+                            if (!g_cheatFolderIndexStack.empty()) g_cheatFolderIndexStack.pop_back();
+                            refreshPage.store(true, std::memory_order_release);
                             return true;
                         }
-                        return fileName.front() == '.';
-                    }),
-                overlayFiles.end()
-            );
-    
-            // Pre-allocate string buffers to avoid repeated allocations
-            std::string overlayFileName, overlayEntryKey;
-            overlayFileName.reserve(64);
-            overlayEntryKey.reserve(256);
-    
-            for (auto& overlayFile : overlayFiles) {
-                overlayFileName = getNameFromPath(overlayFile);
-                overlayFile.clear(); // Free memory immediately
-                
-                auto it = overlaysIniData.find(overlayFileName);
-                if (it == overlaysIniData.end()) {
-                    const auto& [result, overlayName, overlayVersion, usingLibUltrahand, supportsAMS110] = getOverlayInfo(OVERLAY_PATH + overlayFileName);
-                    if (result != ResultSuccess) continue;
-    
-                    auto& overlaySection = overlaysIniData[overlayFileName];
-                    overlaySection[PRIORITY_STR] = "20";
-                    overlaySection[STAR_STR] = FALSE_STR;
-                    overlaySection[HIDE_STR] = FALSE_STR;
-                    overlaySection[USE_LAUNCH_ARGS_STR] = FALSE_STR;
-                    overlaySection[LAUNCH_ARGS_STR] = "";
-                    overlaySection["custom_name"] = "";
-                    overlaySection["custom_version"] = "";
-                    overlaysNeedsUpdate = true;
-    
-                    // Build entry key with single allocation
-                    //overlayEntryKey.clear();
-                    //overlayEntryKey.reserve(4 + overlayName.size() + 1 + overlayName.size() + 1 + 
-                    //                       overlayVersion.size() + 1 + overlayFileName.size() + 8);
+                        return false;
+                    });
+                    list->addItem(backItem);
+                }
 
-                    overlayEntryKey = "0020" + overlayName + ':' + overlayName + ':' + 
-                                      overlayVersion + ':' + overlayFileName + ':' + 
-                                      (usingLibUltrahand ? '1' : '0') + ':' + 
-                                      (supportsAMS110 ? '1' : '0') + ":0";
-                    overlaySet.emplace(std::move(overlayEntryKey));
-                } else {
-                    const std::string& hide = getValueOrDefault(it->second, HIDE_STR, FALSE_STR);
-                    const bool isHidden = (hide == TRUE_STR);
-                    
-                    if (isHidden) {
-                        if (!hideUnsupported || !requiresLNY2 || 
-                            usingLNY2(OVERLAY_PATH + overlayFileName) || 
-                            getValueOrDefault(it->second, "force_support", FALSE_STR) == TRUE_STR) {
-                            drawHiddenTab = true;
+                u32 currentDepth = 0;
+                u32 targetDepth = g_cheatFolderIndexStack.size();
+                bool inTargetFolder = (targetDepth == 0);
+                u32 targetMatchCount = 0;
+
+                for (u32 i = 0; i < cheatCount; i++) {
+                    const auto& cheat = cheats[i];
+                    u32 opcode = (cheat.definition.num_opcodes > 0) ? cheat.definition.opcodes[0] : 0;
+                    bool isFolderStart = (opcode == 0x20000000);
+                    bool isFolderEnd = (opcode == 0x20000001);
+
+                    if (isFolderStart) {
+                        if (inTargetFolder && currentDepth == targetDepth) {
+                            std::string folderName = "\uE132 " + std::string(cheat.definition.readable_name);
+                            auto* folderItem = new tsl::elm::ListItem(folderName);
+                            folderItem->setUseWrapping(true);
+                            folderItem->setFontSize(m_cheatFontSize);
+                            
+                            auto it = notesData.find(cheat.definition.readable_name);
+                            if (it != notesData.end()) {
+                                auto noteIt = it->second.find("note");
+                                if (noteIt != it->second.end()) folderItem->setNote(noteIt->second);
+                            }
+                            
+                            u32 folderIdx = i;
+                            std::string rawName = cheat.definition.readable_name;
+                            folderItem->setClickListener([folderIdx, rawName](u64 keys) {
+                                if (keys & KEY_A) {
+                                    g_cheatFolderIndexStack.push_back(folderIdx);
+                                    g_cheatFolderNameStack.push_back(rawName);
+                                    refreshPage.store(true, std::memory_order_release);
+                                    return true;
+                                }
+                                return false;
+                            });
+                            list->addItem(folderItem);
                         }
+                        currentDepth++;
+                        if (!inTargetFolder && currentDepth <= targetDepth) {
+                            if (i == g_cheatFolderIndexStack[currentDepth - 1]) {
+                                targetMatchCount = currentDepth;
+                                if (targetMatchCount == targetDepth) inTargetFolder = true;
+                            }
+                        }
+                        continue;
                     }
-                    
-                    if (inHiddenMode.load(std::memory_order_acquire) == isHidden) {
-                        const auto& [result, overlayName, overlayVersion, usingLibUltrahand, supportsAMS110] = getOverlayInfo(OVERLAY_PATH + overlayFileName);
-                        if (result != ResultSuccess) continue;
+
+                    if (isFolderEnd) {
+                        if (currentDepth == targetDepth && inTargetFolder) inTargetFolder = false;
+                        if (currentDepth > 0) currentDepth--;
+                        if (targetMatchCount > currentDepth) {
+                            targetMatchCount = currentDepth;
+                            inTargetFolder = (targetMatchCount == targetDepth);
+                        }
+                        continue;
+                    }
+
+                    if (inTargetFolder && currentDepth == targetDepth) {
+                        u32 key_mask = 0;
+                        if (cheat.definition.num_opcodes >= 1) {
+                             u32 firstOp = cheat.definition.opcodes[0];
+                             if ((firstOp & 0xF0000000) == 0x80000000) key_mask = firstOp & 0x0FFFFFFF;
+                        }
+                        std::string displayName = CheatUtils::GetComboKeyGlyphs(key_mask) + cheat.definition.readable_name;
+                        auto* item = new CheatUtils::CheatToggleItem(displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
+
+                        auto it = notesData.find(cheat.definition.readable_name);
+                        if (it != notesData.end()) {
+                            auto noteIt = it->second.find("note");
+                            if (noteIt != it->second.end()) item->setNote(noteIt->second);
+                        }
                         
-                        const std::string& priority = (it->second.find(PRIORITY_STR) != it->second.end()) ? formatPriorityString(it->second[PRIORITY_STR]) : "0020";
-                        const std::string& starred = getValueOrDefault(it->second, STAR_STR, FALSE_STR);
-                        const std::string& customName = getValueOrDefault(it->second, "custom_name", "");
-                        const std::string& customVersion = getValueOrDefault(it->second, "custom_version", "");
-                        
-                        const std::string& assignedName = !customName.empty() ? customName : overlayName;
-                        const std::string& assignedVersion = !customVersion.empty() ? customVersion : overlayVersion;
-                        const bool forceAMS110Support = getValueOrDefault(it->second, "force_support", FALSE_STR) == TRUE_STR;
-    
-                        // Build entry key with single allocation
-                        //overlayEntryKey.clear();
-                        //const bool isStarred = (starred == TRUE_STR);
-                        //const size_t estimatedSize = (isStarred ? 3 : 0) + priority.size() + 
-                        //                            assignedName.size() * 2 + assignedVersion.size() + 
-                        //                            overlayFileName.size() + 10;
-                        //overlayEntryKey.reserve(estimatedSize);
-                        
-                        overlayEntryKey = (starred == TRUE_STR ? "-1:" : "") + priority + assignedName + ':' + 
-                                          assignedName + ':' + assignedVersion + ':' + overlayFileName + ':' + 
-                                          (usingLibUltrahand ? '1' : '0') + ':' + 
-                                          (supportsAMS110 ? '1' : '0') + ':' + 
-                                          (forceAMS110Support ? '1' : '0');
-                        overlaySet.emplace(std::move(overlayEntryKey));
+                        item->setStateChangedListener([cheat](bool state) {
+                            dmntchtToggleCheat(cheat.cheat_id);
+                        });
+
+                        item->setClickListener([cheat](u64 keys) {
+                            if (keys & KEY_X) {
+                                tsl::changeTo<CheatMenu>(cheat.cheat_id, cheat.definition.readable_name);
+                                return true;
+                            }
+                            return false;
+                        });
+
+                        list->addItem(item);
                     }
                 }
+            } else {
+                list->addItem(new tsl::elm::ListItem("Failed to retrieve cheats"));
             }
-            
-            if (overlaysNeedsUpdate) {
-                saveIniFileData(OVERLAYS_INI_FILEPATH, overlaysIniData);
+        } else {
+            // Auto-load Logic
+            static u64 lastAutoLoadTid = 0;
+            static u64 lastAutoLoadBid = 0;
+            bool alreadyTried = (lastAutoLoadTid == metadata.title_id && lastAutoLoadBid == *((u64*)metadata.main_nso_build_id));
+
+            if (!alreadyTried) {
+                lastAutoLoadTid = metadata.title_id;
+                lastAutoLoadBid = *((u64*)metadata.main_nso_build_id);
+
+                std::string tidStr = CheatUtils::GetTitleIdString();
+                std::string bidStr = CheatUtils::GetBuildIdString();
+                std::string localPath = "sdmc:/switch/breeze/cheats/" + tidStr + "/" + bidStr + ".txt";
+
+                if (ult::isFile(localPath)) {
+                    if (CheatUtils::ParseCheats(localPath)) {
+                        refreshPage.store(true, std::memory_order_release);
+                        return;
+                    }
+                }
+
+                // Fallback to Download
+                // if (CheatUtils::TryDownloadCheats(false)) { // false = quiet mode
+                //     refreshPage.store(true, std::memory_order_release);
+                //     return;
+                // }
             }
-        } // overlaysIniData freed here
-        
-        overlayFiles.clear();
-        overlayFiles.shrink_to_fit();
-        
+
+            list->addItem(new tsl::elm::ListItem("No cheats found"));
+        }
+    }
+
+    /* LEGACY OVERLAY CODE - DISABLED
+    void legacyCreateOverlaysMenu(tsl::elm::List* list) {
         if (overlaySet.empty()) {
             addSelectionIsEmptyDrawer(list);
         } else {
@@ -6922,145 +7327,10 @@ public:
             };
 
 
-            // Process overlay set and add to list
-            for (const auto& taintedOverlayFileName : overlaySet) {
-                overlayFileName.clear();
-                overlayName.clear();
-                overlayVersion.clear();
-                const bool overlayStarred = (taintedOverlayFileName.compare(0, 3, "-1:") == 0);
-                bool usingLibUltrahand = false;
-                bool supportsAMS110 = false;
-                bool forceAMS110Support = false;
-                
-                // Parse from the end - optimized with fewer branches
-                const size_t len = taintedOverlayFileName.size();
-                size_t pos = len;
-                size_t positions[6];
-                size_t count = 0;
-                
-                // Unrolled loop for better performance on ARMv8-A
-                while (pos > 0 && count < 6) {
-                    pos = taintedOverlayFileName.rfind(':', pos - 1);
-                    if (pos == std::string::npos) break;
-                    positions[count++] = pos;
-                }
-                
-                if (count == 6) {
-                    // Direct character access instead of substr for single chars
-                    forceAMS110Support = (taintedOverlayFileName[positions[0] + 1] == '1');
-                    supportsAMS110 = (taintedOverlayFileName[positions[1] + 1] == '1');
-                    usingLibUltrahand = (taintedOverlayFileName[positions[2] + 1] == '1');
-                    overlayFileName.assign(taintedOverlayFileName, positions[3] + 1, positions[2] - positions[3] - 1);
-                    overlayVersion.assign(taintedOverlayFileName, positions[4] + 1, positions[3] - positions[4] - 1);
-                    overlayName.assign(taintedOverlayFileName, positions[5] + 1, positions[4] - positions[5] - 1);
-                }
-    
-                const bool requiresAMS110Handling = (requiresLNY2 && !supportsAMS110 && !forceAMS110Support);
-                if (hideUnsupported && requiresAMS110Handling)
-                    continue;
-    
-                const std::string overlayFile = OVERLAY_PATH + overlayFileName;
-                if (!isFile(overlayFile)) continue;
-                
-                // Build newOverlayName with single allocation
-                newOverlayName.clear();
-                if (overlayStarred) {
-                    newOverlayName.reserve(STAR_SYMBOL.size() + 2 + overlayName.size() + 1 + overlayFileName.size());
-                    newOverlayName = STAR_SYMBOL;
-                    newOverlayName += "  ";
-                    newOverlayName += overlayName;
-                } else {
-                    newOverlayName = overlayName;
-                }
-                newOverlayName += '?';
-                newOverlayName += overlayFileName;
-                
-                const bool newStarred = !overlayStarred;
-                
-                tsl::elm::ListItem* listItem = new tsl::elm::ListItem(newOverlayName, "");
-                listItem->enableShortHoldKey();
-                listItem->enableLongHoldKey();
-                
-                if (!hideOverlayVersions) {
-                    displayVersion = getFirstLongEntry(overlayVersion);
-                    if (cleanVersionLabels) displayVersion = cleanVersionLabel(displayVersion);
-                    listItem->setValue(displayVersion, true);
-                    listItem->setValueColor(usingLibUltrahand ? (useLibultrahandVersions ? tsl::ultOverlayVersionTextColor : tsl::overlayVersionTextColor) : tsl::overlayVersionTextColor);
-                }
-                listItem->setTextColor(requiresAMS110Handling ? tsl::warningTextColor : usingLibUltrahand ? (useLibultrahandTitles ? tsl::ultOverlayTextColor : tsl::overlayTextColor) : tsl::overlayTextColor);
-                
-                if (overlayFileName == lastOverlayFilename) {
-                    lastOverlayFilename = "";
-                    jumpItemName = newOverlayName;
-                    jumpItemValue = hideOverlayVersions ? "" : displayVersion;
-                    jumpItemExactMatch.store(true, std::memory_order_release);
-                }
-                                
-                listItem->setClickListener([listItem, overlayFile, newStarred, overlayFileName, overlayName, overlayVersion, requiresAMS110Handling, supportsAMS110, buildOverlayReturnName](s64 keys) {
-                    if (runningInterpreter.load(std::memory_order_acquire)) return false;
-                    
-                    if (simulatedMenu.load(std::memory_order_acquire)) {
-                        keys |= SYSTEM_SETTINGS_KEY;
-                    }
-                    
-                    // Check for single key press (no other keys)
-                    const s64 cleanKeys = keys & ALL_KEYS_MASK;
-                    
-                    if ((keys & KEY_A && cleanKeys == KEY_A)) {
-                        if (!requiresAMS110Handling) {
-                            disableSound.store(true, std::memory_order_release);
-                            
-                            std::string useOverlayLaunchArgs, overlayLaunchArgs;
-                            {
-                                auto overlaysIniData = getParsedDataFromIniFile(OVERLAYS_INI_FILEPATH);
-                                auto sectionIt = overlaysIniData.find(overlayFileName);
-                                if (sectionIt != overlaysIniData.end()) {
-                                    auto useArgsIt = sectionIt->second.find(USE_LAUNCH_ARGS_STR);
-                                    if (useArgsIt != sectionIt->second.end()) useOverlayLaunchArgs = useArgsIt->second;
-                                    auto argsIt = sectionIt->second.find(LAUNCH_ARGS_STR);
-                                    if (argsIt != sectionIt->second.end()) overlayLaunchArgs = argsIt->second;
-                                }
-                                removeQuotes(overlayLaunchArgs);
-                            }
-                            
-                            {
-                                auto iniData = getParsedDataFromIniFile(ULTRAHAND_CONFIG_INI_PATH);
-                                auto& ultrahandSection = iniData[ULTRAHAND_PROJECT_NAME];
-                                if (inHiddenMode.load(std::memory_order_acquire)) ultrahandSection[IN_HIDDEN_OVERLAY_STR] = TRUE_STR;
-                                ultrahandSection[IN_OVERLAY_STR] = TRUE_STR;
-                                saveIniFileData(ULTRAHAND_CONFIG_INI_PATH, iniData);
-                            }
-                            
-                            launchComboHasTriggered.store(true, std::memory_order_acquire);
-                            ult::launchingOverlay.store(true, std::memory_order_release);
-                            if (useOverlayLaunchArgs == TRUE_STR) tsl::setNextOverlay(overlayFile, overlayLaunchArgs);
-                            else tsl::setNextOverlay(overlayFile);
-                            
-                            tsl::Overlay::get()->close(true);
-                            return true;
-                        
-                        } else {
-                            if (tsl::notification) {
-                                tsl::notification->showNow(ult::NOTIFY_HEADER+INCOMPATIBLE_WARNING, 22);
-                            }
-                            
-                            return true;
-                        }
-                    }
-                    
-                    if (keys & STAR_KEY && cleanKeys == STAR_KEY) {
-                        if (!overlayFile.empty()) {
-                            setIniFileValue(OVERLAYS_INI_FILEPATH, overlayFileName, STAR_STR, newStarred ? TRUE_STR : FALSE_STR);
-                        }
-                        
-                        skipJumpReset.store(true, std::memory_order_release);
-                        jumpItemName = buildOverlayReturnName(!newStarred, overlayFileName, overlayName);
-                        jumpItemValue = hideOverlayVersions ? "" : overlayVersion;
-                        jumpItemExactMatch.store(true, std::memory_order_release);
 
 
                         
-                        wasInHiddenMode = inHiddenMode.load(std::memory_order_acquire);
+
                         if (wasInHiddenMode) {
                             inMainMenu.store(false, std::memory_order_release);
                             reloadMenu2 = true;
@@ -7138,6 +7408,8 @@ public:
             list->addItem(listItem);
         }
     }
+    */
+
     
     bool createPackagesMenu(tsl::elm::List* list) {
         if (!isFile(PACKAGE_PATH + PACKAGE_FILENAME)) {
@@ -7269,7 +7541,7 @@ public:
             bool firstItem = true;
             for (const auto& taintedPackageName : packageSet) {
                 if (firstItem) {
-                    addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? PACKAGES : HIDDEN_PACKAGES)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+FAVORITE);
+                    addHeader(list, (!inHiddenMode.load(std::memory_order_acquire) ? PACKAGES : HIDDEN_PACKAGES)+" "+DIVIDER_SYMBOL+" \uE0E3 "+SETTINGS+" "+DIVIDER_SYMBOL+" \uE0E2 "+SETTINGS);
                     firstItem = false;
                 }
                 
@@ -7467,7 +7739,72 @@ public:
             noClickableItems = drawCommandsMenu(list, packageIniPath, packageConfigIniPath, packageHeader, "", pageLeftName, pageRightName,
                 PACKAGE_PATH, LEFT_STR, "package.ini", this->dropdownSection, 0, pathPattern, pathPatternOn, pathPatternOff, usingPages, false);
     
-            if (!hideUserGuide && dropdownSection.empty()) addHelpInfo(list);
+            if (!hideUserGuide && dropdownSection.empty()) {
+                // Display game info before User Guide
+                DmntCheatProcessMetadata metadata;
+                if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                    this->cheatList = list;
+                    
+                    if (m_notesPath.empty()) {
+                        std::stringstream ss;
+                        ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+                        m_notesPath = ss.str();
+                    }
+
+                    if (!m_notesLoaded && !m_notesPath.empty()) {
+                        std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+                        if (!fontSizeStr.empty()) {
+                            m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+                        }
+                        std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+                        if (!showNotesStr.empty()) {
+                            ult::showCheatNotes = (showNotesStr == "true");
+                        }
+                        m_notesLoaded = true;
+                    }
+
+                    CheatUtils::EnsureMetadata();
+                    std::string tidStr = CheatUtils::GetTitleIdString();
+                    std::string bidStr = CheatUtils::GetBuildIdString();
+                    
+                    std::string titleStr = "";
+                    std::string versionStr = "";
+                    static NsApplicationControlData appControlData;
+                    size_t appControlDataSize = 0;
+                    NacpLanguageEntry *languageEntry = nullptr;
+                    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData, sizeof(NsApplicationControlData), &appControlDataSize))) {
+                        if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp, &languageEntry)) && languageEntry) {
+                            titleStr = languageEntry->name;
+                        }
+                        versionStr = appControlData.nacp.display_version;
+                    }
+
+                    if (titleStr.empty()) {
+                        titleStr = tidStr;
+                        std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
+                        if (ult::isFile(titleFilePath)) {
+                            std::ifstream tfile(titleFilePath);
+                            if (std::getline(tfile, titleStr)) ult::trim(titleStr);
+                        }
+                    }
+                    
+                    auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+                    titleItem->setUseWrapping(true);
+                    titleItem->setFontSize(m_cheatFontSize);
+                    list->addItem(titleItem);
+
+                    auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+                    tidItem->setUseWrapping(true);
+                    tidItem->setFontSize(m_cheatFontSize);
+                    list->addItem(tidItem);
+
+                    auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+                    bidItem->setUseWrapping(true);
+                    bidItem->setFontSize(m_cheatFontSize);
+                    list->addItem(bidItem);
+                }
+                addHelpInfo(list);
+            }
         }
         
         return noClickableItems;
@@ -7488,6 +7825,86 @@ public:
      */
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         
+        if (keysHeld & (KEY_ZL)) {
+            if (keysDown & KEY_R) {
+                m_cheatFontSize = std::min(static_cast<int>(m_cheatFontSize) + 1, 30);
+                if (cheatList) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                    }
+                    cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                    if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
+                }
+                return true;
+            }
+            if (keysDown & KEY_L) {
+                m_cheatFontSize = std::max(static_cast<int>(m_cheatFontSize) - 1, 10);
+                if (cheatList) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                    }
+                    cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                    if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
+                }
+                return true;
+            }
+        }
+
+        // Y button toggles notes visibility
+        if (keysDown & KEY_Y) {
+            ult::showCheatNotes = !ult::showCheatNotes;
+            if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "show_notes", ult::showCheatNotes ? "true" : "false");
+            if (cheatList && menuMode == OVERLAYS_STR) {
+                struct ListProxy : public tsl::elm::List {
+                    using tsl::elm::List::m_items;
+                };
+                // Reset calculated heights to force recalculation with new note visibility
+                for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
+                    static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize); // This resets height
+                }
+                cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+            }
+            return true;
+        }
+
+
+        // X button switches to CheatMenu (Settings for cheats)
+        if (keysDown & KEY_X) {
+            if (menuMode == OVERLAYS_STR) {
+                u32 cheatId = 0;
+                std::string cheatName = "";
+                
+                if (this->cheatList) {
+                    struct ListProxy : public tsl::elm::List {
+                        using tsl::elm::List::m_items;
+                    };
+                    for (auto* item : static_cast<ListProxy*>(this->cheatList)->m_items) {
+                        if (item && item->hasFocus()) {
+                             auto* listItem = static_cast<tsl::elm::ListItem*>(item);
+                             std::string text = listItem->getText();
+                             // Only cast to CheatToggleItem if it's actually a cheat item
+                             if (!text.empty() && text != "No cheats found" && text != "Failed to retrieve cheats") {
+                                 auto* cheatItem = static_cast<CheatUtils::CheatToggleItem*>(listItem);
+                                 if (cheatItem->cheat_id != 0) {
+                                     cheatId = cheatItem->cheat_id;
+                                     cheatName = text;
+                                 }
+                             }
+                             break;
+                        }
+                    }
+                }
+                
+                tsl::changeTo<CheatMenu>(cheatId, cheatName);
+                return true;
+            }
+        }
         bool isHolding = (lastCommandIsHold && runningInterpreter.load(std::memory_order_acquire));
         if (isHolding) {
             processHold(keysDown, keysHeld, holdStartTick, isHolding, [&]() {
@@ -7635,6 +8052,17 @@ public:
         // Common condition for back key handling
         const bool backKeyPressed = !isTouching && ((((keysDown & KEY_B)) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
         
+        if (inMainMenu.load(acquire) && menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty() && backKeyPressed) {
+            jumpItemName = "\uE132 " + g_cheatFolderNameStack.back();
+            jumpItemExactMatch.store(true, release);
+            skipJumpReset.store(true, release);
+            g_cheatFolderNameStack.pop_back();
+            g_cheatFolderIndexStack.pop_back();
+            refreshPage.store(true, release);
+            triggerExitSound.store(true, release);
+            return true;
+        }
+
         if (!dropdownSection.empty() && !returningToMain) {
             simulatedNextPage.exchange(false, std::memory_order_acq_rel);
             simulatedMenu.exchange(false, std::memory_order_acq_rel);
@@ -8092,6 +8520,7 @@ public:
      */
     virtual void onHide() override {} 
 
+
     /**
      * @brief Loads the initial graphical user interface (GUI) for the overlay.
      *
@@ -8267,6 +8696,12 @@ public:
 
         deleteFileOrDirectory(RELOADING_FLAG_FILEPATH);
         unpackDeviceInfo();
+
+        // Initialize dmntcht and ns
+        dmntchtInitialize();
+        nsInitialize();
+        
+        // CheckButtons thread removed
     }
     
     /**
@@ -8277,6 +8712,11 @@ public:
      * properly shut down services to avoid memory leaks.
      */
     virtual void exitServices() override {
+        // thread cleanup removed
+
+        dmntchtExit();
+        nsExit();
+
         closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
 
         if (exitingUltrahand.load(acquire) && !reloadingBoot)
@@ -8305,6 +8745,563 @@ public:
  * @param argv An array of C-style strings representing command-line arguments.
  * @return The application's exit code.
  */
+bool UltrahandSettingsMenu::handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) {
+        
+        // Handle delete item continuous hold behavior
+        if (isHolding) {
+            processHold(keysDown, keysHeld, holdStartTick, isHolding, [this]() {
+                if (requestOverlayExit()) {
+                    ult::launchingOverlay.store(true, std::memory_order_release);
+                    tsl::Overlay::get()->close();
+                }
+            });
+        }
+
+        const bool isRunningInterp = runningInterpreter.load(acquire);
+        
+        if (isRunningInterp) {
+            return handleRunningInterpreter(keysDown, keysHeld);
+        }
+        
+        if (lastRunningInterpreter.exchange(false, std::memory_order_acq_rel)) {
+            isDownloadCommand.store(false, release);
+            if (lastSelectedListItem) {
+                lastSelectedListItem->setValue(commandSuccess.load(acquire) ? CHECKMARK_SYMBOL : CROSSMARK_SYMBOL);
+                lastSelectedListItem->enableClickAnimation();
+                lastSelectedListItem = nullptr;
+            }
+
+            closeInterpreterThread();
+            resetPercentages();
+
+            if (!commandSuccess.load()) {
+                triggerRumbleDoubleClick.store(true, std::memory_order_release);
+            }
+
+            if (!limitedMemory && useSoundEffects) {
+                reloadSoundCacheNow.store(true, std::memory_order_release);
+                //ult::Audio::initialize();
+            }
+            //lastRunningInterpreter.store(false, std::memory_order_release);
+            return true;
+        }
+        
+        if (goBackAfter.exchange(false, std::memory_order_acq_rel)) {
+            disableSound.store(true, std::memory_order_release);
+            simulatedBack.store(true, std::memory_order_release);
+            return true;
+        }
+
+        //if (refreshPage.load(acquire)) {
+        //    //tsl::goBack();tsl::changeTo<UltrahandSettingsMenu>(targetMenu);
+        //    tsl::swapTo<UltrahandSettingsMenu>("languageMenu");
+        //    refreshPage.store(false, release);
+        //}
+        
+        if (inSettingsMenu && !inSubSettingsMenu) {
+            if (!returningToSettings) {
+                //if (simulatedNextPage.load(acquire))
+                //    simulatedNextPage.store(false, release);
+                //if (simulatedMenu.load(acquire))
+                //    simulatedMenu.store(false, release);
+                simulatedNextPage.exchange(false, std::memory_order_acq_rel);
+                simulatedMenu.exchange(false, std::memory_order_acq_rel);
+                
+                const bool isTouching = stillTouching.load(acquire);
+                const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
+                
+                if (backKeyPressed) {
+
+                    allowSlide.exchange(false, std::memory_order_acq_rel);
+                    unlockedSlide.exchange(false, std::memory_order_acq_rel);
+                    inSettingsMenu = false;
+                    returningToMain = (lastMenu != "hiddenMenuMode");
+                    returningToHiddenMain = !returningToMain;
+                    lastMenu = "settingsMenu";
+                    
+                    if (reloadMenu) {
+                        //sl::pop(2);
+                        tsl::swapTo<MainMenu>(SwapDepth(3), lastMenuMode);
+                        reloadMenu = false;
+                    } else {
+                        tsl::goBack();
+                    }
+                    return true;
+                }
+            } else {
+                returningToSettings = false;
+            }
+        } else if (inSubSettingsMenu) {
+            simulatedNextPage.exchange(false, std::memory_order_acq_rel);
+            simulatedMenu.exchange(false, std::memory_order_acq_rel);
+            
+            const bool isTouching = stillTouching.load(acquire);
+            const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
+            
+            if (backKeyPressed) {
+                if (exitOnBack) {
+                    ult::launchingOverlay.store(true, std::memory_order_release);
+                    tsl::Overlay::get()->close();
+                    return true;
+                }
+
+                if (softwareHasUpdated) {
+                    // Instead of going back, trigger the reload directly
+                    //disableSound.store(true, std::memory_order_release);
+
+                    setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_OVERLAY_STR, TRUE_STR);
+
+                    ult::launchingOverlay.store(true, std::memory_order_release);
+                    tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl", "--skipCombo --comboReturn");
+                    tsl::Overlay::get()->close();
+                    return true;
+                }
+
+                allowSlide.exchange(false, std::memory_order_acq_rel);
+                unlockedSlide.exchange(false, std::memory_order_acq_rel);
+                inSubSettingsMenu = false;
+                returningToSettings = true;
+                
+                if (reloadMenu2) {
+                    //tsl::goBack(2);
+                    tsl::swapTo<UltrahandSettingsMenu>(SwapDepth(3));
+                    reloadMenu2 = false;
+                } else {
+                    tsl::goBack();
+                }
+                return true;
+            }
+        }
+        
+        if (returningToSettings && !(keysDown & KEY_B)) {
+            returningToSettings = false;
+            inSettingsMenu = true;
+            tsl::impl::parseOverlaySettings();
+        }
+        
+        if (triggerExit.exchange(false, std::memory_order_acq_rel)) {
+            ult::launchingOverlay.store(true, std::memory_order_release);
+
+            if (softwareHasUpdated && requestOverlayExit()) {
+            } else {
+                tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl");
+            }
+            tsl::Overlay::get()->close(); // Close the overlay
+        }
+        
+        return false;
+}
+
+bool SettingsMenu::handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) {
+        
+        //const bool isRunningInterp = runningInterpreter.load(acquire);
+        //
+        //if (isRunningInterp) {
+        //    return handleRunningInterpreter(keysDown, keysHeld);
+        //}
+        //
+        //if (lastRunningInterpreter.load(acquire)) {
+        //    isDownloadCommand.store(false, release);
+        //    if (lastSelectedListItem)
+        //        lastSelectedListItem->setValue(commandSuccess.load(acquire) ? CHECKMARK_SYMBOL : CROSSMARK_SYMBOL);
+        //    closeInterpreterThread();
+        //    lastRunningInterpreter.store(false, std::memory_order_release);
+        //    return true;
+        //}
+        
+        if (goBackAfter.exchange(false, std::memory_order_acq_rel)) {
+            disableSound.store(true, std::memory_order_release);
+            simulatedBack.store(true, std::memory_order_release);
+            return true;
+        }
+
+        static bool runAfter = false;
+        if (runAfter) {
+            runAfter = false;
+            // Reset navigation state properly
+            inSettingsMenu = false;
+            inSubSettingsMenu = false;
+            
+            // Clear the current selection
+            ////g_overlayFilename = "";
+            //entryName = "";
+            
+            // Determine return destination
+            if (lastMenu != "hiddenMenuMode")
+                returningToMain = true;
+            else
+                returningToHiddenMain = true;
+            
+            // Determine pop count and hidden mode settings
+            int popCount;
+            if (lastMenu == "hiddenMenuMode") {
+                popCount = 3;
+                inMainMenu.store(false, std::memory_order_release);
+                inHiddenMode.store(true, std::memory_order_release);
+                if (entryMode == OVERLAY_STR)
+                    setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_HIDDEN_OVERLAY_STR, TRUE_STR);
+                else
+                    popCount = 2;
+            } else {
+                popCount = 2;
+            }
+            
+            runningInterpreter.store(false, release);
+            jumpItemName = rootTitle;
+            jumpItemValue = rootVersion;
+            //g_overlayFilename = "";
+            jumpItemExactMatch.store(false, release);
+            skipJumpReset.store(true, release);
+            
+            tsl::swapTo<MainMenu>(SwapDepth(popCount), lastMenuMode);
+            return true;
+        }
+
+        // Handle delete item continuous hold behavior
+        if (isHolding) {
+            processHold(keysDown, keysHeld, holdStartTick, isHolding, [this]() {
+                std::string targetPath;
+                bool hasTarget = false;
+        
+                if (!entryName.empty() && entryMode == OVERLAY_STR) {
+                    targetPath = OVERLAY_PATH + entryName;
+                    hasTarget = true;
+                } else if (!entryName.empty()) {
+                    targetPath = PACKAGE_PATH + entryName + "/";
+                    hasTarget = true;
+                }
+        
+                if (hasTarget) {
+                    deleteFileOrDirectory(targetPath);
+                    removeIniSection(settingsIniPath, entryName);
+        
+                    if (lastSelectedListItem) {
+                        //lastSelectedListItem->enableClickAnimation();
+                        //lastSelectedListItem->triggerClickAnimation();
+                        lastSelectedListItem->setValue(CHECKMARK_SYMBOL);
+                        //lastSelectedListItem->disableClickAnimation();
+                        lastSelectedListItem = nullptr;
+                    }
+        
+                    triggerRumbleDoubleClick.store(true, std::memory_order_release);
+                    triggerMoveSound.store(true, std::memory_order_release);
+                    runAfter = true;
+                } else if (lastSelectedListItem) {
+                    lastSelectedListItem->setValue(CROSSMARK_SYMBOL);
+                    lastSelectedListItem = nullptr;
+                }
+            }, nullptr, false); // false = do NOT reset storedCommands
+        }
+
+
+        if (inSettingsMenu && !inSubSettingsMenu) {
+            if (!returningToSettings) {
+                if (simulatedNextPage.load(acquire))
+                    simulatedNextPage.store(false, release);
+                if (simulatedMenu.load(acquire))
+                    simulatedMenu.store(false, release);
+
+                const bool isTouching = stillTouching.load(acquire);
+                const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
+    
+                // Note: Original code uses !stillTouching without .load() - preserving this exactly
+                if (backKeyPressed) {
+                    if (allowSlide.load(acquire))
+                        allowSlide.store(false, release);
+                    if (unlockedSlide.load(acquire))
+                        unlockedSlide.store(false, release);
+                    inSettingsMenu = false;
+                    
+                    // Determine return destination
+                    if (lastMenu != "hiddenMenuMode")
+                        returningToMain = true;
+                    else
+                        returningToHiddenMain = true;
+                    
+                    if (reloadMenu) {
+                        reloadMenu = false;
+                        
+                        // Determine pop count and hidden mode settings
+                        size_t popCount;
+                        if (lastMenu == "hiddenMenuMode") {
+                            popCount = 3;
+                            inMainMenu.store(false, std::memory_order_release);
+                            inHiddenMode.store(true, std::memory_order_release);
+                            if (entryMode == OVERLAY_STR)
+                                setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, IN_HIDDEN_OVERLAY_STR, TRUE_STR);
+                            else
+                                popCount = 2;
+                        } else {
+                            popCount = 2;
+                        }
+                        
+                        //tsl::pop(popCount);
+                        //{
+                        //    //std::lock_guard<std::mutex> lock(jumpItemMutex);
+                        jumpItemName = rootTitle;
+                        jumpItemValue = rootVersion;
+                        //g_overlayFilename = "";
+                        jumpItemExactMatch.store(false, release);
+                        skipJumpReset.store(true, release);
+                        //}
+                        
+                        tsl::swapTo<MainMenu>(SwapDepth(popCount), lastMenuMode);
+                    } else {
+                        tsl::goBack();
+                    }
+                    
+                    lastMenu = "settingsMenu";
+                    return true;
+                }
+            }
+        } else if (inSubSettingsMenu) {
+            simulatedNextPage.exchange(false, std::memory_order_acq_rel);
+            simulatedMenu.exchange(false, std::memory_order_acq_rel);
+            
+            // Note: Original code uses stillTouching.load() here - preserving this difference
+            const bool isTouching = stillTouching.load(acquire);
+            const bool backKeyPressed = !isTouching && (((keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)));
+            
+            
+            if (backKeyPressed) {
+                allowSlide.exchange(false, std::memory_order_acq_rel);
+                unlockedSlide.exchange(false, std::memory_order_acq_rel);
+                
+
+                if (dropdownSelection == MODE_STR) {
+                    modeTitle = LAUNCH_MODES;
+                    reloadMenu2 = true;
+                }
+
+
+                else if (dropdownSelection.rfind("mode_combo_", 0) != 0) {
+                    inSubSettingsMenu = false;
+                    returningToSettings = true;
+                }
+    
+                // Step 1: Go back one menu level
+                // Step 2: If reload is needed, change to SettingsMenu with focus
+                if (reloadMenu2) {
+                    reloadMenu2 = false;
+                    //tsl::goBack(2);
+                    
+                    //{
+                    //    //std::lock_guard<std::mutex> lock(jumpItemMutex);
+                    // Provide jump target context
+                    jumpItemName = modeTitle;
+                    jumpItemValue = "";
+                    jumpItemExactMatch.store(true, release);
+                    //g_overlayFilename = "";
+                    //}
+    
+                    tsl::swapTo<SettingsMenu>(
+                        SwapDepth(2),
+                        rootEntryName,
+                        rootEntryMode,
+                        rootTitle,
+                        rootVersion
+                    );
+                } else {
+                    if (modeComboModified) {
+                        // Go back to MODE_STR screen to refresh the combo display
+                        jumpItemName = modeTitle;  // Focus on the mode that was just edited
+                        jumpItemValue = "";
+                        jumpItemExactMatch.store(true, release);
+                        //g_overlayFilename = "";
+                        
+                        tsl::swapTo<SettingsMenu>(
+                            SwapDepth(2),
+                            rootEntryName,
+                            rootEntryMode,
+                            rootTitle,
+                            rootVersion,
+                            MODE_STR  // Go back to the modes list screen
+                        );
+                        // Keep modeComboModified true for the next level up
+                    } else {
+                        tsl::goBack();
+                    }
+                }
+
+                if (modeComboModified) {
+                    modeComboModified = false;
+                    //jumpItemName = MODES;
+                    //jumpItemValue = "";
+                    //jumpItemExactMatch.store(true, release);
+                    ////g_overlayFilename = "";
+
+                    //reloadMenu2 = true;
+                }
+    
+                return true;
+            }
+        }
+        
+        if (returningToSettings && !(keysDown & KEY_B)) {
+            returningToSettings = false;
+            inSettingsMenu = true;
+        }
+    
+        if (triggerExit.exchange(false, std::memory_order_acq_rel)) {
+            ult::launchingOverlay.store(true, std::memory_order_release);
+            tsl::setNextOverlay(OVERLAY_PATH+"ovlmenu.ovl");
+            tsl::Overlay::get()->close();
+        }
+        
+        return false;
+}
+
+void TransitionToMainMenu(const std::string& arg1, const std::string& arg2) {
+    tsl::changeTo<MainMenu>(arg1, arg2);
+}
+
+void SwapToMainMenu() {
+    tsl::swapTo<MainMenu>();
+}
+
+// --- CheatMenu Implementation ---
+
+tsl::elm::Element* CheatMenu::createUI() {
+    auto* rootFrame = new tsl::elm::OverlayFrame("Breezehand", "Cheat Options");
+    auto* list = new tsl::elm::List();
+
+    list->addItem(new tsl::elm::CategoryHeader("Load Cheats"));
+
+    auto* loadAmsItem = new tsl::elm::ListItem("Load from AMS");
+    loadAmsItem->setClickListener([](u64 keys) {
+        if (keys & KEY_A) {
+            std::string bid = CheatUtils::GetBuildIdString();
+            std::string tid = CheatUtils::GetTitleIdString();
+            std::string path = "sdmc:/atmosphere/contents/" + tid + "/cheats/" + bid + ".txt";
+            std::string toggles = "sdmc:/atmosphere/contents/" + tid + "/cheats/toggles.txt"; 
+
+            if (CheatUtils::ParseCheats(path)) {
+                CheatUtils::LoadToggles(toggles);
+                tsl::notification->show("Loaded AMS Cheats");
+            } else {
+                tsl::notification->show("Cheat file not found\n(AMS)");
+            }
+            refreshPage.store(true, std::memory_order_release);
+            tsl::goBack();
+            return true;
+        }
+        return false;
+    });
+    list->addItem(loadAmsItem);
+
+    auto* loadFileItem = new tsl::elm::ListItem("Load from File");
+    loadFileItem->setClickListener([](u64 keys) {
+        if (keys & KEY_A) {
+            std::string bid = CheatUtils::GetBuildIdString();
+            std::string tid = CheatUtils::GetTitleIdString();
+            std::string path = "sdmc:/switch/breeze/cheats/" + tid + "/" + bid + ".txt";
+            std::string toggles = "sdmc:/switch/breeze/cheats/" + tid + "/toggles.txt"; 
+
+            if (CheatUtils::ParseCheats(path)) {
+                CheatUtils::LoadToggles(toggles);
+                tsl::notification->show("Loaded File Cheats");
+            } else {
+                tsl::notification->show("Cheat file not found\n(Breeze)");
+            }
+            refreshPage.store(true, std::memory_order_release);
+            tsl::goBack();
+            return true;
+        }
+        return false;
+    });
+    list->addItem(loadFileItem);
+
+    auto* downloadItem = new tsl::elm::ListItem("Download from URL");
+    downloadItem->setClickListener([](u64 keys) {
+        if (keys & KEY_A) {
+            if (CheatUtils::TryDownloadCheats(true)) {
+                refreshPage.store(true, std::memory_order_release);
+                tsl::goBack();
+            }
+            return true;
+        }
+        return false;
+    });
+    list->addItem(downloadItem);
+
+    list->addItem(new tsl::elm::CategoryHeader("Combo Keys"));
+
+    if (this->cheat_id != 0) {
+        // Context-aware "Set Combo Key" using new Hold Item
+        auto* setComboItem = new CheatUtils::ComboSetItem("Set Combo Key (Hold 1s)", this->cheat_id);
+        setComboItem->setClickListener([](u64 keys) { return false; }); 
+        list->addItem(setComboItem);
+
+        // Context-aware "Remove Combo Key"
+        auto* removeComboItem = new tsl::elm::ListItem("Remove Combo Key");
+        removeComboItem->setClickListener([this](u64 keys) {
+            if (keys & KEY_A) {
+                  CheatUtils::RemoveComboKeyFromCheat(this->cheat_id);
+                  refreshPage.store(true, std::memory_order_release);
+                  tsl::goBack();
+                  return true;
+            }
+            return false;
+        });
+        list->addItem(removeComboItem);
+
+        // Save to File (Breeze)
+        auto* saveToBreezeItem = new tsl::elm::ListItem("Save to File (Breeze)");
+        saveToBreezeItem->setClickListener([this](u64 keys) {
+            if (keys & KEY_A) {
+                CheatUtils::SaveCheatsToDir("sdmc:/switch/breeze/cheats/" + CheatUtils::GetTitleIdString() + "/");
+                tsl::notification->show("Saved to Breeze directory");
+                refreshPage.store(true, std::memory_order_release);
+                tsl::goBack();
+                return true;
+            }
+            return false;
+        });
+        list->addItem(saveToBreezeItem);
+
+        // Save to AMS (Atmosphere)
+        auto* saveToAmsItem = new tsl::elm::ListItem("Save to AMS");
+        saveToAmsItem->setClickListener([this](u64 keys) {
+            if (keys & KEY_A) {
+                CheatUtils::SaveCheatsToDir("sdmc:/atmosphere/contents/" + CheatUtils::GetTitleIdString() + "/cheats/");
+                tsl::notification->show("Saved to Atmosphere directory");
+                refreshPage.store(true, std::memory_order_release);
+                tsl::goBack();
+                return true;
+            }
+            return false;
+        });
+        list->addItem(saveToAmsItem);
+    } else {
+        auto* item = new tsl::elm::ListItem("Select a cheat to set combo!");
+        item->setClickListener([](u64 keys) {
+            if (keys & KEY_A) {
+                tsl::goBack();
+                tsl::notification->show("Press X on a cheat in the list to configure.");
+                return true;
+            }
+            return false;
+        });
+        list->addItem(item);
+    }
+
+    rootFrame->setContent(list);
+    return rootFrame; 
+}
+
+bool CheatMenu::handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) {
+    if (auto focused = this->getFocusedElement()) {
+        if (focused->handleInput(keysDown, keysHeld, *touchInput, leftJoyStick, rightJoyStick))
+            return true;
+    }
+
+    if (keysDown & KEY_B) {
+        tsl::goBack();
+        return true;
+    }
+    return false;
+}
+
 int main(int argc, char* argv[]) {
     for (u8 arg = 0; arg < argc; arg++) {
         if (argv[arg][0] != '-') continue;
@@ -8321,5 +9318,18 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
+    
+    // If launched with arguments (manual/forwarder launch), ensure we start visible
+    if (argc > 1) {
+        ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::TRUE_STR);
+    }
+
+    // Clear download log
+    {
+        ult::createDirectory("sdmc:/config/ultrahand/");
+        FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "w");
+        if (logFile) fclose(logFile);
+    }
+
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }

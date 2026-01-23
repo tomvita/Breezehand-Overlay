@@ -1,111 +1,237 @@
-# Ultrahand Overlay (HOS 16.0.0+)
-[![platform](https://img.shields.io/badge/platform-Switch-898c8c?logo=C++.svg)](https://gbatemp.net/forums/nintendo-switch.283/?prefix_id=44)
-[![language](https://img.shields.io/badge/language-C++-ba1632?logo=C++.svg)](https://github.com/topics/cpp)
-[![GPLv2 License](https://img.shields.io/badge/license-GPLv2-189c11.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
-[![Latest Version](https://img.shields.io/github/v/release/ppkantorski/Ultrahand-Overlay?label=latest&color=blue)](https://github.com/ppkantorski/Ultrahand-Overlay/releases/latest)
-[![GitHub Downloads](https://img.shields.io/github/downloads/ppkantorski/Ultrahand-Overlay/total?color=6f42c1)](https://somsubhra.github.io/github-release-stats/?username=ppkantorski&repository=Ultrahand-Overlay&page=1&per_page=300)
-[![HB App Store](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ppkantorski/Ultrahand-Overlay/main/.github/hbappstore.json&label=hb%20app%20store&color=6f42c1)](https://hb-app.store/switch/UltrahandOverlay)
-[![GitHub issues](https://img.shields.io/github/issues/ppkantorski/Ultrahand-Overlay?color=222222)](https://github.com/ppkantorski/Ultrahand-Overlay/issues)
-[![GitHub stars](https://img.shields.io/github/stars/ppkantorski/Ultrahand-Overlay)](https://github.com/ppkantorski/Ultrahand-Overlay/stargazers)
+# Breezehand Overlay
 
-Create directories, manage files, and customize configurations effortlessly using simple ini files.
+<p align="center">
+  <img src=".pics/logo.png" alt="Breezehand Logo" width="400"/>
+</p>
 
-[![Ultrahand Logo](.pics/banner.gif)](https://gbatemp.net/threads/ultrahand-overlay-the-fully-craft-able-overlay-executor.633560/)
+<p align="center">
+  <a href="https://gbatemp.net/forums/nintendo-switch.283/?prefix_id=44"><img src="https://img.shields.io/badge/platform-Switch-898c8c?logo=C++.svg" alt="platform"></a>
+  <a href="https://github.com/topics/cpp"><img src="https://img.shields.io/badge/language-C++-ba1632?logo=C++.svg" alt="language"></a>
+  <a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html"><img src="https://img.shields.io/badge/license-GPLv2-189c11.svg" alt="GPLv2 License"></a>
+  <a href="https://github.com/tomvita/Breezehand-Overlay/releases/latest"><img src="https://img.shields.io/github/v/release/tomvita/Breezehand-Overlay?label=latest&color=blue" alt="Latest Version"></a>
+</p>
 
-Ultrahand Overlay is an overlay menu ecosystem built from the ground up off of [libultrahand](https://github.com/ppkantorski/libultrahand) (an expanded fork of [libtesla](https://github.com/WerWolv/libtesla)) that provides powerful C/C++ commands through the usage of its own custom interpretive [programming language](https://github.com/ppkantorski/Ultrahand-Overlay/wiki/Command-Reference) (similar to Shell/BASH).  It is a versatile tool that enables users to create and share custom command-based packages, providing enhanced functionality for managing settings, files and directories on your Nintendo Switch.
-
-With Ultrahand, you have the flexibility to customize and shape your file management system according to your needs, empowering you with greater control over your system configurations.
-
-## Screenshots
-![Slideshow](.pics/slideshow.gif)
+<p align="center">
+  <strong>A powerful Nintendo Switch overlay for managing cheats with an enhanced UI, built on libultrahand.</strong>
+</p>
 
 ## Features
 
-Ultrahand Overlay currently offers the following features:
+### 🎨 Enhanced UI
+Unlike traditional overlays that display only a single scrolling line (making long descriptions hard to read), Breezehand provides:
+- **Variable-Size Display Boxes**: Automatically adjusts box height based on content
+- **Multi-line Text Support**: Properly formatted text wrapping for long cheat descriptions
+- **Variable Font Sizes**: Customize font size per game for optimal readability
+- **Additional Notes Support**: Display detailed cheat notes alongside descriptions
+- **Per-Game Settings**: Each game can have custom UI configurations:
+  - Font size (some games need to display many cheats, others have long descriptions)
+  - Box sizing (adapts to the amount of content)
+  - Notes visibility (toggle notes on/off depending on user's needs)
 
-- Create Directories:
-  - Effortlessly create directories on your SD card by specifying the directory path. Ultrahand will handle the creation process for you.
+### 🎮 Advanced Cheat Management
 
-- Copy Files or Directories:
-  - Easily copy files or directories from one location to another on your SD card. Just provide the source and destination paths, and Ultrahand will seamlessly handle the copying process.
+#### Automatic Cheat Downloads with Versioning
+Breezehand can automatically download cheats from popular cheat repositories. The versioning system works as follows:
 
-- Delete Files or Directories:
-  - Simplify file and directory deletion on your SD card. By specifying the path of the file or directory you want to delete, Ultrahand promptly removes it, making the deletion process hassle-free.
+1. **Base URL Configuration**: Add cheat source URLs to `sdmc:/config/ultrahand/cheat_url_txt`
+   - URLs can include `{TITLE_ID}` placeholder which will be replaced with the game's title ID
+   - The `{TITLE_ID}` placeholder can appear anywhere in the URL path
+2. **Automatic Detection**: Detects the running game's Title ID and Build ID
+3. **Smart Version Checking**: 
+   - Replaces `{TITLE_ID}` placeholder in the configured URL
+   - Attempts to download the base version: `{BUILD_ID}.txt`
+   - If successful, checks for versioned cheats: `{BUILD_ID}.v1.txt`, `{BUILD_ID}.v2.txt`, etc.
+   - Continues checking up to `.v15.txt` until a version is not found
+   - Downloads the highest available version automatically
+4. **Multi-Source Support**: Cycle through multiple configured URLs by pressing "Download from URL" repeatedly
 
-- Move Files or Directories:
-  - Seamlessly move files or directories between locations on your SD card. Provide the source path and the destination directory path, and Ultrahand takes care of the moving process, ensuring smooth relocation.
+This allows cheat authors to publish updated cheat versions without breaking compatibility, and users always get the latest available version.
 
-- Download Files:
-  - Download files to your SD card with ease. Efficiently retrieve files from repositories or URLs to your desired location. Whether you need to download/update homebrew or transfer files between locations, this feature simplifies the process, making repository management a breeze.
+#### Organization & Usability
+- **Folder Support**: Organize cheats into folders when dealing with many cheats
+- **Nested Folders**: Support for multi-level folder hierarchies to keep large cheat collections organized
+- **Conditional Key Programming**: Program conditional keys for cheat activation (advanced cheat control)
+- **Toggle Cheats**: Enable/disable individual cheats on the fly
+- **Cheat Notes**: View detailed notes from `notes.txt` files for documentation and usage instructions
 
-- Unzip Files:
-  - Extract compressed zip files on your SD card by unzipping archived files, preserving their original structure. Whether you have downloaded zip archives or received compressed files, this command simplifies the process of extracting them, making it effortless to access the contents within.
+## Installation
 
-- Modify INI Files:
-  - Edit INI files on your SD card with ease. Take full control over your configurations by updating existing key-value pairs, adding new entries, or creating new sections within the INI file using Ultrahand.
+1. **Prerequisites**:
+   - Nintendo Switch running custom firmware (Atmosphere recommended)
+   - [nx-ovlloader](https://github.com/ppkantorski/nx-ovlloader) installed
 
-- Hex Edit Files:
-  - Perform hexadecimal editing of files on your SD card. Edit the binary data directly, allowing for precise control over your data. Ultrahand's Hex Edit Files feature enables you to analyze, modify, and customize files in their raw form.
+2. **Choose Your Installation Method**:
 
-- Convert Mods:
-  - Convert `pchtxt` mods into `ips` or `cheats` format.
+   With Ultrahand Overlay Manager** :
+   - Install [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay) (`ovlmenu.ovl`) for overlay management
+   - Download `breezehand.ovl` from [Releases](https://github.com/tomvita/Breezehand-Overlay/releases/latest)
+   - Place `breezehand.ovl` in `/switch/.overlays/` on your SD card
+   - Access Breezehand through the Ultrahand overlay menu
 
-- System Commands:
-  - There are a variety of system commands that users can utilize.  These include functions to shutdown, reboot, reboot directly into Hekate entries/modes, manipulate the screen's backlight, volume settings, and turn off all bluetooth controllers.
+3. **Configuration** (Optional):
+   - Create `sdmc:/config/ultrahand/cheat_url_txt` to configure cheat download sources
+   - Add one URL per line pointing to cheat repositories
 
-- Run Commmands On Boot:
-  - Users can also utilize their own `/switch/.packages/boot_package.ini` file (with a command section `boot`) to run a series of commands once upon device boot-up.
+4. **Launch**:
+   - Press the overlay hotkey (default: `ZL+ZR+DDOWN`)
+   - Breezehand will appear as your overlay menu
 
-## Getting Started
+## Usage
 
-### Usage
+### Cheat Menu
+1. Launch a game
+2. Open Breezehand overlay
+3. Navigate to the Cheat Menu
+4. Press **A** to toggle individual cheats or enter folders
+5. Press **X** to open Cheat Settings:
+   - **Download from URL**: Download cheats from configured sources (press multiple times to cycle through URLs)
+   - **Font Size**: Adjust font size for this game
+   - **Box Height**: Customize display box height
+   - **Toggle Notes**: Show/hide additional cheat notes
 
-To use Ultrahand, follow these steps:
+### Cheat URL Configuration
+Create `sdmc:/config/ultrahand/cheat_url_txt` with your cheat sources (one URL per line):
 
-1. Download and install the latest [nx-ovlloader](https://github.com/ppkantorski/nx-ovlloader).
-    - **Sidenote:** nx-ovlloader+ consumes 2MB more of system memory than nx-ovlloader and provides expanded features. Users can also switch between the two within the Ultrahand Settings Menu.
-2. Download the latest Ultrahand [ovlmenu.ovl](https://github.com/ppkantorski/Ultrahand-Overlay/releases/latest/download/ovlmenu.ovl) and place it within `/switch/.overlays/`.
-    - **WARNING:** This will overwrite `Tesla Menu` if already installed.
-3. After installing Ultrahand Overlay, a new folder named `ultrahand` will be created within the root config folder on your SD card (`/config/ultrahand/`) along with a `config.ini` file containing various Ultrahand settings.
-4. Launch Ultrahand (similarly to `Tesla Menu`) with Ultrahand's default hotkeys (`ZL+ZR+DDOWN`) or Tesla's.  A new folder will be made (`/switch/.packages/`) with a preset `package.ini` file for your base menu commands.
+> **Note**: A template file with example URLs is included in the release. See the included `cheat_url_txt` template for reference.
+```
+https://example.com/cheats/{TITLE_ID}/
+https://cdn.example.com/{TITLE_ID}/atmosphere/
+https://github.com/user/repo/raw/main/
+```
 
-5. Place your custom `package.ini` package file in your Ultrahand package directory (`/switch/.packages/<PACKAGE_NAME>/`). This file will contains the commands for your custom Ultrahand package.
-    - **Sidenote:** If your Ultrahand package does not show up, you may need to run `Fix Bit Archive` in Hekate.
-    - See [Ultrahand Packages](https://github.com/ppkantorski/Ultrahand-Packages) for a comprehensive list of known packages.
+**How Versioning Works:**
+When you press "Download from URL", the overlay:
+1. Detects your game's title ID and build ID (e.g., title: `0100ABC001234000`, build: `A1B2C3D4E5F60708`)
+2. Replaces `{TITLE_ID}` in your configured URL (can appear anywhere in the URL)
+3. Tries to download the base version: `{BUILD_ID}.txt` (e.g., `A1B2C3D4E5F60708.txt`)
+4. If successful, checks for newer versions: `{BUILD_ID}.v1.txt`, `{BUILD_ID}.v2.txt`, `{BUILD_ID}.v3.txt`... up to `.v15.txt`
+5. Downloads the highest version found
+6. Saves to `sdmc:/switch/breeze/cheats/{TITLE_ID}/`
 
-6. Your commands will now show up on the packages menu within Ultrahand.
+**Directory Structure:**
+- **Breeze Directory**: `sdmc:/switch/breeze/cheats/{TITLE_ID}/` - Where cheats are downloaded and managed
+  - This is where Breezehand stores all cheats, notes, and folders
+  - Less crowded than Atmosphere's contents folder
+  - Notes (`notes.txt`) only work in this directory
+  - **Important**: Cheats stored here are preserved during Atmosphere updates (when contents directory needs to be wiped)
+- **Atmosphere Directory**: `sdmc:/atmosphere/contents/{TITLE_ID}/cheats/` - Where cheats auto-load at game startup
+  - Cheats here are automatically loaded by Atmosphere when the game starts
+  - No user interaction needed for cheats to activate
+  - **Note**: This directory is often recommended to be wiped during major Atmosphere updates
 
-## Additional Features
-- You can click `A` to execute any command as well as click `MINUS` to view/execute the individual command lines written in the ini for execution.
-- You can click `PLUS` on the main menu to enter the settings menu.
-- You can click `X` on top of an overlay/package to star them.
-- You can click `Y` on top of an overlay/package to configure additional settings.
+**Save Buttons:**
+Breezehand provides two save options:
+1. **Save** - Saves your cheat toggles to the Breeze directory
+   - Creates a toggle file that remembers which cheats are enabled
+   - Cheats are automatically toggled on when you open the menu
+2. **Save to AMS** - Copies enabled cheats to Atmosphere directory
+   - Saves enabled cheats to `sdmc:/atmosphere/contents/{TITLE_ID}/cheats/`
+   - Also creates a toggle file for automatic activation
+   - Use this when you want cheats to auto-load at game startup without opening the overlay
 
-For additional assistance with custom packages, feel free to checkout the [Ultrahand Overlay Wiki](https://github.com/ppkantorski/Ultrahand-Overlay/wiki).
+**Example URL Configuration:**
+```
+https://example.com/cheats/{TITLE_ID}/
+https://cdn.example.com/{TITLE_ID}/atmosphere/
+https://github.com/user/repo/raw/main/
+```
 
-### Nintendo Switch Compatibility
-To run Ultrahand Overlay on the Nintendo Switch, you need to have the necessary [homebrew environment](https://github.com/Atmosphere-NX/Atmosphere) set up on your console running HOS 16.0.0+. Once you have the homebrew environment set up, you can transfer the compiled .ovl to your Switch and launch it using your old `Tesla Menu` hotkeys.
+### Organizing Cheats with Folders (For Cheat Authors)
+For games with many cheats, cheat authors can organize them into folders using special folder markers within the cheat file:
 
-Please note that running homebrew software on your Nintendo Switch may void your warranty and can carry certain risks. Ensure that you understand the implications and follow the appropriate guidelines and precautions when using homebrew software.
+```
+[Infinite Health]
+04000000 XXXXXXXX YYYYYYYY
 
-### Compilation Prerequisites
+[Gameplay Cheats]20000000
 
-To compile and run the software, you need to have the following C/C++ dependencies installed:
+[Max Stats]
+04000000 XXXXXXXX YYYYYYYY
 
-- [libultrahand](https://github.com/ppkantorski/libultrahand)
+[God Mode]
+04000000 XXXXXXXX YYYYYYYY
+
+[End Gameplay]20000001
+
+[Item Cheats]20000000
+
+[All Weapons]
+04000000 XXXXXXXX YYYYYYYY
+
+[Consumables]20000000
+
+[Infinite Potions]
+04000000 XXXXXXXX YYYYYYYY
+
+[End Consumables]20000001
+
+[End Items]20000001
+```
+
+**Folder Syntax:**
+- `[FolderName]20000000` - Starts a folder with the specified name
+- `[AnyText]20000001` - Ends the current folder (the text in brackets doesn't matter)
+- Folders can be nested by using multiple folder start markers before closing them
+- Regular cheats `[CheatName]` followed by cheat codes appear within folders or at the root level
+
+Folders appear in the Breezehand overlay menu and can be nested for complex cheat collections.
+
+## For Cheat Creators
+
+> [!IMPORTANT]
+> **Memory Usage Considerations**: Ultrahand/Breezehand consumes significant memory. When developing cheats with dmnt (gen1 and gen2) sysmodules loaded, many games may experience memory-related issues or instability.
+> 
+> **Recommendation**: During cheat development, use [Breeze](https://github.com/tomvita/Breeze-Beta) without Breezehand/Ultrahand overlay to ensure maximum available memory for the game and cheat engine. Once your cheats are finalized, you can use Breezehand for convenient cheat management during normal gameplay.
+
+## Building from Source
+
+### Prerequisites
+- [devkitPro](https://devkitpro.org/) with devkitA64
 - libnx
 - switch-curl
 - switch-zlib
 - switch-mbedtls
+- [libultrahand](https://github.com/ppkantorski/libultrahand) (included as submodule)
+
+### Compilation
+```bash
+git clone --recursive https://github.com/tomvita/Breezehand-Overlay.git
+cd Breezehand-Overlay
+make
+```
+
+The compiled `ovlmenu.ovl` will be in the project directory.
+
+## Project Structure
+```
+Breezehand-Overlay/
+├── source/
+│   └── main.cpp          # Main overlay implementation
+├── lib/
+│   └── libultrahand/     # Core library (submodule)
+├── Makefile
+└── README.md
+```
+
+## Credits
+
+- **Original Ultrahand Overlay**: [ppkantorski](https://github.com/ppkantorski/Ultrahand-Overlay)
+- **libtesla**: [WerWolv](https://github.com/WerWolv/libtesla)
+- **libultrahand**: [ppkantorski](https://github.com/ppkantorski/libultrahand)
 
 ## Contributing
 
-Contributions are welcome! If you have any ideas, suggestions, or bug reports, please raise an [issue](https://github.com/ppkantorski/Ultrahand-Overlay/issues/new/choose), submit a [pull request](https://github.com/ppkantorski/Ultrahand-Overlay/compare) or reach out to me directly on [GBATemp](https://gbatemp.net/threads/ultrahand-overlay-the-fully-craft-able-overlay-executor.633560/).
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/X8X3VR194)
+Contributions are welcome! Feel free to:
+- Report bugs via [Issues](https://github.com/tomvita/Breezehand-Overlay/issues)
+- Submit pull requests with improvements
+- Suggest new features
 
 ## License
 
-This project is licensed and distributed under [GPLv2](LICENSE) with a [custom library](https://github.com/ppkantorski/libultrahand/tree/main/libultra) utilizing [CC-BY-4.0](SUB_LICENSE).
+This project is licensed under GPLv2. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2023-2025 ppkantorski
+Copyright (c) 2026 tomvita
+
+---
+
+**Note**: This software is for educational and research purposes. Use at your own risk. Running homebrew software may void your warranty.
