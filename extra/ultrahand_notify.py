@@ -15,7 +15,7 @@ FTP_HOST = "192.168.3.3"
 FTP_PORT = 5000
 FTP_USERNAME = "root"
 FTP_PASSWORD = ""
-REMOTE_PATH = "/config/ultrahand/notifications/"
+REMOTE_PATH = "/config/breezehand/notifications/"
 
 def generate_and_upload_notify(text, font_size=28):
     """

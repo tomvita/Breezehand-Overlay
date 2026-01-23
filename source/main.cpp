@@ -116,7 +116,7 @@ static std::string ReplaceAll(std::string str, const std::string& from, const st
 }
 
 static void LogDownload(const std::string& url) {
-    FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "a");
+    FILE* logFile = fopen("sdmc:/config/breezehand/cheat_download.log", "a");
     if (logFile) {
         fprintf(logFile, "%s\n", url.c_str());
         fclose(logFile);
@@ -732,15 +732,12 @@ private:
                 }
             } 
             // === UPDATE_LANGUAGES case ===
-            // Commented out for now - can be re-enabled if language updates are needed
-            /*
             else if (title == UPDATE_LANGUAGES) {
                 interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"lang.zip"});
                 interpreterCommands.push_back({"download", ULTRAHAND_REPO_URL + "releases/latest/download/lang.zip", DOWNLOADS_PATH});
                 interpreterCommands.push_back({"unzip", DOWNLOADS_PATH+"lang.zip", LANG_PATH});
                 interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"lang.zip"});
             }
-            */
     
             runningInterpreter.store(true, release);
             executeInterpreterCommands(std::move(interpreterCommands), "", "");
@@ -980,8 +977,7 @@ public:
 
             addHeader(list, SOFTWARE_UPDATE);
             addUpdateButton(list, UPDATE_ULTRAHAND, fullVersionLabel);
-            // Commented out for now - can be re-enabled if language updates are needed
-            // addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
+            addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
 
             PackageHeader overlayHeader;
             overlayHeader.title = "Breezehand Overlay";
@@ -6605,9 +6601,9 @@ namespace CheatUtils {
             if (std::getline(tfile, title)) ult::trim(title);
         }
         
-        std::string configPath = "sdmc:/config/ultrahand/cheat_url.txt";
+        std::string configPath = "sdmc:/config/breezehand/cheat_url.txt";
         if (!ult::isFile(configPath)) {
-            configPath = "sdmc:/config/ultrahand/cheat_url_txt";
+            configPath = "sdmc:/config/breezehand/cheat_url_txt";
         }
         
         if (!ult::isFile(configPath)) {
@@ -9346,8 +9342,8 @@ int main(int argc, char* argv[]) {
 
     // Clear download log
     {
-        ult::createDirectory("sdmc:/config/ultrahand/");
-        FILE* logFile = fopen("sdmc:/config/ultrahand/cheat_download.log", "w");
+        ult::createDirectory("sdmc:/config/breezehand/");
+        FILE* logFile = fopen("sdmc:/config/breezehand/cheat_download.log", "w");
         if (logFile) fclose(logFile);
     }
 

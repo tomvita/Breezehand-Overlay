@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <strong>A powerful Nintendo Switch overlay for managing cheats with an enhanced UI, built on libultrahand.</strong>
+  <strong>A powerful Nintendo Switch overlay for managing cheats with an enhanced UI, built on libbreezehand.</strong>
 </p>
 
 ## Features
@@ -33,7 +33,7 @@ Unlike traditional overlays that display only a single scrolling line (making lo
 #### Automatic Cheat Downloads with Versioning
 Breezehand can automatically download cheats from popular cheat repositories. The versioning system works as follows:
 
-1. **Base URL Configuration**: Add cheat source URLs to `sdmc:/config/ultrahand/cheat_url_txt`
+1. **Base URL Configuration**: Add cheat source URLs to `sdmc:/config/breezehand/cheat_url_txt`
    - URLs can include `{TITLE_ID}` placeholder which will be replaced with the game's title ID
    - The `{TITLE_ID}` placeholder can appear anywhere in the URL path
 2. **Automatic Detection**: Detects the running game's Title ID and Build ID
@@ -69,7 +69,7 @@ This allows cheat authors to publish updated cheat versions without breaking com
    - Access Breezehand through the Ultrahand overlay menu
 
 3. **Configuration** (Optional):
-   - Create `sdmc:/config/ultrahand/cheat_url_txt` to configure cheat download sources
+   - Create `sdmc:/config/breezehand/cheat_url_txt` to configure cheat download sources
    - Add one URL per line pointing to cheat repositories
 
 4. **Launch**:
@@ -90,7 +90,7 @@ This allows cheat authors to publish updated cheat versions without breaking com
    - **Toggle Notes**: Show/hide additional cheat notes
 
 ### Cheat URL Configuration
-Create `sdmc:/config/ultrahand/cheat_url_txt` with your cheat sources (one URL per line):
+Create `sdmc:/config/breezehand/cheat_url_txt` with your cheat sources (one URL per line):
 
 > **Note**: A template file with example URLs is included in the release. See the included `cheat_url_txt` template for reference.
 ```

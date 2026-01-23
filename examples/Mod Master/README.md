@@ -27,7 +27,7 @@ To use Mod Master:
 1. Open the `package.ini` file located in the `examples/Mod Master` directory.
 2. Uncomment the desired configuration and its corresponding commands by removing the semicolon (`;`) at the beginning of each line.
 3. Save the `package.ini` file after making the necessary changes.
-4. Copy the `Mod Master` directory to your switch under `/config/ultrahand/` by placing it in that location.
+4. Copy the `Mod Master` directory to your switch under `/config/breezehand/` by placing it in that location.
 
 Note: Make sure you have organized the mods properly within the subdirectories as mentioned in the "Obtaining Mods" section.
 

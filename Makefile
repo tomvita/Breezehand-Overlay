@@ -1,14 +1,14 @@
 ##################################################################################
-# Makefile for Ultrahand Overlay
-# Author: ppkantorski
+# Makefile for Breezehand Overlay
+# Author: tomvita
 # Description:
-#   This Makefile is used to build the Ultrahand Overlay homebrew application for
+#   This Makefile is used to build the Breezehand Overlay homebrew application for
 #   Nintendo Switch.
 #
 #   For more details and usage instructions, please refer to the project's
 #   documentation and README.md.
 #
-#   GitHub Repository: https://github.com/ppkantorski/Ultrahand-Overlay
+#   GitHub Repository: https://github.com/tomvita/Breezehand-Overlay
 #
 # Licensed under GPLv2
 # Copyright (c) 2023-2026 ppkantorski

@@ -13,13 +13,13 @@ The `package.ini` file contains the following configurations:
 - `[Enable Blocking (sysmmc)]`: Enables blocking for hosts on sysmmc.
 - `[Disable Blocking (sysmmc)]`: Disables blocking for hosts on sysmmc.
 
-Each configuration has a set of commands that perform the corresponding actions. The commands include deleting existing host files and copying new host files from the `/config/ultrahand/Host Guard/` directory to the `/atmosphere/hosts/` directory.
+Each configuration has a set of commands that perform the corresponding actions. The commands include deleting existing host files and copying new host files from the `/config/breezehand/Host Guard/` directory to the `/atmosphere/hosts/` directory.
 
 ## Installation
 
 To install Host Guard:
 
-1. Copy the `Host Guard` directory to your switch under `/config/ultrahand/` by placing it in that location.
+1. Copy the `Host Guard` directory to your switch under `/config/breezehand/` by placing it in that location.
 
 ## Usage
 

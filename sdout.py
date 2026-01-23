@@ -78,8 +78,8 @@ def create_zip_without_metadata(source_dir, output_zip):
 
 def main():
     script_dir = Path.cwd()
-    sdout_dir = script_dir / "sdout"
-    sdout_zip = script_dir / "sdout.zip"
+    sdout_dir = script_dir / "breezehand"
+    sdout_zip = script_dir / "breezehand.zip"
     temp_dir = tempfile.mkdtemp()
     
     try:
@@ -95,15 +95,15 @@ def main():
         # Step 1: Create sdout folder structure
         print("Creating folder structure...")
         folders = [
-            "config/ultrahand",
-            "config/ultrahand/downloads",
-            "config/ultrahand/flags",
-            "config/ultrahand/lang",
-            "config/ultrahand/notifications",
-            "config/ultrahand/payloads",
-            "config/ultrahand/sounds",
-            "config/ultrahand/themes",
-            "config/ultrahand/wallpapers",
+            "config/breezehand",
+            "config/breezehand/downloads",
+            "config/breezehand/flags",
+            "config/breezehand/lang",
+            "config/breezehand/notifications",
+            "config/breezehand/payloads",
+            "config/breezehand/sounds",
+            "config/breezehand/themes",
+            "config/breezehand/wallpapers",
             "switch/.overlays",
             "switch/.packages"
         ]
@@ -140,7 +140,7 @@ def main():
         
         # Step 4: Copy lang files
         lang_source = ultrahand_root / "lang"
-        lang_dest = sdout_dir / "config/ultrahand/lang"
+        lang_dest = sdout_dir / "config/breezehand/lang"
         
         if lang_source.exists():
             print("Copying language files...")
@@ -150,7 +150,7 @@ def main():
         
         # Step 5: Copy ultrahand_updater.bin
         payload_source = ultrahand_root / "payloads/ultrahand_updater.bin"
-        payload_dest = sdout_dir / "config/ultrahand/payloads"
+        payload_dest = sdout_dir / "config/breezehand/payloads"
         
         if payload_source.exists():
             print("Copying payload file...")
@@ -160,7 +160,7 @@ def main():
         # Step 6: Copy theme files from the downloaded repository
         print("Copying theme files...")
         theme_source = ultrahand_root / "themes"
-        theme_dest = sdout_dir / "config/ultrahand/themes"
+        theme_dest = sdout_dir / "config/breezehand/themes"
         theme_files = ["ultra.ini", "ultra-blue.ini"]
         
         if theme_source.exists():
@@ -177,7 +177,7 @@ def main():
         # Step 7: Copy sound files
         print("Copying sound files...")
         sounds_source = ultrahand_root / "sounds"
-        sounds_dest = sdout_dir / "config/ultrahand/sounds"
+        sounds_dest = sdout_dir / "config/breezehand/sounds"
         
         if sounds_source.exists():
             for wav_file in sounds_source.glob("*.wav"):
@@ -188,14 +188,14 @@ def main():
         
         # Step 8: Copy ovlmenu.ovl
         print("Copying ovlmenu.ovl...")
-        ovlmenu_source = script_dir / "ovlmenu.ovl"
+        ovlmenu_source = script_dir / "breezehand.ovl"
         ovlmenu_dest = sdout_dir / "switch/.overlays"
         
         if ovlmenu_source.exists():
             shutil.copy2(ovlmenu_source, ovlmenu_dest)
-            print(f"Copied ovlmenu.ovl")
+            print(f"Copied breezehand.ovl")
         else:
-            print("Warning: ovlmenu.ovl not found in script directory")
+            print("Warning: breezehand.ovl not found in script directory")
         
         # Step 9: Clean up temporary files
         print("Cleaning up temporary files...")
@@ -203,10 +203,10 @@ def main():
         print("Temporary files deleted")
         
         # Step 10: Create final zip
-        output_zip = script_dir / "sdout.zip"
+        output_zip = script_dir / "breezehand.zip"
         create_zip_without_metadata(sdout_dir, output_zip)
         
-        print("\n✓ Successfully created sdout.zip!")
+        print(f"✓ Successfully created breezehand.zip!")
         print(f"Location: {output_zip}")
         
     except Exception as e:
