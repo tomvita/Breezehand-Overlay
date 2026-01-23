@@ -718,67 +718,29 @@ private:
     
             // === UPDATE_ULTRAHAND case ===
             if (title == UPDATE_ULTRAHAND) {
-                const bool disableLoaderUpdate = isFile(FLAGS_PATH+"NO_LOADER_UPDATES.flag");
-                const bool disableSoundEffectsUpdate = isFile(FLAGS_PATH+"NO_SOUND_EFFECTS_UPDATES.flag");
                 const std::string versionLabel = cleanVersionLabel(parseValueFromIniSection((SETTINGS_PATH+"RELEASE.ini"), "Release Info", "latest_version"));
                 
-                // Lambda to add backup/restore commands
-                auto addBackupCommands = [&]() {
-                    if (disableSoundEffectsUpdate) {
-                        interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"sounds/"});
-                        interpreterCommands.push_back({"cp", SOUNDS_PATH, DOWNLOADS_PATH+"sounds/"});
-                    }
-                    if (disableLoaderUpdate) {
-                        interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"420000000007E51A/"});
-                        interpreterCommands.push_back({"cp", "/atmosphere/contents/420000000007E51A/", DOWNLOADS_PATH+"420000000007E51A/"});
-                    }
-                };
+                // Update via breezehand.zip
+                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"breezehand.zip"});
+                interpreterCommands.push_back({"download", ULTRAHAND_REPO_URL + "releases/latest/download/breezehand.zip", DOWNLOADS_PATH});
+                interpreterCommands.push_back({"unzip", DOWNLOADS_PATH+"breezehand.zip", ROOT_PATH});
+                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"breezehand.zip"});
                 
-                auto addRestoreAndLoaderCommands = [&]() {
-                    if (disableSoundEffectsUpdate) {
-                        interpreterCommands.push_back({"mv", DOWNLOADS_PATH+"sounds/", SOUNDS_PATH});
-                    }
-                    if (disableLoaderUpdate) {
-                        interpreterCommands.push_back({"mv", DOWNLOADS_PATH+"420000000007E51A/", "/atmosphere/contents/420000000007E51A/"});
-                    } else if (!isVersionGreaterOrEqual(amsVersion,"1.8.0")) {
-                        interpreterCommands.push_back({"download", OLD_NX_OVLLOADER_ZIP_URL, DOWNLOADS_PATH});
-                        interpreterCommands.push_back({"unzip", DOWNLOADS_PATH + "nx-ovlloader.zip", ROOT_PATH});
-                        interpreterCommands.push_back({"delete", DOWNLOADS_PATH + "nx-ovlloader.zip"});
-                    }
-                };
-                
-                auto addVersionUpdate = [&]() {
-                    if (!versionLabel.empty()) {
-                        interpreterCommands.push_back({"set-json-val", HB_APPSTORE_JSON, "version", versionLabel});
-                    }
-                };
-                
-                // Try #1: Update via update.ini
-                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"update.ini"});
-                interpreterCommands.push_back({"download-no-retry", LATEST_UPDATER_INI_URL, DOWNLOADS_PATH}); // if fails, move to next try
-                addBackupCommands();
-                interpreterCommands.push_back({"exec", "update", DOWNLOADS_PATH+"update.ini"});
-                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"update.ini"});
-                addRestoreAndLoaderCommands();
-                addVersionUpdate();
-                
-                // Try #2: Update via sdout.zip
-                interpreterCommands.push_back({"try:"});
-                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"sdout.zip"});
-                interpreterCommands.push_back({"download", ULTRAHAND_REPO_URL + "releases/latest/download/sdout.zip", DOWNLOADS_PATH});
-                addBackupCommands();
-                interpreterCommands.push_back({"unzip", DOWNLOADS_PATH+"sdout.zip", ROOT_PATH});
-                interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"sdout.zip"});
-                addRestoreAndLoaderCommands();
-                addVersionUpdate();
+                // Update version in appstore JSON if available
+                if (!versionLabel.empty()) {
+                    interpreterCommands.push_back({"set-json-val", HB_APPSTORE_JSON, "version", versionLabel});
+                }
             } 
             // === UPDATE_LANGUAGES case ===
+            // Commented out for now - can be re-enabled if language updates are needed
+            /*
             else if (title == UPDATE_LANGUAGES) {
                 interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"lang.zip"});
                 interpreterCommands.push_back({"download", ULTRAHAND_REPO_URL + "releases/latest/download/lang.zip", DOWNLOADS_PATH});
                 interpreterCommands.push_back({"unzip", DOWNLOADS_PATH+"lang.zip", LANG_PATH});
                 interpreterCommands.push_back({"delete", DOWNLOADS_PATH+"lang.zip"});
             }
+            */
     
             runningInterpreter.store(true, release);
             executeInterpreterCommands(std::move(interpreterCommands), "", "");
@@ -1018,14 +980,15 @@ public:
 
             addHeader(list, SOFTWARE_UPDATE);
             addUpdateButton(list, UPDATE_ULTRAHAND, fullVersionLabel);
-            addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
+            // Commented out for now - can be re-enabled if language updates are needed
+            // addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
 
             PackageHeader overlayHeader;
-            overlayHeader.title = "Ultrahand Overlay";
+            overlayHeader.title = "Breezehand Overlay";
             overlayHeader.version = APP_VERSION;
-            overlayHeader.creator = "ppkantorski";
-            overlayHeader.about = "Ultrahand Overlay is a versatile tool that enables you to create and share custom command-based packages.";
-            overlayHeader.credits = "Special thanks to B3711, ComplexNarrative, ssky, MasaGratoR, meha, WerWolv, HookedBehemoth and many others. ♥";
+            overlayHeader.creator = "tomvita";
+            overlayHeader.about = "Breezehand is a powerful cheat management overlay for Nintendo Switch with enhanced UI, automatic cheat downloads with versioning, folder support, and advanced cheat organization features.";
+            overlayHeader.credits = "Built on Ultrahand Overlay by ppkantorski. Special thanks to B3711, ComplexNarrative, ssky, MasaGratoR, meha, WerWolv, HookedBehemoth and many others. ♥";
             addPackageInfo(list, overlayHeader, OVERLAY_STR);
             overlayHeader.clear();
         
