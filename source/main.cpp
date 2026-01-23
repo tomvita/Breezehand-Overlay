@@ -6977,6 +6977,11 @@ private:
     std::string m_notesPath = "";
     bool m_notesLoaded = false;
     tsl::elm::List *cheatList = nullptr;
+    u64 m_lastTitleId = 0;
+    u64 m_lastBuildId = 0;
+    u32 m_updateCounter = 0;
+    static constexpr u32 CHECK_INTERVAL = 50;
+    bool m_noGameRunning = false;
     //bool initializingSpawn = false;
     //std::string defaultLang = "en";
 
@@ -8054,6 +8059,51 @@ public:
                 wasInHiddenMode = false;
             }
             return true;
+        }
+    
+    
+        // Periodically check if the game has changed
+        m_updateCounter++;
+        if (m_updateCounter >= CHECK_INTERVAL) {
+            m_updateCounter = 0;
+            
+            // Check if a game is running
+            bool hasCheatProcess = false;
+            if (R_SUCCEEDED(dmntchtHasCheatProcess(&hasCheatProcess))) {
+                // If no game is running and we had a game before, close overlay
+                if (!hasCheatProcess) {
+                    m_noGameRunning = true;
+                    if (m_lastTitleId != 0 || m_lastBuildId != 0) {
+                        // Game was running but now stopped - close overlay
+                        tsl::Overlay::get()->close();
+                        return true;
+                    }
+                } else {
+                    // if no game was running before exit overlay
+                    if (m_noGameRunning) {
+                        tsl::Overlay::get()->close();
+                        return true;
+                    }
+                    // Get current game metadata
+                    DmntCheatProcessMetadata currentMetadata;
+                    if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&currentMetadata))) {
+                        u64 currentTitleId = currentMetadata.title_id;
+                        u64 currentBuildId = *((u64*)currentMetadata.main_nso_build_id);
+                        
+                        // Initialize on first run
+                        if (m_lastTitleId == 0 && m_lastBuildId == 0) {
+                            m_lastTitleId = currentTitleId;
+                            m_lastBuildId = currentBuildId;
+                        }
+                        // Check if game has changed
+                        else if (currentTitleId != m_lastTitleId || currentBuildId != m_lastBuildId) {
+                            // Game has changed - close overlay to prevent stale display
+                            tsl::Overlay::get()->close();
+                            return true;
+                        }
+                    }
+                }
+            }
         }
     
         // Common condition for back key handling
