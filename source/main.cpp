@@ -6601,13 +6601,25 @@ namespace CheatUtils {
             if (std::getline(tfile, title)) ult::trim(title);
         }
         
-        std::string configPath = "sdmc:/config/breezehand/cheat_url.txt";
+        // Check new path first (no extension, then .txt)
+        std::string configPath = "sdmc:/config/breezehand/cheat_url_txt";
         if (!ult::isFile(configPath)) {
-            configPath = "sdmc:/config/breezehand/cheat_url_txt";
+            configPath = "sdmc:/config/breezehand/cheat_url.txt";
+        }
+        
+        // Fallback to legacy path if new path doesn't exist
+        if (!ult::isFile(configPath)) {
+            std::string legacyPath = "sdmc:/config/ultrahand/cheat_url_txt";
+            if (ult::isFile(legacyPath)) {
+                configPath = legacyPath;
+            } else {
+                legacyPath = "sdmc:/config/ultrahand/cheat_url.txt";
+                if (ult::isFile(legacyPath)) configPath = legacyPath;
+            }
         }
         
         if (!ult::isFile(configPath)) {
-            if (notify) tsl::notification->show("Config not found\ncheat_url.txt");
+            if (notify) tsl::notification->show("Config not found\ncheat_url_txt");
             return false;
         }
         
