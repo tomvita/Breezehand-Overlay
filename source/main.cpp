@@ -6608,20 +6608,12 @@ namespace CheatUtils {
             if (std::getline(tfile, title)) ult::trim(title);
         }
         
-        // Check new path first (no extension, then .txt)
+        // Check for cheat_url_txt and copy template if missing
         std::string configPath = "sdmc:/config/breezehand/cheat_url_txt";
         if (!ult::isFile(configPath)) {
-            configPath = "sdmc:/config/breezehand/cheat_url.txt";
-        }
-        
-        // Fallback to legacy path if new path doesn't exist
-        if (!ult::isFile(configPath)) {
-            std::string legacyPath = "sdmc:/config/ultrahand/cheat_url_txt";
-            if (ult::isFile(legacyPath)) {
-                configPath = legacyPath;
-            } else {
-                legacyPath = "sdmc:/config/ultrahand/cheat_url.txt";
-                if (ult::isFile(legacyPath)) configPath = legacyPath;
+            std::string templatePath = "sdmc:/config/breezehand/cheat_url_txt.template";
+            if (ult::isFile(templatePath)) {
+                ult::copyFileOrDirectory(templatePath, configPath);
             }
         }
         
