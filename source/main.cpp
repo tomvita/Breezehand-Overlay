@@ -7213,18 +7213,31 @@ public:
                              u32 firstOp = cheat.definition.opcodes[0];
                              if ((firstOp & 0xF0000000) == 0x80000000) key_mask = firstOp & 0x0FFFFFFF;
                         }
-                        std::string displayName = CheatUtils::GetComboKeyGlyphs(key_mask) + cheat.definition.readable_name;
-                        auto* item = new CheatUtils::CheatToggleItem(displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
+
+                        std::string rawName = cheat.definition.readable_name;
+                        bool isMaster = (cheat.cheat_id == 0);
+                        std::string displayName = CheatUtils::GetComboKeyGlyphs(key_mask) + rawName;
+                        
+                        tsl::elm::ListItem *item;
+                        if (isMaster) {
+                            item = new tsl::elm::ListItem(displayName);
+                            item->setTextColor(tsl::style::color::ColorDescription); // Grey for Master Codes
+                        } else {
+                            auto *toggleItem = new CheatUtils::CheatToggleItem(displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
+                            toggleItem->setStateChangedListener([cheat](bool state) {
+                                dmntchtToggleCheat(cheat.cheat_id);
+                            });
+                            item = toggleItem;
+                        }
+
+                        item->setFontSize(m_cheatFontSize);
+                        item->setUseWrapping(true);
 
                         auto it = notesData.find(cheat.definition.readable_name);
                         if (it != notesData.end()) {
                             auto noteIt = it->second.find("note");
                             if (noteIt != it->second.end()) item->setNote(noteIt->second);
                         }
-                        
-                        item->setStateChangedListener([cheat](bool state) {
-                            dmntchtToggleCheat(cheat.cheat_id);
-                        });
 
                         item->setClickListener([cheat](u64 keys) {
                             if (keys & KEY_X) {
