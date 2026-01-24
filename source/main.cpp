@@ -882,8 +882,15 @@ public:
                 currentWallpaper = (currentWallpaper.empty() || currentWallpaper == OPTION_SYMBOL) ? OPTION_SYMBOL : currentWallpaper;
             }
             
+            auto getLanguageLabel = [&](const std::string& code) -> std::string {
+                for (size_t i = 0; i < defaultLanguages.size(); ++i) {
+                    if (defaultLanguages[i] == code) return *defaultLanguagesRepresentation[i];
+                }
+                return code;
+            };
+            
             addListItem(list, KEY_COMBO, keyCombo, KEY_COMBO_STR);
-            addListItem(list, LANGUAGE, defaultLang, "languageMenu");
+            addListItem(list, LANGUAGE, getLanguageLabel(defaultLang), "languageMenu");
             addListItem(list, SYSTEM, DROPDOWN_SYMBOL, "systemMenu");
             addListItem(list, SOFTWARE_UPDATE, DROPDOWN_SYMBOL, "softwareUpdateMenu");
             addHeader(list, UI_SETTINGS);
