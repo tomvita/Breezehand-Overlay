@@ -247,7 +247,7 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) clean all release full
 
 #---------------------------------------------------------------------------------
 all: $(BUILD)
@@ -259,7 +259,10 @@ $(BUILD):
 
 	@rm -rf out/
 	@mkdir -p out/switch/.overlays/
+	@mkdir -p out/config/breezehand/lang/
 	@cp $(CURDIR)/$(TARGET).ovl out/switch/.overlays/$(TARGET).ovl
+	@cp $(CURDIR)/cheat_url_txt.template out/config/breezehand/cheat_url_txt.template
+	@cp $(CURDIR)/lang/*.json out/config/breezehand/lang/
 
 #---------------------------------------------------------------------------------
 clean:
@@ -274,6 +277,12 @@ dist: all
 
 	@rm -f $(TARGET).zip
 	@cd out; zip -r ../$(TARGET).zip ./*; cd ../
+
+release: dist
+
+full: all
+	@echo making full release ...
+	@python sdout.py
 #---------------------------------------------------------------------------------
 else
 .PHONY: all

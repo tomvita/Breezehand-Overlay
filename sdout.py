@@ -138,56 +138,81 @@ def main():
         
         ultrahand_root = extracted_folders[0]
         
-        # Step 4: Copy lang files
-        lang_source = ultrahand_root / "lang"
+        # Step 4: Copy lang files (Prefer local)
         lang_dest = sdout_dir / "config/breezehand/lang"
+        lang_local = script_dir / "lang"
+        lang_source = ultrahand_root / "lang"
         
+        # Copy from repo first, then overwrite with local if exists
         if lang_source.exists():
-            print("Copying language files...")
+            print("Copying language files from repo...")
             for json_file in lang_source.glob("*.json"):
                 shutil.copy2(json_file, lang_dest)
-                print(f"Copied {json_file.name}")
         
-        # Step 5: Copy ultrahand_updater.bin
-        payload_source = ultrahand_root / "payloads/ultrahand_updater.bin"
+        if lang_local.exists():
+            print("Applying local language files...")
+            for json_file in lang_local.glob("*.json"):
+                shutil.copy2(json_file, lang_dest)
+                print(f"Updated {json_file.name}")
+        
+        # Step 5: Copy ultrahand_updater.bin (Prefer local)
         payload_dest = sdout_dir / "config/breezehand/payloads"
+        payload_local = script_dir / "payloads/ultrahand_updater.bin"
+        payload_source = ultrahand_root / "payloads/ultrahand_updater.bin"
         
-        if payload_source.exists():
-            print("Copying payload file...")
+        if payload_local.exists():
+            print("Copying local payload file...")
+            shutil.copy2(payload_local, payload_dest)
+        elif payload_source.exists():
+            print("Copying payload file from repo...")
             shutil.copy2(payload_source, payload_dest)
-            print(f"Copied ultrahand_updater.bin")
         
-        # Step 6: Copy theme files from the downloaded repository
-        print("Copying theme files...")
-        theme_source = ultrahand_root / "themes"
+        # Step 6: Copy theme files (Prefer local)
         theme_dest = sdout_dir / "config/breezehand/themes"
+        theme_local = script_dir / "themes"
+        theme_source = ultrahand_root / "themes"
         theme_files = ["ultra.ini", "ultra-blue.ini"]
         
-        if theme_source.exists():
-            for theme_file in theme_files:
-                theme_file_path = theme_source / theme_file
-                if theme_file_path.exists():
-                    shutil.copy2(theme_file_path, theme_dest)
-                    print(f"Copied {theme_file}")
-                else:
-                    print(f"Warning: {theme_file} not found in themes folder")
-        else:
-            print("Warning: themes folder not found in Ultrahand repository")
+        # Helper to copy from specific source
+        def copy_themes(source):
+            if source.exists():
+                for theme_file in theme_files:
+                    theme_file_path = source / theme_file
+                    if theme_file_path.exists():
+                        shutil.copy2(theme_file_path, theme_dest)
+                        print(f"Copied theme: {theme_file}")
+
+        print("Processing themes...")
+        copy_themes(theme_source)
+        copy_themes(theme_local) # Local overwrites repo
         
-        # Step 7: Copy sound files
-        print("Copying sound files...")
-        sounds_source = ultrahand_root / "sounds"
+        # Step 7: Copy sound files (Prefer local)
         sounds_dest = sdout_dir / "config/breezehand/sounds"
+        sounds_local = script_dir / "sounds"
+        sounds_source = ultrahand_root / "sounds"
         
-        if sounds_source.exists():
-            for wav_file in sounds_source.glob("*.wav"):
-                shutil.copy2(wav_file, sounds_dest)
-                print(f"Copied {wav_file.name}")
+        def copy_sounds(source):
+            if source.exists():
+                for wav_file in source.glob("*.wav"):
+                    shutil.copy2(wav_file, sounds_dest)
+        
+        print("Processing sounds...")
+        copy_sounds(sounds_source)
+        copy_sounds(sounds_local) # Local overwrites repo
+        
+        # Step 8: Copy cheat_url_txt.template
+        print("Copying cheat_url_txt.template...")
+        template_source = script_dir / "cheat_url_txt.template"
+        template_dest = sdout_dir / "config/breezehand/cheat_url_txt.template"
+        
+        if template_source.exists():
+            shutil.copy2(template_source, template_dest)
+            print(f"Copied cheat_url_txt.template")
         else:
-            print("Warning: sounds folder not found in Ultrahand repository")
-        
-        # Step 8: Copy ovlmenu.ovl
-        print("Copying ovlmenu.ovl...")
+            print("Warning: cheat_url_txt.template not found in script directory")
+            
+        # Step 9: Copy breezehand.ovl
+        print("Copying breezehand.ovl...")
         ovlmenu_source = script_dir / "breezehand.ovl"
         ovlmenu_dest = sdout_dir / "switch/.overlays"
         
@@ -197,20 +222,20 @@ def main():
         else:
             print("Warning: breezehand.ovl not found in script directory")
         
-        # Step 9: Clean up temporary files
+        # Step 10: Clean up temporary files
         print("Cleaning up temporary files...")
         shutil.rmtree(temp_dir)
         print("Temporary files deleted")
         
-        # Step 10: Create final zip
+        # Step 11: Create final zip
         output_zip = script_dir / "breezehand.zip"
         create_zip_without_metadata(sdout_dir, output_zip)
         
-        print(f"✓ Successfully created breezehand.zip!")
+        print(f"[DONE] Successfully created breezehand.zip!")
         print(f"Location: {output_zip}")
         
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        print(f"\n[ERROR] Error: {e}")
         # Clean up on error
         if Path(temp_dir).exists():
             shutil.rmtree(temp_dir)
