@@ -482,6 +482,18 @@ static std::string returnJumpItemValue;
 // Forward declaration of the MainMenu class.
 class MainMenu;
 
+class MainComboSetItem : public tsl::elm::ListItem {
+private:
+    u64 holdStartTick = 0;
+    u64 capturedKeys = 0;
+    bool capturing = false;
+
+public:
+    MainComboSetItem(const std::string& text, const std::string& value);
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchState, HidAnalogStickState leftJoyStick, HidAnalogStickState rightJoyStick) override;
+    virtual bool onClick(u64 keys) override;
+};
 class UltrahandSettingsMenu : public tsl::Gui {
 private:
     std::string entryName, entryMode, overlayName, dropdownSelection, settingsIniPath;
@@ -907,7 +919,12 @@ public:
             addHeader(list, KEY_COMBO);
             std::string defaultCombo = parseValueFromIniSection(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, KEY_COMBO_STR);
             trim(defaultCombo);
-            handleSelection(list, defaultCombos, defaultCombo, KEY_COMBO_STR, KEY_COMBO_STR);
+            // handleSelection(list, defaultCombos, defaultCombo, KEY_COMBO_STR, KEY_COMBO_STR);
+            std::string mappedCombo = defaultCombo.empty() ? defaultCombos[0] : defaultCombo;
+            convertComboToUnicode(mappedCombo);
+            
+            auto* setComboItem = new MainComboSetItem(KEY_COMBO, mappedCombo);
+            list->addItem(setComboItem);
         } else if (dropdownSelection == "languageMenu") {
             addHeader(list, LANGUAGE);
             const std::string defaulLang = parseValueFromIniSection(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, DEFAULT_LANG_STR);
@@ -6854,7 +6871,7 @@ public:
                 } else {
                     if (keys == capturedKeys) {
                         u64 diff = armGetSystemTick() - holdStartTick;
-                        if (armTicksToNs(diff) >= 1000000000ULL) { // 1 second
+                        if (armTicksToNs(diff) >= 500000000ULL) { // 0.5 second
                             if (cheat_id != 0) {
                                 CheatUtils::AddComboKeyToCheat(cheat_id, capturedKeys);
                                 tsl::notification->show("Combo Key Set: " + getKeyNames(capturedKeys));
@@ -6881,7 +6898,7 @@ public:
             } else {
                 holdStartTick = 0;
                 capturedKeys = 0;
-                this->setNote("Hold keys for 1 second");
+                this->setNote("Hold keys for 0.5s");
             }
             // Consume EVERYTHING including B while capturing
             return true;
@@ -6903,7 +6920,7 @@ public:
                 capturing = true;
                 holdStartTick = 0;
                 capturedKeys = 0;
-                this->setNote("Hold keys for 2 seconds");
+                this->setNote("Hold keys for 0.5s");
                 return true;
             }
         }
@@ -9268,7 +9285,7 @@ tsl::elm::Element* CheatMenu::createUI() {
 
     if (this->cheat_id != 0) {
         // Context-aware "Set Combo Key" using new Hold Item
-        auto* setComboItem = new CheatUtils::ComboSetItem("Set Combo Key (Hold 1s)", this->cheat_id);
+        auto* setComboItem = new CheatUtils::ComboSetItem("Set Combo Key (Hold 0.5s)", this->cheat_id);
         setComboItem->setClickListener([](u64 keys) { return false; }); 
         list->addItem(setComboItem);
 
@@ -9340,6 +9357,111 @@ bool CheatMenu::handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput
         return true;
     }
     return false;
+}
+
+
+
+
+MainComboSetItem::MainComboSetItem(const std::string& text, const std::string& value) : tsl::elm::ListItem(text) {
+    this->setValue(value);
+    this->setNote("Press A to start capture");
+    this->setAlwaysShowNote(true);
+}
+
+bool MainComboSetItem::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchState, HidAnalogStickState leftJoyStick, HidAnalogStickState rightJoyStick) {
+    if (capturing) {
+        u64 keys = keysHeld & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R | KEY_ZL | KEY_ZR | KEY_PLUS | KEY_MINUS | KEY_DLEFT | KEY_DUP | KEY_DRIGHT | KEY_DDOWN | KEY_LSTICK | KEY_RSTICK);
+        
+        // Cancel capture if B is pressed alone
+        if (keys == 0 && (keysDown & KEY_B)) {
+            capturing = false;
+            holdStartTick = 0;
+            capturedKeys = 0;
+            this->setNote("Press A to start capture");
+            return true;
+        }
+
+        if (keys != 0) {
+            if (holdStartTick == 0) {
+                holdStartTick = armGetSystemTick();
+                capturedKeys = keys;
+                this->setNote("Capture: " + tsl::hlp::keysToComboString(keys) + " (0.5s)");
+            } else {
+                if (keys == capturedKeys) {
+                    u64 diff = armGetSystemTick() - holdStartTick;
+                    if (armTicksToNs(diff) >= 500000000ULL) { // 0.5 second
+                        if (capturedKeys == KEY_A) {
+                            this->setNote("A alone not allowed!");
+                            return true;
+                        }
+                        
+                        std::string comboStr = tsl::hlp::keysToComboString(capturedKeys);
+                        tsl::impl::updateCombo(capturedKeys);
+                        
+                        removeKeyComboFromOthers(comboStr, "");
+                        tsl::hlp::loadEntryKeyCombos();
+                        
+                        tsl::notification->show("Key Combo Set: " + comboStr);
+                        
+                        std::string displayCombo = comboStr;
+                        convertComboToUnicode(displayCombo);
+                        this->setValue(displayCombo);
+                        
+                        capturing = false;
+                        holdStartTick = 0;
+                        capturedKeys = 0;
+                        this->setNote("Press A to start capture");
+                        
+                        // Refresh current menu immediately
+                        reloadMenu = true;
+                        tsl::swapTo<UltrahandSettingsMenu>();
+                        return true;
+                    } else {
+                         // Countdown/feedback
+                         float elapsed = armTicksToNs(diff) / 500000000.0f;
+                         char buf[64];
+                         std::snprintf(buf, sizeof(buf), "Capture: %s (%.1fs)", tsl::hlp::keysToComboString(capturedKeys).c_str(), 0.5f - (elapsed * 0.5f));
+                         this->setNote(buf);
+                    }
+                } else {
+                    // Keys changed, reset timer
+                    holdStartTick = armGetSystemTick();
+                    capturedKeys = keys;
+                    this->setNote("Capture: " + tsl::hlp::keysToComboString(keys) + " (0.5s)");
+                }
+            }
+        } else {
+            holdStartTick = 0;
+            capturedKeys = 0;
+            this->setNote("Hold keys for 0.5s");
+        }
+        // Consume EVERYTHING including B while capturing
+        return true;
+    }
+
+    if (!this->hasFocus()) {
+        holdStartTick = 0;
+        capturedKeys = 0;
+        capturing = false;
+        this->setNote("Press A to start capture");
+    }
+
+    return tsl::elm::ListItem::handleInput(keysDown, keysHeld, touchState, leftJoyStick, rightJoyStick);
+}
+
+bool MainComboSetItem::onClick(u64 keys) {
+    if (keys & KEY_A) {
+        if (!capturing) {
+            capturing = true;
+            holdStartTick = 0;
+            capturedKeys = 0;
+            this->setValue("");
+            tsl::impl::updateCombo(0);
+            this->setNote("Hold keys for 0.5s");
+            return true;
+        }
+    }
+    return tsl::elm::ListItem::onClick(keys);
 }
 
 int main(int argc, char* argv[]) {
