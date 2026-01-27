@@ -971,6 +971,15 @@ public:
                         if (selectedListItem)
                             selectedListItem->setValue(defaultLangMode);
                         listItem->setValue(defaultLangMode + " " + CHECKMARK_SYMBOL);
+
+                        // Reload font if CJK language is selected
+                        if (defaultLangMode == "zh-cn") {
+                            tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_ChineseSimplified);
+                        } else if (defaultLangMode == "zh-tw") {
+                            tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_ChineseTraditional);
+                        } else if (defaultLangMode == "ko") {
+                            tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_KO);
+                        }
                         //lastSelectedListItem = nullptr;
                         lastSelectedListItem = listItem;
                         tsl::shiftItemFocus(listItem);
@@ -8535,6 +8544,15 @@ void initializeSettingsAndDirectories() {
     else {
         if (defaultLang == "en")
             reinitializeLangVars();
+    }
+
+    // Load local font if needed based on overlay language setting
+    if (defaultLang == "zh-cn") {
+        tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_ChineseSimplified);
+    } else if (defaultLang == "zh-tw") {
+        tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_ChineseTraditional);
+    } else if (defaultLang == "ko") {
+        tsl::gfx::Renderer::get().loadLocalFont(PlSharedFontType_KO);
     }
     
     // Initialize theme
