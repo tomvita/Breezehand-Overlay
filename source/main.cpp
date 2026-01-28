@@ -7846,7 +7846,7 @@ public:
      */
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         
-        if (keysHeld & (KEY_ZL)) {
+        if ((keysHeld & KEY_ZL) && menuMode == OVERLAYS_STR) {
             if (keysDown & KEY_R) {
                 m_cheatFontSize = std::min(static_cast<int>(m_cheatFontSize) + 1, 30);
                 if (cheatList) {
