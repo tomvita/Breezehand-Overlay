@@ -30,10 +30,12 @@
 #include <ultra.hpp>
 #include <tesla.hpp>
 #include <utils.hpp>
+// #include <switch.h>
 #include <dmntcht.h>
 #include <set>
 #include <iomanip>
 #include <sstream>
+#include "search_types.hpp"
 
 
 using namespace ult;
@@ -494,6 +496,26 @@ public:
     virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchState, HidAnalogStickState leftJoyStick, HidAnalogStickState rightJoyStick) override;
     virtual bool onClick(u64 keys) override;
 };
+
+#if IS_LAUNCHER_DIRECTIVE
+searchType_t g_pendingKeyboardType = SEARCH_TYPE_NONE;
+std::string g_pendingKeyboardValue = "";
+
+void launchKeyboard(searchType_t type, const std::string& initialValue, const std::string& title) {
+    std::string path = "sdmc:/switch/.overlays/keyboard.ovl";
+    std::string args = "--type " + std::to_string((int)type) + " --value \"" + initialValue + "\" --title \"" + title + "\"";
+    
+    std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
+    ult::requestedOverlayPath = path;
+    ult::requestedOverlayArgs = args;
+    ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::TRUE_STR);
+    tsl::setNextOverlay(path, args);
+    
+    // Signal exit
+    tsl::Overlay::get()->close();
+}
+#endif
+
 class UltrahandSettingsMenu : public tsl::Gui {
 private:
     std::string entryName, entryMode, overlayName, dropdownSelection, settingsIniPath;
@@ -7081,6 +7103,17 @@ public:
         menuMode = !hiddenMenuMode.empty() ? hiddenMenuMode : currentMenu;
         
         auto* list = new tsl::elm::List();
+
+        auto* kbTest = new tsl::elm::ListItem("Keyboard Test");
+        kbTest->setClickListener([](u64 keys) {
+            if (keys & KEY_A) {
+                launchKeyboard(SEARCH_TYPE_NONE, "TestValue", "Keyboard Test");
+                return true;
+            }
+            return false;
+        });
+        list->addItem(kbTest);
+
         bool noClickableItems = false;
         
         if (menuMode == OVERLAYS_STR) {
@@ -8585,7 +8618,24 @@ public:
      * This function is called when the overlay transitions from an invisible state to a visible state.
      * It can be used to perform actions or updates specific to the overlay's visibility.
      */
-    virtual void onShow() override {} 
+    virtual void onShow() override {
+        // Check for keyboard return value
+        const std::string kbReturnPath = "sdmc:/switch/.overlays/breezehand_kb.bin";
+        if (ult::isFile(kbReturnPath)) {
+            std::ifstream f(kbReturnPath);
+            if (f.is_open()) {
+                std::string value;
+                std::getline(f, value, '\0');
+                f.close();
+                
+                // For now, just show a notification or store it
+                // In a real implementation, this would update the memory or search value
+                tsl::notification->show("Keyboard return: " + value);
+                g_pendingKeyboardValue = value;
+            }
+            ult::deleteFileOrDirectory(kbReturnPath);
+        }
+    } 
     
     /**
      * @brief Performs actions when the overlay becomes visible.
