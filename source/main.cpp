@@ -509,10 +509,7 @@ void launchKeyboard(searchType_t type, const std::string& initialValue, const st
     ult::requestedOverlayPath = path;
     ult::requestedOverlayArgs = args;
     ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH, ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR, ult::TRUE_STR);
-    tsl::setNextOverlay(path, args);
-    
-    // Signal exit
-    tsl::Overlay::get()->close();
+    ult::overlayLaunchRequested.store(true, std::memory_order_release);
 }
 #endif
 
@@ -7887,7 +7884,9 @@ public:
                         using tsl::elm::List::m_items;
                     };
                     for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
-                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                        if (item && item->m_isItem) {
+                            static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                        }
                     }
                     cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
                     if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
@@ -7901,7 +7900,9 @@ public:
                         using tsl::elm::List::m_items;
                     };
                     for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
-                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                        if (item && item->m_isItem) {
+                            static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize);
+                        }
                     }
                     cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
                     if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "font_size", std::to_string(m_cheatFontSize));
@@ -7920,7 +7921,9 @@ public:
                 };
                 // Reset calculated heights to force recalculation with new note visibility
                 for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
-                    static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize); // This resets height
+                    if (item && item->m_isItem) {
+                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize); // This resets height
+                    }
                 }
                 cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
             }
@@ -7939,7 +7942,7 @@ public:
                         using tsl::elm::List::m_items;
                     };
                     for (auto* item : static_cast<ListProxy*>(this->cheatList)->m_items) {
-                        if (item && item->hasFocus()) {
+                        if (item && item->m_isItem && item->hasFocus()) {
                              auto* listItem = static_cast<tsl::elm::ListItem*>(item);
                              std::string text = listItem->getText();
                              // Only cast to CheatToggleItem if it's actually a cheat item
