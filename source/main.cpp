@@ -7885,17 +7885,23 @@ public:
         if (keysDown & KEY_Y) {
             ult::showCheatNotes = !ult::showCheatNotes;
             if (!m_notesPath.empty()) ult::setIniFileValue(m_notesPath, "Breeze", "show_notes", ult::showCheatNotes ? "true" : "false");
+            
             if (cheatList && menuMode == OVERLAYS_STR) {
+                // Find currently focused item to restore focus and scroll after refresh
                 struct ListProxy : public tsl::elm::List {
                     using tsl::elm::List::m_items;
                 };
-                // Reset calculated heights to force recalculation with new note visibility
                 for (auto* item : static_cast<ListProxy*>(cheatList)->m_items) {
-                    if (item && item->m_isItem) {
-                        static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_cheatFontSize); // This resets height
+                    if (item && item->m_isItem && item->hasFocus()) {
+                        auto* listItem = static_cast<tsl::elm::ListItem*>(item);
+                        jumpItemName = listItem->getText();
+                        jumpItemValue = listItem->getValue();
+                        jumpItemExactMatch.store(true, release);
+                        skipJumpReset.store(true, release);
+                        break;
                     }
                 }
-                cheatList->layout(cheatList->getX(), cheatList->getY(), cheatList->getWidth(), cheatList->getHeight());
+                refreshPage.store(true, release);
             }
             return true;
         }
