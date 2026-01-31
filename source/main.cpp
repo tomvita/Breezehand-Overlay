@@ -24,11 +24,13 @@
  ********************************************************************************/
 
 #define NDEBUG
-#define STBTT_STATIC
+// #define STBTT_STATIC
 #define TESLA_INIT_IMPL
 
 #include <ultra.hpp>
 #include <tesla.hpp>
+#include "keyboard.hpp"
+#include "../common/search_types.hpp"
 #include <utils.hpp>
 #include <dmntcht.h>
 #include <set>
@@ -6960,6 +6962,267 @@ public:
     }
 } // namespace CheatUtils
 
+class CheatEditMenu : public tsl::Gui {
+private:
+    u32 m_cheatId;
+    std::string m_cheatName;
+    bool m_enabled;
+    int m_fontSize;
+    tsl::elm::List* m_list;
+    std::vector<u32> m_cachedOpcodes;
+    bool m_dirty;
+    int m_focusIndex;
+
+public:
+    CheatEditMenu(u32 cheatId, const std::string& name, bool enabled, const std::vector<u32>& opcodes = {}, int focusIndex = -1, bool dirty = false) 
+        : m_cheatId(cheatId), m_cheatName(name), m_enabled(enabled), m_fontSize(18), m_list(nullptr), m_cachedOpcodes(opcodes), m_dirty(dirty), m_focusIndex(focusIndex) {}
+
+    void refreshList() {
+        m_list->clear();
+        
+        // Cheat Info Header
+        m_list->addItem(new tsl::elm::CategoryHeader("Cheat Info"));
+        
+        auto* nameItem = new tsl::elm::ListItem(m_cheatName);
+        nameItem->setUseWrapping(true);
+        m_list->addItem(nameItem);
+        
+        // Hex Codes Header
+        m_list->addItem(new tsl::elm::CategoryHeader("Hex Codes"));
+
+        if (!m_cachedOpcodes.empty()) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "UI: %lu ops. Dirty: %d", m_cachedOpcodes.size(), m_dirty);
+            // tsl::notification->show(buf); 
+
+            for (u32 j = 0; j < m_cachedOpcodes.size(); j++) {
+                // Formatting logic adapted from SaveCheatsToDir
+                u32 op = m_cachedOpcodes[j];
+                u32 opcode = (op >> 28) & 0xF;
+                u8 T = 0;
+                
+                // Pre-decode check for special types
+                if ((opcode == 0xC)) {
+                     u32 subcode = (op >> 24) & 0xFF;
+                     if (subcode == 0xC0) opcode = 0xC0; 
+                }
+
+                 // Special handling for Type 9 (Arithmetic)
+                if ((opcode == 9) && (((op >> 8) & 0xF) == 0)) {
+                    snprintf(buf, sizeof(buf), "%08X", op);
+                    auto* item = new tsl::elm::ListItem(buf);
+                    item->setFontSize(m_fontSize);
+                    item->setUseWrapping(true);
+                    m_list->addItem(item);
+                    continue;
+                }
+                
+                // Decode lengths
+                std::string lineStr = "";
+                auto appendHex = [&](u32 val) {
+                    char tmp[16];
+                    snprintf(tmp, sizeof(tmp), "%08X ", val);
+                    lineStr += tmp;
+                };
+
+                // Opcode length logic
+                switch (opcode) {
+                    case 0: case 1: case 0xC06:
+                        appendHex(m_cachedOpcodes[j++]);
+                        if (j >= m_cachedOpcodes.size()) break;
+                        [[fallthrough]];
+                    case 9: case 0xC04:
+                        appendHex(m_cachedOpcodes[j++]);
+                        if (j >= m_cachedOpcodes.size()) break;
+                        [[fallthrough]];
+                    case 3: case 10:
+                        appendHex(m_cachedOpcodes[j]);
+                        if (T == 8 || (T == 0 && opcode == 3)) {
+                             j++;
+                             if (j < m_cachedOpcodes.size()) appendHex(m_cachedOpcodes[j]);
+                        }
+                        break;
+                    case 4: case 6: case 0xC4:
+                        appendHex(m_cachedOpcodes[j++]);
+                        if (j >= m_cachedOpcodes.size()) break;
+                        [[fallthrough]];
+                    case 5: case 7: case 0xC00: case 0xC02:
+                        appendHex(m_cachedOpcodes[j++]);
+                        if (j >= m_cachedOpcodes.size()) break;
+                        [[fallthrough]];
+                    case 2: case 8: case 0xC1: case 0xC2:
+                    default:
+                        appendHex(m_cachedOpcodes[j]);
+                        break;
+                }
+                if (!lineStr.empty()) lineStr.pop_back();
+                auto* item = new tsl::elm::ListItem(lineStr);
+                item->setFontSize(m_fontSize);
+                item->setUseWrapping(true);
+                m_list->addItem(item);
+            }
+        } else {
+            m_list->addItem(new tsl::elm::ListItem("Error reading cheat"));
+        }
+        
+        if (m_focusIndex != -1) {
+            m_list->setFocusedIndex(m_focusIndex);
+        }
+    }
+
+    virtual tsl::elm::Element* createUI() override {
+        auto *frame = new tsl::elm::OverlayFrame("Cheat Editor", "");
+        m_list = new tsl::elm::List();
+
+        // Load cache if empty (first run)
+        if (m_cachedOpcodes.empty() && !m_dirty) {
+             DmntCheatEntry cheat;
+             if (R_SUCCEEDED(dmntchtGetCheatById(&cheat, m_cheatId))) {
+                 for(u32 i=0; i<cheat.definition.num_opcodes; i++) {
+                     m_cachedOpcodes.push_back(cheat.definition.opcodes[i]);
+                 }
+             }
+        }
+
+        refreshList();
+
+        frame->setContent(m_list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState joyStickPosLeft, HidAnalogStickState joyStickPosRight) override {
+        if (keysDown & KEY_B) {
+            if (m_dirty) {
+                // Access protected accessors via proxy
+                struct ListProxy : public tsl::elm::List {
+                    using tsl::elm::List::m_items;
+                };
+                auto* proxy = static_cast<ListProxy*>(m_list);
+                
+                std::vector<u32> finalOps;
+                finalOps.reserve(0x100);
+                
+                // Index 3+: Hex items (skip headers and name)
+                for (size_t i = 3; i < proxy->m_items.size(); i++) {
+                    struct ListItemProxy : public tsl::elm::ListItem {
+                        using tsl::elm::ListItem::m_text;
+                    };
+                    auto* listItem = static_cast<ListItemProxy*>(proxy->m_items[i]);
+                    std::string line = listItem->m_text;
+                    
+                    std::stringstream ss(line);
+                    std::string word;
+                    while (ss >> word) {
+                        finalOps.push_back(std::strtoul(word.c_str(), nullptr, 16));
+                    }
+                }
+
+                if (!finalOps.empty()) {
+                    dmntchtRemoveCheat(m_cheatId);
+                    
+                    DmntCheatDefinition def;
+                    memset(&def, 0, sizeof(def));
+                    strncpy(def.readable_name, m_cheatName.c_str(), sizeof(def.readable_name) - 1);
+                    def.num_opcodes = std::min((size_t)0x100, finalOps.size());
+                    for(u32 i=0; i<def.num_opcodes; i++) {
+                        def.opcodes[i] = finalOps[i];
+                    }
+                    
+                    u32 newId = 0;
+                    dmntchtAddCheat(&def, m_enabled, &newId);
+                }
+            }
+            tsl::goBack();
+            return true;
+        }
+
+        if (keysDown & KEY_A) {
+            // Access protected accessors via proxy
+            struct ListProxy : public tsl::elm::List {
+                using tsl::elm::List::m_items;
+                using tsl::elm::List::m_focusedIndex;
+            };
+            
+            auto* proxy = static_cast<ListProxy*>(m_list);
+            if (!proxy->m_items.empty() && proxy->m_focusedIndex < proxy->m_items.size()) {
+                // Safeguard headers
+                if (proxy->m_focusedIndex == 0 || proxy->m_focusedIndex == 2) return false;
+
+                auto* item = proxy->m_items[proxy->m_focusedIndex];
+                if (item) {
+                    struct ListItemProxy : public tsl::elm::ListItem {
+                        using tsl::elm::ListItem::m_text;
+                    };
+                    auto* listItem = static_cast<ListItemProxy*>(item);
+                    if (listItem) {
+                        std::string val = listItem->m_text;
+                        u32 fIdx = proxy->m_focusedIndex;
+                        
+                        tsl::changeTo<tsl::KeyboardGui>(SEARCH_TYPE_HEX, val, "Edit Hex", 
+                            [this, proxy, fIdx](std::string result) {
+                                this->m_dirty = true;
+                                
+                                if (!proxy->m_items.empty() && fIdx < proxy->m_items.size()) {
+                                    auto* item = proxy->m_items[fIdx];
+                                    if (item) {
+                                        static_cast<tsl::elm::ListItem*>(item)->setText(result);
+                                    }
+                                }
+                                tsl::goBack();
+                            }
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+
+        // Manual Font Size Adjustment
+        if ((keysHeld & KEY_ZL)) {
+            bool changed = false;
+            if (keysDown & KEY_R) {
+                m_fontSize = std::min(m_fontSize + 1, 30);
+                changed = true;
+            }
+            if (keysDown & KEY_L) {
+                m_fontSize = std::max(m_fontSize - 1, 10);
+                changed = true;
+            }
+
+            if (changed && m_list) {
+                // Access protected m_items via proxy hack
+                struct ListProxy : public tsl::elm::List {
+                    using tsl::elm::List::m_items;
+                };
+                
+                // Skip the first few items (Header, Name, Header)
+                // Index 0: CategoryHeader "Cheat Info"
+                // Index 1: ListItem Name
+                // Index 2: CategoryHeader "Hex Codes"
+                // Index 3+: Hex items
+                
+                auto& items = static_cast<ListProxy*>(m_list)->m_items;
+                for (size_t i = 3; i < items.size(); i++) {
+                    auto* item = items[i];
+                    if (item) {
+                       // Assuming all items after index 2 are ListItems for hex
+                       // We should ideally check type but standard usage here implies it.
+                       // Cast to ListItem (base class Element doesn't have setFontSize)
+                       // Accessing private/protected setFontSize might require cast to ListItem*
+                       // ListItem inherits from Element. Element has no setFontSize.
+                       // We created them as ListItems.
+                       static_cast<tsl::elm::ListItem*>(item)->setFontSize(m_fontSize);
+                    }
+                }
+                return true;
+            }
+        }
+        
+        return false;
+    }
+};
+
 class MainMenu : public tsl::Gui {
 
 private:
@@ -7267,6 +7530,10 @@ public:
                         item->setClickListener([cheat](u64 keys) {
                             if (keys & KEY_X) {
                                 tsl::changeTo<CheatMenu>(cheat.cheat_id, cheat.definition.readable_name);
+                                return true;
+                            }
+                            if (keys & KEY_MINUS) {
+                                tsl::changeTo<CheatEditMenu>(cheat.cheat_id, cheat.definition.readable_name, cheat.enabled);
                                 return true;
                             }
                             return false;
@@ -9524,4 +9791,410 @@ int main(int argc, char* argv[]) {
     }
 
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
+}
+
+// ==========================================
+// KEYBOARD IMPLEMENTATION (Merged)
+// ==========================================
+
+#include "keyboard.hpp"
+#include <algorithm>
+#include <switch.h>
+
+namespace {
+
+    // Helper classes are internal to this compilation unit.
+
+    // --- KeyboardFrame ---
+    class KeyboardFrame : public tsl::elm::OverlayFrame {
+    public:
+        KeyboardFrame(const std::string& title, const std::string& subtitle) : tsl::elm::OverlayFrame(title, subtitle) {}
+        
+        virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
+            setBoundaries(parentX, parentY, parentWidth, parentHeight);
+            
+            if (m_contentElement != nullptr) {
+                // Reduced padding: Left 25, Right 25 -> Width - 50 total padding
+                m_contentElement->setBoundaries(parentX + 25, parentY + 115, parentWidth - 50, parentHeight - 73 - 110);
+                m_contentElement->layout(parentX + 25, parentY + 115, parentWidth - 50, parentHeight - 73 - 110);
+                m_contentElement->invalidate();
+            }
+        }
+    };
+
+    // --- KeyboardButton ---
+    class KeyboardButton : public tsl::elm::Element {
+    public:
+        KeyboardButton(char c, std::function<void(char)> onClick) 
+            : m_char(c), m_label(1, c), m_onClick(onClick) {
+            m_isItem = true;
+        }
+        
+        KeyboardButton(const std::string& label, std::function<void()> onClickAction) 
+            : m_char(0), m_label(label), m_onClickAction(onClickAction) {
+            m_isItem = true;
+        }
+
+        virtual s32 getHeight() override { return 60; }
+
+        virtual void draw(tsl::gfx::Renderer *renderer) override {
+            auto color = m_focused ? tsl::style::color::ColorHighlight : tsl::style::color::ColorText;
+            if (m_focused) {
+                renderer->drawRoundedRect(this->getX(), this->getY(), this->getWidth(), this->getHeight(), 8.0f, a(tsl::style::color::ColorClickAnimation));
+            }
+            renderer->drawRect(this->getX(), this->getY(), this->getWidth(), this->getHeight(), a(tsl::style::color::ColorFrame));
+            
+            s32 textX = this->getX() + (this->getWidth() / 2) - (m_label.length() * 8);
+            s32 textY = this->getY() + (this->getHeight() / 2) + 12;
+            renderer->drawString(m_label.c_str(), false, textX, textY, 25, a(color));
+        }
+
+        virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
+            setBoundaries(parentX, parentY, parentWidth, parentHeight);
+        }
+
+        virtual inline tsl::elm::Element* requestFocus(tsl::elm::Element *oldFocus, tsl::FocusDirection direction) override {
+            return this;
+        }
+
+        virtual inline bool onClick(u64 keys) override {
+            if (keys & KEY_A) {
+                if (m_onClick) m_onClick(m_char);
+                else if (m_onClickAction) m_onClickAction();
+                return true;
+            }
+            return false;
+        }
+
+    private:
+        char m_char;
+        std::string m_label;
+        std::function<void(char)> m_onClick;
+        std::function<void()> m_onClickAction;
+    };
+
+    // --- KeyboardRow ---
+    class KeyboardRow : public tsl::elm::Element {
+    public:
+        KeyboardRow() { m_isItem = true; }
+        virtual ~KeyboardRow() {
+            for (auto* btn : m_buttons) delete btn;
+        }
+
+        void addButton(KeyboardButton* btn) {
+            btn->setParent(this);
+            m_buttons.push_back(btn);
+        }
+
+        virtual s32 getHeight() override { return 60; }
+
+        virtual void draw(tsl::gfx::Renderer *renderer) override {
+            this->layout(this->getX(), this->getY(), this->getWidth(), this->getHeight());
+            for (auto* btn : m_buttons) btn->frame(renderer);
+        }
+
+        virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
+            if (m_buttons.empty()) return;
+
+            u16 btnWidth = this->getWidth() / m_buttons.size();
+            u16 btnHeight = 60;
+            u16 yOffset = (this->getHeight() - btnHeight) / 2;
+
+            for (size_t i = 0; i < m_buttons.size(); ++i) {
+                u16 width = (i == m_buttons.size() - 1) ? (this->getWidth() - i * btnWidth) : btnWidth;
+                m_buttons[i]->layout(parentX + i * btnWidth, parentY + yOffset, width, btnHeight);
+            }
+        }
+
+        virtual inline tsl::elm::Element* requestFocus(tsl::elm::Element *oldFocus, tsl::FocusDirection direction) override {
+            if (m_buttons.empty()) return nullptr;
+            
+            if (oldFocus && (direction == tsl::FocusDirection::Up || direction == tsl::FocusDirection::Down)) {
+                s32 targetX = oldFocus->getX() + (oldFocus->getWidth() / 2);
+                auto it = std::min_element(m_buttons.begin(), m_buttons.end(), [targetX](tsl::elm::Element* a, tsl::elm::Element* b) {
+                    return std::abs(a->getX() + (s32)(a->getWidth() / 2) - targetX) < std::abs(b->getX() + (s32)(b->getWidth() / 2) - targetX);
+                });
+                return (*it)->requestFocus(oldFocus, direction);
+            }
+
+            if (oldFocus && (direction == tsl::FocusDirection::Left || direction == tsl::FocusDirection::Right)) {
+                for (size_t i = 0; i < m_buttons.size(); ++i) {
+                    if (m_buttons[i] == oldFocus) {
+                        if (direction == tsl::FocusDirection::Left) {
+                            if (i > 0) return m_buttons[i-1]->requestFocus(oldFocus, direction);
+                        } else {
+                            if (i < m_buttons.size() - 1) return m_buttons[i+1]->requestFocus(oldFocus, direction);
+                        }
+                        return oldFocus;
+                    }
+                }
+            }
+            
+            if (direction == tsl::FocusDirection::Left) return m_buttons.back()->requestFocus(oldFocus, direction);
+            return m_buttons.front()->requestFocus(oldFocus, direction);
+        }
+
+    private:
+        std::vector<KeyboardButton*> m_buttons;
+    };
+
+    // --- ValueDisplay ---
+    class ValueDisplay : public tsl::elm::Element {
+    public:
+        ValueDisplay(tsl::KeyboardGui* gui, const std::string& title, std::string& value, size_t& cursorPos) 
+            : m_gui(gui), m_title(title), m_value(value), m_cursorPos(cursorPos) {
+            m_isItem = true;
+        }
+
+        virtual s32 getHeight() override { return 70; }
+
+        virtual void draw(tsl::gfx::Renderer *renderer) override {
+            std::string val;
+            size_t pos;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_gui->getMutex());
+                val = m_value;
+                pos = m_cursorPos;
+            }
+
+            renderer->drawRect(this->getX(), this->getY(), this->getWidth(), this->getHeight(), a(tsl::style::color::ColorFrame));
+            
+            s32 maxW = this->getWidth() - 30;
+            int effectiveSize = m_fontSize;
+            
+            // Auto-reduce font size if text is too wide
+            while (effectiveSize > 10 && renderer->getTextDimensions(val.c_str(), false, effectiveSize).first > maxW) {
+                effectiveSize--;
+            }
+
+            s32 textY = this->getY() + (this->getHeight() / 2) + (effectiveSize / 2); // Dynamic centering using effective size
+            
+            // Removing title rendering per user request
+            //renderer->drawString(displayTitle.c_str(), false, this->getX() + 15, textY, 25, a(tsl::style::color::ColorText));
+            
+            // Draw Value with effective size
+            renderer->drawString(val.c_str(), false, this->getX() + 15, textY, effectiveSize, a(tsl::style::color::ColorText));
+
+            // Cursor logic
+            s32 prefixWidth = renderer->getTextDimensions(val.substr(0, pos).c_str(), false, effectiveSize).first;
+            s32 cursorX = this->getX() + 15 + prefixWidth;
+            renderer->drawRect(cursorX, this->getY() + 15, 2, effectiveSize + 15, a(tsl::style::color::ColorHighlight));
+        }
+
+        void changeFontSize(int delta) {
+            m_fontSize += delta;
+            if (m_fontSize < 10) m_fontSize = 10;
+            if (m_fontSize > 60) m_fontSize = 60;
+        }
+
+        virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
+            setBoundaries(parentX, parentY, parentWidth, parentHeight);
+        }
+
+        virtual inline tsl::elm::Element* requestFocus(tsl::elm::Element *oldFocus, tsl::FocusDirection direction) override {
+            return nullptr;
+        }
+
+    private:
+        tsl::KeyboardGui* m_gui;
+        std::string m_title;
+        std::string& m_value;
+        size_t& m_cursorPos;
+        int m_fontSize = 25; // Default font size
+    };
+}
+
+namespace tsl {
+
+    // --- KeyboardGui ---
+    KeyboardGui::KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, std::function<void(std::string)> onComplete)
+        : m_type(type), m_value(initialValue), m_title(title), m_onComplete(onComplete) {
+        m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE); 
+        m_cursorPos = m_value.length();
+        tsl::disableJumpTo = true;
+    }
+
+    KeyboardGui::~KeyboardGui() {
+        tsl::disableJumpTo = false;
+    }
+
+    elm::Element* KeyboardGui::createUI() {
+        auto* frame = new KeyboardFrame(m_title, ""); 
+        auto* list = new elm::List();
+        
+        auto* valItem = new ValueDisplay(this, "", m_value, m_cursorPos);
+        m_valueDisplay = valItem;
+        list->addItem(valItem);
+
+        auto keyPress = [this](char c) { this->handleKeyPress(c); };
+        
+        if (m_type == SEARCH_TYPE_NONE) {
+            auto* typeRow1 = new KeyboardRow();
+            typeRow1->addButton(new KeyboardButton("U8", [this]{ this->switchType(SEARCH_TYPE_UNSIGNED_8BIT); }));
+            typeRow1->addButton(new KeyboardButton("U16", [this]{ this->switchType(SEARCH_TYPE_UNSIGNED_16BIT); }));
+            typeRow1->addButton(new KeyboardButton("U32", [this]{ this->switchType(SEARCH_TYPE_UNSIGNED_32BIT); }));
+            typeRow1->addButton(new KeyboardButton("U64", [this]{ this->switchType(SEARCH_TYPE_UNSIGNED_64BIT); }));
+            list->addItem(typeRow1);
+        }
+
+        if (m_type == SEARCH_TYPE_HEX) {
+             auto* row1 = new KeyboardRow();
+             row1->addButton(new KeyboardButton('1', keyPress));
+             row1->addButton(new KeyboardButton('2', keyPress));
+             row1->addButton(new KeyboardButton('3', keyPress));
+             row1->addButton(new KeyboardButton('A', keyPress));
+             list->addItem(row1);
+
+             auto* row2 = new KeyboardRow();
+             row2->addButton(new KeyboardButton('4', keyPress));
+             row2->addButton(new KeyboardButton('5', keyPress));
+             row2->addButton(new KeyboardButton('6', keyPress));
+             row2->addButton(new KeyboardButton('B', keyPress));
+             list->addItem(row2);
+
+             auto* row3 = new KeyboardRow();
+             row3->addButton(new KeyboardButton('7', keyPress));
+             row3->addButton(new KeyboardButton('8', keyPress));
+             row3->addButton(new KeyboardButton('9', keyPress));
+             row3->addButton(new KeyboardButton('C', keyPress));
+             list->addItem(row3);
+
+             auto* row4 = new KeyboardRow();
+             row4->addButton(new KeyboardButton('0', keyPress));
+             row4->addButton(new KeyboardButton('F', keyPress));
+             row4->addButton(new KeyboardButton('E', keyPress));
+             row4->addButton(new KeyboardButton('D', keyPress));
+             list->addItem(row4);
+
+             auto* row5 = new KeyboardRow();
+             row5->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+             row5->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
+             list->addItem(row5);
+        } else if (m_isNumpad) {
+            auto* row1 = new KeyboardRow();
+            row1->addButton(new KeyboardButton('1', keyPress));
+            row1->addButton(new KeyboardButton('2', keyPress));
+            row1->addButton(new KeyboardButton('3', keyPress));
+            list->addItem(row1);
+
+            auto* row2 = new KeyboardRow();
+            row2->addButton(new KeyboardButton('4', keyPress));
+            row2->addButton(new KeyboardButton('5', keyPress));
+            row2->addButton(new KeyboardButton('6', keyPress));
+            list->addItem(row2);
+
+            auto* row3 = new KeyboardRow();
+            row3->addButton(new KeyboardButton('7', keyPress));
+            row3->addButton(new KeyboardButton('8', keyPress));
+            row3->addButton(new KeyboardButton('9', keyPress));
+            list->addItem(row3);
+
+            auto* row4 = new KeyboardRow();
+            row4->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+            row4->addButton(new KeyboardButton('0', keyPress));
+            row4->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
+            list->addItem(row4);
+        } else {
+             // HEX logic moved up
+             {
+                auto* row1 = new KeyboardRow();
+                for (char c : std::string("1234567890")) row1->addButton(new KeyboardButton(c, keyPress));
+                list->addItem(row1);
+
+                auto* row2 = new KeyboardRow();
+                for (char c : std::string("QWERTYUIOP")) row2->addButton(new KeyboardButton(c, keyPress));
+                list->addItem(row2);
+                
+                auto* row3 = new KeyboardRow();
+                for (char c : std::string("ASDFGHJKL")) row3->addButton(new KeyboardButton(c, keyPress));
+                list->addItem(row3);
+
+                auto* row4 = new KeyboardRow();
+                row4->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+                for (char c : std::string("ZXCVBNM")) row4->addButton(new KeyboardButton(c, keyPress));
+                row4->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
+                list->addItem(row4);
+             }
+        }
+
+        frame->setContent(list);
+        return frame;
+    }
+
+    void KeyboardGui::update() {}
+
+    bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState leftJoyStick, HidAnalogStickState rightJoyStick) {
+        if (keysDown & KEY_R) {
+            if (keysHeld & KEY_ZL) {
+                if (m_valueDisplay) static_cast<ValueDisplay*>(m_valueDisplay)->changeFontSize(2);
+                return true;
+            }
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_cursorPos < m_value.length()) m_cursorPos++;
+            return true;
+        }
+        if (keysDown & KEY_L) {
+             if (keysHeld & KEY_ZL) {
+                if (m_valueDisplay) static_cast<ValueDisplay*>(m_valueDisplay)->changeFontSize(-2);
+                return true;
+            }
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_cursorPos > 0) m_cursorPos--;
+            return true;
+        }
+        if (keysHeld & (KEY_L | KEY_R)) return true;
+
+        if (keysDown & KEY_B) {
+            handleBackspace();
+            return true;
+        }
+        if (keysDown & KEY_X) {
+            handleCancel();
+            return true;
+        }
+        if (keysDown & KEY_PLUS) {
+            handleConfirm();
+            return true;
+        }
+        if (keysDown & KEY_Y && !m_isNumpad) {
+            handleKeyPress(' ');
+            return true;
+        }
+        return false;
+    }
+
+    void KeyboardGui::handleKeyPress(char c) {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_value.insert(m_cursorPos, 1, c);
+        m_cursorPos++;
+    }
+
+    void KeyboardGui::handleBackspace() {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        if (m_cursorPos > 0) {
+            m_value.erase(m_cursorPos - 1, 1);
+            m_cursorPos--;
+        }
+    }
+
+    void KeyboardGui::handleConfirm() {
+        if (m_onComplete) {
+            m_onComplete(m_value);
+        } else {
+           tsl::goBack();
+        }
+    }
+
+    void KeyboardGui::handleCancel() {
+        tsl::goBack();
+    }
+
+    void KeyboardGui::switchType(searchType_t newType) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            m_type = newType;
+            m_isNumpad = (newType != SEARCH_TYPE_POINTER);
+        }
+        tsl::swapTo<KeyboardGui>(m_type, m_value, m_title, m_onComplete);
+    }
 }
