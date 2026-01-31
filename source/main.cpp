@@ -6961,6 +6961,209 @@ public:
         return glyphs;
     }
 } // namespace CheatUtils
+static const char *const condition_str[] = {"", " > ", " >= ", " < ", " <= ", " == ", " != "};
+static const char *const math_str[] = {" + ", " - ", " * ", " << ", " >> ", " & ", " | ", " NOT ", " XOR ", " None/Move ", " fadd ", " fsub ", " fmul ", " fdiv "};
+static const char *const heap_str[] = {"main", "heap", "alias", "aslr", "blank"};
+static const std::vector<u32> buttonCodes = {0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002, 0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800, 0x80001000, 0x80002000, 0x80004000, 0x80008000, 0x80100000, 0x80200000, 0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000};
+static const std::vector<std::string> buttonNames = {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""};
+
+std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
+    if (index >= opcodes.size()) return "";
+    u32 first_dword = opcodes[index++];
+    u32 type = (first_dword >> 28) & 0xF;
+    
+    if (type >= 0xC) type = (type << 4) | ((first_dword >> 24) & 0xF);
+    if (type >= 0xF0) type = (type << 4) | ((first_dword >> 20) & 0xF);
+
+    char buffer[256];
+    buffer[0] = 0;
+
+    auto GetNextDword = [&]() -> u32 {
+        return (index < opcodes.size()) ? opcodes[index++] : 0;
+    };
+
+    auto GetNextVmInt = [&](u32 bit_width) -> u64 {
+        u32 first = GetNextDword();
+        if (bit_width == 1) return (u8)first;
+        if (bit_width == 2) return (u16)first;
+        if (bit_width == 4) return first;
+        if (bit_width == 8) return (((u64)first) << 32) | (u64)GetNextDword();
+        return 0;
+    };
+
+    switch (type) {
+        case 0: // Store Static
+        {
+            u8 width = (first_dword >> 24) & 0xF;
+            u8 memType = (first_dword >> 20) & 0xF;
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            u32 second_dword = GetNextDword();
+            u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
+            u64 val = GetNextVmInt(width);
+            snprintf(buffer, sizeof(buffer), "[%sR%X+0x%010lX] = 0x%lX (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, width);
+            break;
+        }
+        case 1: // Begin Conditional Block
+        {
+            u8 width = (first_dword >> 24) & 0xF;
+            u8 memType = (first_dword >> 20) & 0xF;
+            u8 cond = (first_dword >> 16) & 0xF;
+            bool useOfs = (first_dword >> 12) & 0xF;
+            u8 ofsReg = (first_dword >> 8) & 0xF;
+            u32 second_dword = GetNextDword();
+            u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
+            u64 val = GetNextVmInt(width);
+            snprintf(buffer, sizeof(buffer), "If [%s%s0x%010lX] %s 0x%lX", 
+                heap_str[memType < 5 ? memType : 4], useOfs ? (std::string("R") + std::to_string(ofsReg) + "+").c_str() : "", addr, 
+                (cond < 7) ? condition_str[cond] : "?", val);
+            break;
+        }
+        case 2: // End Conditional Block
+        {
+            u8 endType = (first_dword >> 24) & 0xF;
+            snprintf(buffer, sizeof(buffer), endType ? "Else" : "Endif");
+            break;
+        }
+        case 3: // Control Loop
+        {
+            bool start = ((first_dword >> 24) & 0xF) == 0;
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            if (start) {
+                u32 iters = GetNextDword();
+                snprintf(buffer, sizeof(buffer), "Loop Start R%X = %d", regIdx, iters);
+            } else {
+                snprintf(buffer, sizeof(buffer), "Loop End");
+            }
+            break;
+        }
+        case 4: // Load Register Static
+        {
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
+            snprintf(buffer, sizeof(buffer), "R%X = 0x%016lX", regIdx, val);
+            break;
+        }
+        case 5: // Load Register Memory
+        {
+            u8 width = (first_dword >> 24) & 0xF;
+            u8 memType = (first_dword >> 20) & 0xF;
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            u8 loadFrom = (first_dword >> 12) & 0xF;
+            u8 offReg = (first_dword >> 8) & 0xF;
+            u32 second_dword = GetNextDword();
+            u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
+            if (loadFrom == 3) snprintf(buffer, sizeof(buffer), "R%X = [%sR%X+0x%010lX] (W=%d)", regIdx, heap_str[memType < 5 ? memType : 4], offReg, addr, width);
+            else if (loadFrom) snprintf(buffer, sizeof(buffer), "R%X = [R%X+0x%010lX] (W=%d)", regIdx, (loadFrom == 1 ? regIdx : offReg), addr, width);
+            else snprintf(buffer, sizeof(buffer), "R%X = [%s+0x%010lX] (W=%d)", regIdx, heap_str[memType < 5 ? memType : 4], addr, width);
+            break;
+        }
+        case 6: // Store Static to Address
+        {
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            bool inc = (first_dword >> 12) & 0xF;
+            bool useOffSet = (first_dword >> 8) & 0xF;
+            u8 offReg = (first_dword >> 4) & 0xF;
+            u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
+            snprintf(buffer, sizeof(buffer), "[R%X%s] = 0x%lX%s", regIdx, useOffSet ? (std::string("+R") + std::to_string(offReg)).c_str() : "", val, inc ? " (Inc)" : "");
+            break;
+        }
+        case 7: // Perform Arithmetic Static
+        {
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            u8 mathOp = (first_dword >> 12) & 0xF;
+            u32 val = GetNextDword();
+            snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%08X", regIdx, regIdx, (mathOp < 14) ? math_str[mathOp] : " ?", val);
+            break;
+        }
+        case 8: // Begin Keypress Conditional Block
+        {
+            u32 mask = first_dword & 0x0FFFFFFF;
+            std::string keys = "If keys(";
+            for (size_t i = 0; i < buttonCodes.size(); i++) if (mask & buttonCodes[i]) keys += buttonNames[i];
+            keys += ")";
+            snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
+            break;
+        }
+        case 9: // Perform Arithmetic Register
+        {
+            u8 width = (first_dword >> 24) & 0xF;
+            u8 mathOp = (first_dword >> 20) & 0xF;
+            u8 dstReg = (first_dword >> 16) & 0xF;
+            u8 srcReg1 = (first_dword >> 12) & 0xF;
+            bool hasImm = (first_dword >> 8) & 0xF;
+            if (hasImm) {
+                u64 val = GetNextVmInt(width);
+                snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%lX", dstReg, srcReg1, (mathOp < 14) ? math_str[mathOp] : " ?", val);
+            } else {
+                u8 srcReg2 = (first_dword >> 4) & 0xF;
+                snprintf(buffer, sizeof(buffer), "R%X = R%X%sR%X", dstReg, srcReg1, (mathOp < 14) ? math_str[mathOp] : " ?", srcReg2);
+            }
+            break;
+        }
+        case 0xA: // Store Register to Address
+        {
+            u8 srcReg = (first_dword >> 20) & 0xF;
+            u8 addrReg = (first_dword >> 16) & 0xF;
+            u8 offType = (first_dword >> 8) & 0xF;
+            u8 offReg = (first_dword >> 4) & 0xF;
+            if (offType == 0) snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+            else if (offType == 1) snprintf(buffer, sizeof(buffer), "[R%X+R%X] = R%X", addrReg, offReg, srcReg);
+            else if (offType == 2) {
+                u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+                snprintf(buffer, sizeof(buffer), "[R%X+0x%lX] = R%X", addrReg, addr, srcReg);
+            } else if (offType == 3) {
+                u8 mType = offReg;
+                snprintf(buffer, sizeof(buffer), "[%s+R%X] = R%X", (mType < 5 ? heap_str[mType] : ""), addrReg, srcReg);
+            } else if (offType >= 4) {
+                u8 mType = offReg;
+                u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+                if (offType == 4) snprintf(buffer, sizeof(buffer), "[%s+0x%lX] = R%X", (mType < 5 ? heap_str[mType] : ""), addr, srcReg);
+                else snprintf(buffer, sizeof(buffer), "[%s+R%X+0x%lX] = R%X", (mType < 5 ? heap_str[mType] : ""), addrReg, addr, srcReg);
+            }
+            break;
+        }
+        case 0xC0: // Begin Register Conditional Block
+        {
+            u8 width = (first_dword >> 24) & 0xF;
+            u8 cond = (first_dword >> 20) & 0xF;
+            u8 valReg = (first_dword >> 16) & 0xF;
+            u8 compType = (first_dword >> 12) & 0xF;
+            snprintf(buffer, sizeof(buffer), "If R%X %s ...", valReg, (cond < 7) ? condition_str[cond] : "?");
+            if (compType == 0 || compType == 1 || compType == 2 || compType == 3 || compType == 6) GetNextDword(); 
+            else if (compType == 4) GetNextVmInt(width);
+            break;
+        }
+        case 0xC1: // Save/Restore Register
+        case 0xC2: // Save/Restore Register Mask
+            snprintf(buffer, sizeof(buffer), "Save/Restore Regs");
+            break;
+        case 0xC3: // Read/Write Static Register
+        {
+            u8 staticIdx = (first_dword >> 20) & 0xF;
+            u8 regIdx = (first_dword >> 16) & 0xF;
+            snprintf(buffer, sizeof(buffer), "Static[%d] %s R%d", staticIdx, (first_dword & 1) ? "<-" : "->", regIdx);
+            break;
+        }
+        case 0xC4: // Begin Extended Keypress Conditional
+        {
+            u64 mask = (((u64)GetNextDword()) << 32) | GetNextDword();
+            std::string keys = "If keys(";
+            for (size_t i = 0; i < buttonCodes.size(); i++) if (mask & buttonCodes[i]) keys += buttonNames[i];
+            keys += ")";
+            snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
+            break;
+        }
+        case 0xFF0: snprintf(buffer, sizeof(buffer), "Pause Process"); break;
+        case 0xFF1: snprintf(buffer, sizeof(buffer), "Resume Process"); break;
+        case 0xFFF: snprintf(buffer, sizeof(buffer), "Debug Log"); break;
+        
+        default:
+            snprintf(buffer, sizeof(buffer), "Opcode Type %X", type);
+            break;
+    }
+
+    return buffer;
+}
 
 class CheatEditMenu : public tsl::Gui {
 private:
@@ -6991,78 +7194,37 @@ public:
         m_list->addItem(new tsl::elm::CategoryHeader("Hex Codes"));
 
         if (!m_cachedOpcodes.empty()) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "UI: %lu ops. Dirty: %d", m_cachedOpcodes.size(), m_dirty);
-            // tsl::notification->show(buf); 
-
-            for (u32 j = 0; j < m_cachedOpcodes.size(); j++) {
-                // Formatting logic adapted from SaveCheatsToDir
-                u32 op = m_cachedOpcodes[j];
-                u32 opcode = (op >> 28) & 0xF;
-                u8 T = 0;
-                
-                // Pre-decode check for special types
-                if ((opcode == 0xC)) {
-                     u32 subcode = (op >> 24) & 0xFF;
-                     if (subcode == 0xC0) opcode = 0xC0; 
-                }
-
-                 // Special handling for Type 9 (Arithmetic)
-                if ((opcode == 9) && (((op >> 8) & 0xF) == 0)) {
-                    snprintf(buf, sizeof(buf), "%08X", op);
-                    auto* item = new tsl::elm::ListItem(buf);
-                    item->setFontSize(m_fontSize);
-                    item->setUseWrapping(true);
-                    m_list->addItem(item);
-                    continue;
+            size_t i = 0;
+            while (i < m_cachedOpcodes.size()) {
+                size_t startIdx = i;
+                std::string note = GetOpcodeNote(m_cachedOpcodes, i);
+                size_t numDwords = i - startIdx;
+                if (numDwords == 0) { // Safety catch for unknown opcodes that don't advance index
+                    i++;
+                    numDwords = 1;
                 }
                 
-                // Decode lengths
                 std::string lineStr = "";
-                auto appendHex = [&](u32 val) {
-                    char tmp[16];
-                    snprintf(tmp, sizeof(tmp), "%08X ", val);
-                    lineStr += tmp;
-                };
-
-                // Opcode length logic
-                switch (opcode) {
-                    case 0: case 1: case 0xC06:
-                        appendHex(m_cachedOpcodes[j++]);
-                        if (j >= m_cachedOpcodes.size()) break;
-                        [[fallthrough]];
-                    case 9: case 0xC04:
-                        appendHex(m_cachedOpcodes[j++]);
-                        if (j >= m_cachedOpcodes.size()) break;
-                        [[fallthrough]];
-                    case 3: case 10:
-                        appendHex(m_cachedOpcodes[j]);
-                        if (T == 8 || (T == 0 && opcode == 3)) {
-                             j++;
-                             if (j < m_cachedOpcodes.size()) appendHex(m_cachedOpcodes[j]);
-                        }
-                        break;
-                    case 4: case 6: case 0xC4:
-                        appendHex(m_cachedOpcodes[j++]);
-                        if (j >= m_cachedOpcodes.size()) break;
-                        [[fallthrough]];
-                    case 5: case 7: case 0xC00: case 0xC02:
-                        appendHex(m_cachedOpcodes[j++]);
-                        if (j >= m_cachedOpcodes.size()) break;
-                        [[fallthrough]];
-                    case 2: case 8: case 0xC1: case 0xC2:
-                    default:
-                        appendHex(m_cachedOpcodes[j]);
-                        break;
+                for (size_t j = 0; j < numDwords; j++) {
+                    char hex[16];
+                    snprintf(hex, sizeof(hex), "%08X ", m_cachedOpcodes[startIdx + j]);
+                    lineStr += hex;
                 }
                 if (!lineStr.empty()) lineStr.pop_back();
+
                 auto* item = new tsl::elm::ListItem(lineStr);
                 item->setFontSize(m_fontSize);
                 item->setUseWrapping(true);
+
+                if (!note.empty()) {
+                    item->setNote(note);
+                    item->setAlwaysShowNote(true);
+                }
+
                 m_list->addItem(item);
             }
         } else {
-            m_list->addItem(new tsl::elm::ListItem("Error reading cheat"));
+            m_list->addItem(new tsl::elm::ListItem("No opcodes found"));
         }
         
         if (m_focusIndex != -1) {
