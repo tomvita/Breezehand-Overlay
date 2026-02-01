@@ -30,5 +30,6 @@ typedef enum {
     SEARCH_TYPE_POINTER,
     SEARCH_TYPE_UNSIGNED_40BIT,
     SEARCH_TYPE_HEX,
+    SEARCH_TYPE_TEXT,
     SEARCH_TYPE_NONE
 } searchType_t;

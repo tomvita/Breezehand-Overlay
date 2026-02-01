@@ -29,8 +29,9 @@
 
 #include <ultra.hpp>
 #include <tesla.hpp>
-#include "keyboard.hpp"
 #include "../common/search_types.hpp"
+#include "keyboard.hpp"
+
 #include <utils.hpp>
 #include <dmntcht.h>
 #include <set>
@@ -6981,23 +6982,14 @@ namespace {
         return result;
     }
 
-    std::string DisassembleARM64(u32 code) {
-        return air::DisassembleARM64(code);
+    std::string DisassembleARM64(u32 code, u64 address = 0) {
+        return air::DisassembleARM64(code, address);
     }
-
-    /*
-    // Manual ARM64 disassembly (commented out in favor of Capstone)
-    std::string DisassembleARM64_Old(u32 code) {
-        char buf[64];
-        ...
-        return "";
-    }
-    */
-
-    std::string FormatValueNote(u64 val, u32 width) {
+    
+    std::string FormatValueNote(u64 val, u32 width, u64 address = 0) {
         if (s_noteMinimalMode) {
             if (width == 4) {
-                std::string asmStr = DisassembleARM64((u32)val);
+                std::string asmStr = DisassembleARM64((u32)val, address);
                 return asmStr.empty() ? "" : " asm=" + asmStr;
             }
             return "";
@@ -7023,7 +7015,7 @@ namespace {
             result += buf;
             
             // ASM Disassembly check for 4-byte width (32-bit instruction)
-            std::string asmStr = DisassembleARM64((u32)val);
+            std::string asmStr = DisassembleARM64((u32)val, address);
             if (!asmStr.empty()) {
                 result += ", asm=" + asmStr;
             }
@@ -7071,9 +7063,9 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
             u64 val = GetNextVmInt(width);
             if (s_noteMinimalMode) {
-                snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr, DisassembleARM64((u32)val).c_str());
+                snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr, DisassembleARM64((u32)val, addr).c_str());
             } else {
-                snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX%s (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, FormatValueNote(val, width).c_str(), width);
+                snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX%s (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, FormatValueNote(val, width, addr).c_str(), width);
             }
             break;
         }
@@ -7088,11 +7080,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
             u64 val = GetNextVmInt(width);
             if (s_noteMinimalMode) {
-                snprintf(buffer, sizeof(buffer), "If [0x%010lX]%s", addr, FormatValueNote(val, width).c_str());
+                snprintf(buffer, sizeof(buffer), "If [0x%010lX]%s", addr, FormatValueNote(val, width, addr).c_str());
             } else {
                 snprintf(buffer, sizeof(buffer), "If [%s%s0x%010lX] %s 0x%lX%s", 
                     heap_str[memType < 5 ? memType : 4], useOfs ? (std::string("R") + std::to_string(ofsReg) + "+").c_str() : "", addr, 
-                    (cond < 7) ? condition_str[cond] : "?", val, FormatValueNote(val, width).c_str());
+                    (cond < 7) ? condition_str[cond] : "?", val, FormatValueNote(val, width, addr).c_str());
             }
             break;
         }
@@ -7296,6 +7288,24 @@ public:
         
         auto* nameItem = new tsl::elm::ListItem(m_cheatName);
         nameItem->setUseWrapping(true);
+        nameItem->setClickListener([this, nameItem](u64 keys) { 
+            if (keys & KEY_A) {
+                 tsl::changeTo<tsl::KeyboardGui>(SEARCH_TYPE_TEXT, m_cheatName, "Edit Name", 
+                    [this, nameItem](std::string newVal){
+                        // Update local state
+                        this->m_cheatName = newVal;
+                        this->m_dirty = true;
+                        
+                        // Update UI immediately
+                        nameItem->setText(newVal);
+
+                        // Explicitly navigate back since handleConfirm skipping it when callback exists
+                        tsl::goBack(); 
+                    });
+                return true;
+            }
+            return false;
+        });
         m_list->addItem(nameItem);
         
         // Hex Codes Header
@@ -7429,6 +7439,17 @@ public:
                     
                     u32 newId = 0;
                     dmntchtAddCheat(&def, m_enabled, &newId);
+
+                    // Trigger refresh of parent menu to show new name
+                    refreshPage.store(true, release);
+                    
+                    // Preserve focus on the renamed cheat
+                    extern std::string jumpItemName;
+                    extern std::atomic<bool> jumpItemExactMatch;
+                    
+                    jumpItemName = m_cheatName;
+                    jumpItemExactMatch.store(true, release);
+                    skipJumpReset.store(true, release);
                 }
             }
             tsl::goBack();
@@ -10482,9 +10503,37 @@ namespace tsl {
              row4->addButton(new KeyboardButton('0', keyPress));
              row4->addButton(new KeyboardButton('F', keyPress));
              row4->addButton(new KeyboardButton('E', keyPress));
-             row4->addButton(new KeyboardButton('D', keyPress));
+             auto* row5 = new KeyboardRow();
+             row5->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+             row5->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
+             row5->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
+             list->addItem(row5);
+        } else if (m_type == SEARCH_TYPE_TEXT) {
+             // Row 1: Numbers
+             auto* row1 = new KeyboardRow();
+             for (char c = '1'; c <= '9'; c++) row1->addButton(new KeyboardButton(c, keyPress));
+             row1->addButton(new KeyboardButton('0', keyPress));
+             list->addItem(row1);
+
+             // Row 2: QWERTYUIOP
+             auto* row2 = new KeyboardRow();
+             const std::string r2 = "QWERTYUIOP";
+             for (char c : r2) row2->addButton(new KeyboardButton(c, keyPress));
+             list->addItem(row2);
+
+             // Row 3: ASDFGHJKL
+             auto* row3 = new KeyboardRow();
+             const std::string r3 = "ASDFGHJKL";
+             for (char c : r3) row3->addButton(new KeyboardButton(c, keyPress));
+             list->addItem(row3);
+
+             // Row 4: ZXCVBNM
+             auto* row4 = new KeyboardRow();
+             const std::string r4 = "ZXCVBNM";
+             for (char c : r4) row4->addButton(new KeyboardButton(c, keyPress));
              list->addItem(row4);
 
+             // Row 5: Action Keys
              auto* row5 = new KeyboardRow();
              row5->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
              row5->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
@@ -10591,6 +10640,11 @@ namespace tsl {
             return true;
         }
         if (keysDown & KEY_Y) {
+            if (m_type == SEARCH_TYPE_TEXT) {
+                handleKeyPress(' ');
+                return true;
+            }
+
             s_noteMinimalMode = !s_noteMinimalMode;
             if (m_onNoteUpdate && m_frame) {
                 m_frame->setSubtitle(m_onNoteUpdate(m_value));
@@ -10624,7 +10678,7 @@ namespace tsl {
         if (m_onComplete) {
             m_onComplete(m_value);
         } else {
-           tsl::goBack();
+            tsl::goBack();
         }
     }
 
