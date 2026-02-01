@@ -7000,7 +7000,7 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u32 second_dword = GetNextDword();
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
             u64 val = GetNextVmInt(width);
-            snprintf(buffer, sizeof(buffer), "[%sR%X+0x%010lX] = 0x%lX (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, width);
+            snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, width);
             break;
         }
         case 1: // Begin Conditional Block
@@ -7173,6 +7173,11 @@ private:
     int m_fontSize;
     tsl::elm::List* m_list;
     std::vector<u32> m_cachedOpcodes;
+        class ListProxy : public tsl::elm::List {
+    public:
+        using tsl::elm::List::m_items;
+    };
+
     bool m_dirty;
     int m_focusIndex;
 
@@ -7229,6 +7234,38 @@ public:
         
         if (m_focusIndex != -1) {
             m_list->setFocusedIndex(m_focusIndex);
+        }
+    }
+
+    virtual void update() override {
+        if (this->m_dirty && this->m_list != nullptr) {
+            auto *list = static_cast<ListProxy*>(this->m_list);
+            for (auto *element : list->m_items) {
+                if (element != nullptr && element->isItem() && !element->isTable()) {
+                    auto *item = static_cast<tsl::elm::ListItem*>(element);
+                    std::string text = item->getText();
+                    if (!text.empty()) {
+                        std::vector<u32> dwords;
+                        std::string hex;
+                        for (char c : text) {
+                            if (isxdigit(c)) hex += c;
+                            else if (!hex.empty()) {
+                                dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+                                hex.clear();
+                            }
+                        }
+                        if (!hex.empty()) dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+
+                        if (!dwords.empty()) {
+                            size_t idx = 0;
+                            std::string note = GetOpcodeNote(dwords, idx);
+                            if (item->getNote() != note) {
+                                item->setNote(note);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
