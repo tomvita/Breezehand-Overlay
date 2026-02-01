@@ -6968,7 +6968,19 @@ static const char *const heap_str[] = {"main", "heap", "alias", "aslr", "blank"}
 static const std::vector<u32> buttonCodes = {0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002, 0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800, 0x80001000, 0x80002000, 0x80004000, 0x80008000, 0x80100000, 0x80200000, 0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000};
 static const std::vector<std::string> buttonNames = {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""};
 
+static bool s_noteMinimalMode = false;
+
 namespace {
+    std::string WrapNote(const std::string& note, size_t limit = 60) {
+        if (note.length() <= limit) return note;
+        std::string result = "";
+        for (size_t i = 0; i < note.length(); i += limit) {
+            if (i > 0) result += "\n";
+            result += note.substr(i, limit);
+        }
+        return result;
+    }
+
     std::string DisassembleARM64(u32 code) {
         return air::DisassembleARM64(code);
     }
@@ -6983,6 +6995,14 @@ namespace {
     */
 
     std::string FormatValueNote(u64 val, u32 width) {
+        if (s_noteMinimalMode) {
+            if (width == 4) {
+                std::string asmStr = DisassembleARM64((u32)val);
+                return asmStr.empty() ? "" : " asm=" + asmStr;
+            }
+            return "";
+        }
+
         char buf[128];
         std::string result = " (";
         
@@ -7050,7 +7070,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u32 second_dword = GetNextDword();
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
             u64 val = GetNextVmInt(width);
-            snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX%s (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, FormatValueNote(val, width).c_str(), width);
+            if (s_noteMinimalMode) {
+                snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr, DisassembleARM64((u32)val).c_str());
+            } else {
+                snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX%s (W=%d)", (memType < 5) ? heap_str[memType] : "", regIdx, addr, val, FormatValueNote(val, width).c_str(), width);
+            }
             break;
         }
         case 1: // Begin Conditional Block
@@ -7063,9 +7087,13 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u32 second_dword = GetNextDword();
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
             u64 val = GetNextVmInt(width);
-            snprintf(buffer, sizeof(buffer), "If [%s%s0x%010lX] %s 0x%lX%s", 
-                heap_str[memType < 5 ? memType : 4], useOfs ? (std::string("R") + std::to_string(ofsReg) + "+").c_str() : "", addr, 
-                (cond < 7) ? condition_str[cond] : "?", val, FormatValueNote(val, width).c_str());
+            if (s_noteMinimalMode) {
+                snprintf(buffer, sizeof(buffer), "If [0x%010lX]%s", addr, FormatValueNote(val, width).c_str());
+            } else {
+                snprintf(buffer, sizeof(buffer), "If [%s%s0x%010lX] %s 0x%lX%s", 
+                    heap_str[memType < 5 ? memType : 4], useOfs ? (std::string("R") + std::to_string(ofsReg) + "+").c_str() : "", addr, 
+                    (cond < 7) ? condition_str[cond] : "?", val, FormatValueNote(val, width).c_str());
+            }
             break;
         }
         case 2: // End Conditional Block
@@ -7102,7 +7130,9 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u8 offReg = (first_dword >> 8) & 0xF;
             u32 second_dword = GetNextDword();
             u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
-            if (loadFrom == 3) snprintf(buffer, sizeof(buffer), "R%X = [%sR%X+0x%010lX] (W=%d)", regIdx, heap_str[memType < 5 ? memType : 4], offReg, addr, width);
+            if (s_noteMinimalMode) {
+                snprintf(buffer, sizeof(buffer), "R%X = [0x%010lX]%s", regIdx, addr, (width == 4) ? FormatValueNote(0, 0).c_str() : ""); // Placeholder for ASM if applicable
+            } else if (loadFrom == 3) snprintf(buffer, sizeof(buffer), "R%X = [%sR%X+0x%010lX] (W=%d)", regIdx, heap_str[memType < 5 ? memType : 4], offReg, addr, width);
             else if (loadFrom) snprintf(buffer, sizeof(buffer), "R%X = [R%X+0x%010lX] (W=%d)", regIdx, (loadFrom == 1 ? regIdx : offReg), addr, width);
             else snprintf(buffer, sizeof(buffer), "R%X = [%s+0x%010lX] (W=%d)", regIdx, heap_str[memType < 5 ? memType : 4], addr, width);
             break;
@@ -7114,7 +7144,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             bool useOffSet = (first_dword >> 8) & 0xF;
             u8 offReg = (first_dword >> 4) & 0xF;
             u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
-            snprintf(buffer, sizeof(buffer), "[R%X%s] = 0x%lX%s%s", regIdx, useOffSet ? (std::string("+R") + std::to_string(offReg)).c_str() : "", val, inc ? " (Inc)" : "", FormatValueNote(val, 8).c_str());
+            if (s_noteMinimalMode) {
+                snprintf(buffer, sizeof(buffer), "[R%X] = 0x%lX%s", regIdx, val, FormatValueNote(val, 8).c_str());
+            } else {
+                snprintf(buffer, sizeof(buffer), "[R%X%s] = 0x%lX%s%s", regIdx, useOffSet ? (std::string("+R") + std::to_string(offReg)).c_str() : "", val, inc ? " (Inc)" : "", FormatValueNote(val, 8).c_str());
+            }
             break;
         }
         case 7: // Perform Arithmetic Static
@@ -7122,7 +7156,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u8 regIdx = (first_dword >> 16) & 0xF;
             u8 mathOp = (first_dword >> 12) & 0xF;
             u32 val = GetNextDword();
-            snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%08X%s", regIdx, regIdx, (mathOp < 14) ? math_str[mathOp] : " ?", val, FormatValueNote(val, 4).c_str());
+            if (s_noteMinimalMode) {
+                snprintf(buffer, sizeof(buffer), "R%X = R%X...%s", regIdx, regIdx, FormatValueNote(val, 4).c_str());
+            } else {
+                snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%08X%s", regIdx, regIdx, (mathOp < 14) ? math_str[mathOp] : " ?", val, FormatValueNote(val, 4).c_str());
+            }
             break;
         }
         case 8: // Begin Keypress Conditional Block
@@ -7143,7 +7181,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             bool hasImm = (first_dword >> 8) & 0xF;
             if (hasImm) {
                 u64 val = GetNextVmInt(width);
-                snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%lX%s", dstReg, srcReg1, (mathOp < 14) ? math_str[mathOp] : " ?", val, FormatValueNote(val, width).c_str());
+                if (s_noteMinimalMode) {
+                    snprintf(buffer, sizeof(buffer), "R%X = R%X...%s", dstReg, srcReg1, FormatValueNote(val, width).c_str());
+                } else {
+                    snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%lX%s", dstReg, srcReg1, (mathOp < 14) ? math_str[mathOp] : " ?", val, FormatValueNote(val, width).c_str());
+                }
             } else {
                 u8 srcReg2 = (first_dword >> 4) & 0xF;
                 snprintf(buffer, sizeof(buffer), "R%X = R%X%sR%X", dstReg, srcReg1, (mathOp < 14) ? math_str[mathOp] : " ?", srcReg2);
@@ -7156,7 +7198,15 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             u8 addrReg = (first_dword >> 16) & 0xF;
             u8 offType = (first_dword >> 8) & 0xF;
             u8 offReg = (first_dword >> 4) & 0xF;
-            if (offType == 0) snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+            if (s_noteMinimalMode) {
+                if (offType == 0) snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+                else if (offType == 1) snprintf(buffer, sizeof(buffer), "[R%X+R%X] = R%X", addrReg, offReg, srcReg);
+                else if (offType == 3) snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+                else {
+                    u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+                    snprintf(buffer, sizeof(buffer), "[0x%lX] = R%X", addr, srcReg);
+                }
+            } else if (offType == 0) snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
             else if (offType == 1) snprintf(buffer, sizeof(buffer), "[R%X+R%X] = R%X", addrReg, offReg, srcReg);
             else if (offType == 2) {
                 u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
@@ -7182,7 +7232,11 @@ std::string GetOpcodeNote(const std::vector<u32>& opcodes, size_t& index) {
             if (compType == 0 || compType == 1 || compType == 2 || compType == 3 || compType == 6) GetNextDword(); 
             else if (compType == 4) {
                 u64 val = GetNextVmInt(width);
-                snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), " 0x%lX%s", val, FormatValueNote(val, width).c_str());
+                if (s_noteMinimalMode) {
+                    snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), "...%s", FormatValueNote(val, width).c_str());
+                } else {
+                    snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), " 0x%lX%s", val, FormatValueNote(val, width).c_str());
+                }
             }
             break;
         }
@@ -7226,10 +7280,6 @@ private:
     int m_fontSize;
     tsl::elm::List* m_list;
     std::vector<u32> m_cachedOpcodes;
-        class ListProxy : public tsl::elm::List {
-    public:
-        using tsl::elm::List::m_items;
-    };
 
     bool m_dirty;
     int m_focusIndex;
@@ -7292,12 +7342,13 @@ public:
 
     virtual void update() override {
         if (this->m_dirty && this->m_list != nullptr) {
-            auto *list = static_cast<ListProxy*>(this->m_list);
-            for (auto *element : list->m_items) {
+            auto& items = this->m_list->getItems();
+            for (size_t i = 3; i < items.size(); i++) {
+                auto *element = items[i];
                 if (element != nullptr && element->isItem() && !element->isTable()) {
                     auto *item = static_cast<tsl::elm::ListItem*>(element);
                     std::string text = item->getText();
-                    if (!text.empty()) {
+                    if (!text.empty() && text != "No opcodes found") {
                         std::vector<u32> dwords;
                         std::string hex;
                         for (char c : text) {
@@ -7345,21 +7396,17 @@ public:
     virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState joyStickPosLeft, HidAnalogStickState joyStickPosRight) override {
         if (keysDown & KEY_B) {
             if (m_dirty) {
-                // Access protected accessors via proxy
-                struct ListProxy : public tsl::elm::List {
-                    using tsl::elm::List::m_items;
-                };
-                auto* proxy = static_cast<ListProxy*>(m_list);
+                const auto& items = m_list->getItems();
                 
                 std::vector<u32> finalOps;
                 finalOps.reserve(0x100);
                 
                 // Index 3+: Hex items (skip headers and name)
-                for (size_t i = 3; i < proxy->m_items.size(); i++) {
+                for (size_t i = 3; i < items.size(); i++) {
                     struct ListItemProxy : public tsl::elm::ListItem {
                         using tsl::elm::ListItem::m_text;
                     };
-                    auto* listItem = static_cast<ListItemProxy*>(proxy->m_items[i]);
+                    auto* listItem = static_cast<ListItemProxy*>(items[i]);
                     std::string line = listItem->m_text;
                     
                     std::stringstream ss(line);
@@ -7385,6 +7432,48 @@ public:
                 }
             }
             tsl::goBack();
+            return true;
+        }
+
+        if (keysDown & KEY_Y) {
+            s_noteMinimalMode = !s_noteMinimalMode;
+            
+            // In-place update of notes without destroying list items
+            const auto& items = m_list->getItems();
+            
+            // Re-evaluate notes for all hex items (skip header/name at indices 0-2)
+            for (size_t i = 3; i < items.size(); i++) {
+                auto* element = items[i];
+                if (element && element->isItem() && !element->isTable()) {
+                    auto* item = static_cast<tsl::elm::ListItem*>(element);
+                    std::string text = item->getText();
+                    if (!text.empty() && text != "No opcodes found") {
+                         // Parse hex from text to get opcodes
+                        std::vector<u32> dwords;
+                        std::string hex;
+                        for (char c : text) {
+                            if (isxdigit(c)) hex += c;
+                            else if (!hex.empty()) {
+                                dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+                                hex.clear();
+                            }
+                        }
+                        if (!hex.empty()) dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+
+                        if (!dwords.empty()) {
+                            size_t idx = 0;
+                            // Regenerate note with new mode
+                            std::string note = GetOpcodeNote(dwords, idx);
+                            item->setNote(note); // This handles item height recalc
+                        }
+                    }
+                }
+            }
+            
+            // Force container layout update
+            m_list->recalculateLayout();
+            
+            this->m_dirty = true;
             return true;
         }
 
@@ -7436,7 +7525,7 @@ public:
                                 
                                 if (!dwords.empty()) {
                                     size_t idx = 0;
-                                    return GetOpcodeNote(dwords, idx);
+                                    return WrapNote(GetOpcodeNote(dwords, idx));
                                 }
                                 return "";
                             }
@@ -10083,11 +10172,66 @@ namespace {
         virtual void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
             setBoundaries(parentX, parentY, parentWidth, parentHeight);
             
+            // We do the heavy lifting in draw() to support dynamic content resizing based on subtitle height,
+            // but we set initial bounds here to avoid null rects.
             if (m_contentElement != nullptr) {
-                // Reduced padding: Left 25, Right 25 -> Width - 50 total padding
                 m_contentElement->setBoundaries(parentX + 25, parentY + 115, parentWidth - 50, parentHeight - 73 - 110);
                 m_contentElement->layout(parentX + 25, parentY + 115, parentWidth - 50, parentHeight - 73 - 110);
                 m_contentElement->invalidate();
+            }
+        }
+
+        virtual void draw(tsl::gfx::Renderer* renderer) override {
+            // 1. Temporarily clear content and subtitle so base draw doesn't render them
+            tsl::elm::Element* content = m_contentElement;
+            std::string sub = m_subtitle;
+            m_contentElement = nullptr;
+            m_subtitle = "";
+
+            // 2. Call base draw (background, title, buttons)
+            tsl::elm::OverlayFrame::draw(renderer);
+
+            // 3. Restore
+            m_contentElement = content;
+            m_subtitle = sub;
+
+            // 4. Draw Custom Wrapped Subtitle
+            s32 startY = this->getY() + 75;
+            s32 effectiveHeight = 0;
+            
+            if (!m_subtitle.empty()) {
+                // Manually draw subtitle with wrapping.
+                // Note: WrapNote logic is already applied in m_subtitle (contains \n) if passed from KeyboardGui
+                // But Renderer::drawString ignores \n usually. We need to split manually.
+                
+                std::stringstream ss(m_subtitle);
+                std::string line;
+                int yOffset = 0;
+                while (std::getline(ss, line, '\n')) {
+                    renderer->drawString(line.c_str(), false, this->getX() + 20, startY + yOffset, 20, tsl::style::color::ColorText);
+                    yOffset += 24; 
+                }
+                effectiveHeight = yOffset;
+            }
+
+            // 5. Draw Content with dynamic adjustment
+            if (m_contentElement != nullptr) {
+                // Adjust Y based on subtitle height. Base reserved space was ~something.
+                // We want content to start below subtitle.
+                s32 contentY = startY + effectiveHeight + 10;
+                // Clamp contentY to minimum 115 to match original look if no subtitle
+                if (contentY < this->getY() + 115) contentY = this->getY() + 115;
+
+                s32 availableHeight = (this->getY() + this->getHeight() - 73) - contentY;
+                
+                // Only re-layout if boundaries changed significantly (to avoid spamming layout)
+                if (m_contentElement->getY() != contentY || m_contentElement->getHeight() != availableHeight) {
+                    m_contentElement->setBoundaries(this->getX() + 25, contentY, this->getWidth() - 50, availableHeight);
+                    m_contentElement->layout(this->getX() + 25, contentY, this->getWidth() - 50, availableHeight);
+                    //m_contentElement->invalidate(); // Avoid full invalidate in draw
+                }
+                
+                m_contentElement->frame(renderer);
             }
         }
     };
@@ -10447,7 +10591,10 @@ namespace tsl {
             return true;
         }
         if (keysDown & KEY_Y) {
-            handleKeyPress(' ');
+            s_noteMinimalMode = !s_noteMinimalMode;
+            if (m_onNoteUpdate && m_frame) {
+                m_frame->setSubtitle(m_onNoteUpdate(m_value));
+            }
             return true;
         }
         return false;
