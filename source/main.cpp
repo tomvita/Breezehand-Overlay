@@ -10367,6 +10367,18 @@ namespace tsl {
             if (m_cursorPos > 0) m_cursorPos--;
             return true;
         }
+        if (keysDown & KEY_ZR) {
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            m_cursorPos += 9;
+            if (m_cursorPos > m_value.length()) m_cursorPos = m_value.length();
+            return true;
+        }
+        if (keysDown & KEY_ZL) {
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_cursorPos >= 9) m_cursorPos -= 9;
+            else m_cursorPos = 0;
+            return true;
+        }
         if (keysHeld & (KEY_L | KEY_R)) return true;
 
         if (keysDown & KEY_B) {
