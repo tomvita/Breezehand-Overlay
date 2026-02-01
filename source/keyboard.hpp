@@ -11,7 +11,9 @@ namespace tsl {
 
     class KeyboardGui : public Gui {
     public:
-        KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, std::function<void(std::string)> onComplete);
+        KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, 
+                    std::function<void(std::string)> onComplete,
+                    std::function<std::string(std::string)> onNoteUpdate = nullptr);
         virtual ~KeyboardGui();
 
         // Gui overrides
@@ -26,9 +28,11 @@ namespace tsl {
         std::string m_value;
         std::string m_title;
         std::function<void(std::string)> m_onComplete;
+        std::function<std::string(std::string)> m_onNoteUpdate;
         size_t m_cursorPos = 0;
         bool m_isNumpad;
         elm::Element* m_valueDisplay = nullptr;
+        elm::OverlayFrame* m_frame = nullptr;
         std::recursive_mutex m_mutex;
         
         void handleKeyPress(char c);

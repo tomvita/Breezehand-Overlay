@@ -7368,6 +7368,24 @@ public:
                                     }
                                 }
                                 tsl::goBack();
+                            },
+                            [](std::string currentVal) -> std::string {
+                                std::vector<u32> dwords;
+                                std::string hex;
+                                for (char c : currentVal) {
+                                    if (isxdigit(c)) hex += c;
+                                    else if (!hex.empty()) {
+                                        dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+                                        hex.clear();
+                                    }
+                                }
+                                if (!hex.empty()) dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
+                                
+                                if (!dwords.empty()) {
+                                    size_t idx = 0;
+                                    return GetOpcodeNote(dwords, idx);
+                                }
+                                return "";
                             }
                         );
                         return true;
@@ -10206,8 +10224,10 @@ namespace {
 namespace tsl {
 
     // --- KeyboardGui ---
-    KeyboardGui::KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, std::function<void(std::string)> onComplete)
-        : m_type(type), m_value(initialValue), m_title(title), m_onComplete(onComplete) {
+    KeyboardGui::KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, 
+                             std::function<void(std::string)> onComplete,
+                             std::function<std::string(std::string)> onNoteUpdate)
+        : m_type(type), m_value(initialValue), m_title(title), m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate) {
         m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE); 
         m_cursorPos = m_value.length();
         tsl::disableJumpTo = true;
@@ -10218,7 +10238,10 @@ namespace tsl {
     }
 
     elm::Element* KeyboardGui::createUI() {
-        auto* frame = new KeyboardFrame(m_title, ""); 
+        std::string initialNote = "";
+        if (m_onNoteUpdate) initialNote = m_onNoteUpdate(m_value);
+        auto* frame = new KeyboardFrame(m_title, initialNote); 
+        m_frame = frame;
         auto* list = new elm::List();
         
         auto* valItem = new ValueDisplay(this, "", m_value, m_cursorPos);
@@ -10267,6 +10290,7 @@ namespace tsl {
 
              auto* row5 = new KeyboardRow();
              row5->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+             row5->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
              row5->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
              list->addItem(row5);
         } else if (m_isNumpad) {
@@ -10291,6 +10315,7 @@ namespace tsl {
             auto* row4 = new KeyboardRow();
             row4->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
             row4->addButton(new KeyboardButton('0', keyPress));
+            row4->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
             row4->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
             list->addItem(row4);
         } else {
@@ -10311,6 +10336,7 @@ namespace tsl {
                 auto* row4 = new KeyboardRow();
                 row4->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
                 for (char c : std::string("ZXCVBNM")) row4->addButton(new KeyboardButton(c, keyPress));
+                row4->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
                 row4->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
                 list->addItem(row4);
              }
@@ -10355,7 +10381,7 @@ namespace tsl {
             handleConfirm();
             return true;
         }
-        if (keysDown & KEY_Y && !m_isNumpad) {
+        if (keysDown & KEY_Y) {
             handleKeyPress(' ');
             return true;
         }
@@ -10366,6 +10392,9 @@ namespace tsl {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         m_value.insert(m_cursorPos, 1, c);
         m_cursorPos++;
+        if (m_onNoteUpdate && m_frame) {
+            m_frame->setSubtitle(m_onNoteUpdate(m_value));
+        }
     }
 
     void KeyboardGui::handleBackspace() {
@@ -10373,6 +10402,9 @@ namespace tsl {
         if (m_cursorPos > 0) {
             m_value.erase(m_cursorPos - 1, 1);
             m_cursorPos--;
+            if (m_onNoteUpdate && m_frame) {
+                m_frame->setSubtitle(m_onNoteUpdate(m_value));
+            }
         }
     }
 
