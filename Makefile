@@ -57,11 +57,11 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:= Breezehand
 APP_AUTHOR	:= tomvita
-APP_VERSION	:= 0.5.3
+APP_VERSION	:= 0.6.0
 TARGET		:= breezehand
 BUILD		:= build
-SOURCES		:= source common
-INCLUDES	:= source common include
+SOURCES		:= source common ../capstone ../capstone/arch/AArch64
+INCLUDES	:= source common include ../capstone/include/capstone ../capstone/include/
 NO_ICON		:= 1
 
 # This location should reflect where you place the libultrahand directory (lib can vary between projects).
@@ -78,7 +78,7 @@ CFLAGS := -g -Wall -Os -ffunction-sections -fdata-sections -flto \
           -fno-strict-aliasing -frename-registers -falign-functions=16 \
           $(ARCH) $(DEFINES)
 
-CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2
+CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2 -DCAPSTONE_HAS_ARM64
 
 
 #---------------------------------------------------------------------------------
