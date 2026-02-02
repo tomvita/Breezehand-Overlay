@@ -7777,7 +7777,77 @@ public:
     void createCheatsMenu(tsl::elm::List* list) {
         inOverlaysPage.store(true, std::memory_order_release);
         inPackagesPage.store(false, std::memory_order_release);
-    
+
+        // Display game info at the top
+        if (!hideUserGuide && dropdownSection.empty()) {
+            DmntCheatProcessMetadata metadata;
+            if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                this->cheatList = list;
+
+                if (m_notesPath.empty()) {
+                    std::stringstream ss;
+                    ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+                    m_notesPath = ss.str();
+                }
+
+                if (!m_notesLoaded && !m_notesPath.empty()) {
+                    std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+                    if (!fontSizeStr.empty()) {
+                        m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+                    }
+                    std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+                    if (!showNotesStr.empty()) {
+                        ult::showCheatNotes = (showNotesStr == "true");
+                    }
+                    m_notesLoaded = true;
+                }
+
+                CheatUtils::EnsureMetadata();
+                std::string tidStr = CheatUtils::GetTitleIdString();
+                std::string bidStr = CheatUtils::GetBuildIdString();
+
+                std::string titleStr = "";
+                std::string versionStr = "";
+                static NsApplicationControlData appControlData;
+                size_t appControlDataSize = 0;
+                NacpLanguageEntry* languageEntry = nullptr;
+                if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData, sizeof(NsApplicationControlData), &appControlDataSize))) {
+                    if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp, &languageEntry)) && languageEntry) {
+                        titleStr = languageEntry->name;
+                    }
+                    versionStr = appControlData.nacp.display_version;
+                }
+
+                if (titleStr.empty()) {
+                    titleStr = tidStr;
+                    std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
+                    if (ult::isFile(titleFilePath)) {
+                        std::ifstream tfile(titleFilePath);
+                        if (std::getline(tfile, titleStr)) ult::trim(titleStr);
+                    }
+                }
+
+                // Add "Current Game" category header
+                auto* categoryHeader = new tsl::elm::CategoryHeader("Current Game");
+                list->addItem(categoryHeader);
+
+                auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+                titleItem->setUseWrapping(true);
+                titleItem->setFontSize(m_cheatFontSize);
+                list->addItem(titleItem);
+
+                auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+                tidItem->setUseWrapping(true);
+                tidItem->setFontSize(m_cheatFontSize);
+                list->addItem(tidItem);
+
+                auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+                bidItem->setUseWrapping(true);
+                bidItem->setFontSize(m_cheatFontSize);
+                list->addItem(bidItem);
+            }
+        }
+        
         addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " + ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " + ult::SETTINGS);
         
         bool hasCheatProcess = false;
@@ -8417,74 +8487,74 @@ public:
         
         if (!inHiddenMode.load(std::memory_order_acquire)) {
             // Display game info at the top
-            if (!hideUserGuide && dropdownSection.empty()) {
-                DmntCheatProcessMetadata metadata;
-                if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
-                    this->cheatList = list;
+            // if (!hideUserGuide && dropdownSection.empty()) {
+            //     DmntCheatProcessMetadata metadata;
+            //     if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+            //         this->cheatList = list;
                     
-                    if (m_notesPath.empty()) {
-                        std::stringstream ss;
-                        ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
-                        m_notesPath = ss.str();
-                    }
+            //         if (m_notesPath.empty()) {
+            //             std::stringstream ss;
+            //             ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+            //             m_notesPath = ss.str();
+            //         }
 
-                    if (!m_notesLoaded && !m_notesPath.empty()) {
-                        std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
-                        if (!fontSizeStr.empty()) {
-                            m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
-                        }
-                        std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
-                        if (!showNotesStr.empty()) {
-                            ult::showCheatNotes = (showNotesStr == "true");
-                        }
-                        m_notesLoaded = true;
-                    }
+            //         if (!m_notesLoaded && !m_notesPath.empty()) {
+            //             std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "font_size");
+            //             if (!fontSizeStr.empty()) {
+            //                 m_cheatFontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+            //             }
+            //             std::string showNotesStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+            //             if (!showNotesStr.empty()) {
+            //                 ult::showCheatNotes = (showNotesStr == "true");
+            //             }
+            //             m_notesLoaded = true;
+            //         }
 
-                    CheatUtils::EnsureMetadata();
-                    std::string tidStr = CheatUtils::GetTitleIdString();
-                    std::string bidStr = CheatUtils::GetBuildIdString();
+            //         CheatUtils::EnsureMetadata();
+            //         std::string tidStr = CheatUtils::GetTitleIdString();
+            //         std::string bidStr = CheatUtils::GetBuildIdString();
                     
-                    std::string titleStr = "";
-                    std::string versionStr = "";
-                    static NsApplicationControlData appControlData;
-                    size_t appControlDataSize = 0;
-                    NacpLanguageEntry *languageEntry = nullptr;
-                    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData, sizeof(NsApplicationControlData), &appControlDataSize))) {
-                        if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp, &languageEntry)) && languageEntry) {
-                            titleStr = languageEntry->name;
-                        }
-                        versionStr = appControlData.nacp.display_version;
-                    }
+            //         std::string titleStr = "";
+            //         std::string versionStr = "";
+            //         static NsApplicationControlData appControlData;
+            //         size_t appControlDataSize = 0;
+            //         NacpLanguageEntry *languageEntry = nullptr;
+            //         if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData, sizeof(NsApplicationControlData), &appControlDataSize))) {
+            //             if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp, &languageEntry)) && languageEntry) {
+            //                 titleStr = languageEntry->name;
+            //             }
+            //             versionStr = appControlData.nacp.display_version;
+            //         }
 
-                    if (titleStr.empty()) {
-                        titleStr = tidStr;
-                        std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
-                        if (ult::isFile(titleFilePath)) {
-                            std::ifstream tfile(titleFilePath);
-                            if (std::getline(tfile, titleStr)) ult::trim(titleStr);
-                        }
-                    }
+            //         if (titleStr.empty()) {
+            //             titleStr = tidStr;
+            //             std::string titleFilePath = "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
+            //             if (ult::isFile(titleFilePath)) {
+            //                 std::ifstream tfile(titleFilePath);
+            //                 if (std::getline(tfile, titleStr)) ult::trim(titleStr);
+            //             }
+            //         }
                     
-                    // Add "Current Game" category header
-                    auto* categoryHeader = new tsl::elm::CategoryHeader("Current Game");
-                    list->addItem(categoryHeader);
+            //         // Add "Current Game" category header
+            //         auto* categoryHeader = new tsl::elm::CategoryHeader("Current Game");
+            //         list->addItem(categoryHeader);
                     
-                    auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
-                    titleItem->setUseWrapping(true);
-                    titleItem->setFontSize(m_cheatFontSize);
-                    list->addItem(titleItem);
+            //         auto* titleItem = new tsl::elm::ListItem(titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+            //         titleItem->setUseWrapping(true);
+            //         titleItem->setFontSize(m_cheatFontSize);
+            //         list->addItem(titleItem);
 
-                    auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
-                    tidItem->setUseWrapping(true);
-                    tidItem->setFontSize(m_cheatFontSize);
-                    list->addItem(tidItem);
+            //         auto* tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+            //         tidItem->setUseWrapping(true);
+            //         tidItem->setFontSize(m_cheatFontSize);
+            //         list->addItem(tidItem);
 
-                    auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
-                    bidItem->setUseWrapping(true);
-                    bidItem->setFontSize(m_cheatFontSize);
-                    list->addItem(bidItem);
-                }
-            }
+            //         auto* bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+            //         bidItem->setUseWrapping(true);
+            //         bidItem->setFontSize(m_cheatFontSize);
+            //         list->addItem(bidItem);
+            //     }
+            // }
             
             std::string pageLeftName, pageRightName, pathPattern, pathPatternOn, pathPatternOff;
             bool usingPages = false;
