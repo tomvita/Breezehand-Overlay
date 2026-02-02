@@ -10301,6 +10301,20 @@ namespace {
             return false;
         }
 
+        virtual bool onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY, s32 prevX, s32 prevY, s32 initialX, s32 initialY) override {
+            if (event == tsl::elm::TouchEvent::Touch) {
+                if (inBounds(currX, currY)) return true;
+            }
+            if (event == tsl::elm::TouchEvent::Release) {
+                if (inBounds(currX, currY) && inBounds(initialX, initialY)) {
+                    this->triggerClickAnimation();
+                    this->onClick(KEY_A);
+                    return true;
+                }
+            }
+            return false;
+        }
+
     private:
         char m_char;
         std::string m_label;
@@ -10355,6 +10369,7 @@ namespace {
             if (oldFocus && (direction == tsl::FocusDirection::Left || direction == tsl::FocusDirection::Right)) {
                 for (size_t i = 0; i < m_buttons.size(); ++i) {
                     if (m_buttons[i] == oldFocus) {
+                        m_lastFocusedIndex = i;
                         if (direction == tsl::FocusDirection::Left) {
                             if (i > 0) return m_buttons[i-1]->requestFocus(oldFocus, direction);
                         } else {
@@ -10366,10 +10381,29 @@ namespace {
             }
             
             if (direction == tsl::FocusDirection::Left) return m_buttons.back()->requestFocus(oldFocus, direction);
+            if (direction == tsl::FocusDirection::Right) return m_buttons.front()->requestFocus(oldFocus, direction);
+
+            // Default focus (None or from vertical/other)
+            if (m_lastFocusedIndex < m_buttons.size()) {
+                return m_buttons[m_lastFocusedIndex]->requestFocus(oldFocus, direction);
+            }
             return m_buttons.front()->requestFocus(oldFocus, direction);
         }
 
+        virtual bool onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY, s32 prevX, s32 prevY, s32 initialX, s32 initialY) override {
+            for (size_t i = 0; i < m_buttons.size(); ++i) {
+                if (m_buttons[i]->onTouch(event, currX, currY, prevX, prevY, initialX, initialY)) {
+                    if (event == tsl::elm::TouchEvent::Touch || event == tsl::elm::TouchEvent::Release) {
+                        m_lastFocusedIndex = i;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
     private:
+        size_t m_lastFocusedIndex = 0;
         std::vector<KeyboardButton*> m_buttons;
     };
 
@@ -10501,12 +10535,15 @@ namespace tsl {
 
              auto* row4 = new KeyboardRow();
              row4->addButton(new KeyboardButton('0', keyPress));
-             row4->addButton(new KeyboardButton('F', keyPress));
+             row4->addButton(new KeyboardButton('D', keyPress));
              row4->addButton(new KeyboardButton('E', keyPress));
+             row4->addButton(new KeyboardButton('F', keyPress));
+             list->addItem(row4);
+             
              auto* row5 = new KeyboardRow();
-             row5->addButton(new KeyboardButton("BS", [this]{ this->handleBackspace(); }));
+             row5->addButton(new KeyboardButton("BS(B)", [this]{ this->handleBackspace(); }));
              row5->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
-             row5->addButton(new KeyboardButton("OK", [this]{ this->handleConfirm(); }));
+             row5->addButton(new KeyboardButton("OK(+)", [this]{ this->handleConfirm(); }));
              list->addItem(row5);
         } else if (m_type == SEARCH_TYPE_TEXT) {
              // Row 1: Numbers
