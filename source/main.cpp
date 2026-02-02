@@ -108,6 +108,7 @@ static std::vector<u32> g_cheatFolderIndexStack; // Indices of folder starts in 
 static std::vector<std::string> g_cheatFolderNameStack;
 
 static int g_cheatDownloadIndex = 0;
+static int g_cheatFontSize = 17;
 
 static std::string ReplaceAll(std::string str, const std::string& from, const std::string& to) {
     if(from.empty()) return str;
@@ -7272,13 +7273,29 @@ private:
     int m_fontSize;
     tsl::elm::List* m_list;
     std::vector<u32> m_cachedOpcodes;
+    std::string m_notesPath;
 
     bool m_dirty;
     int m_focusIndex;
 
 public:
     CheatEditMenu(u32 cheatId, const std::string& name, bool enabled, const std::vector<u32>& opcodes = {}, int focusIndex = -1, bool dirty = false) 
-        : m_cheatId(cheatId), m_cheatName(name), m_enabled(enabled), m_fontSize(18), m_list(nullptr), m_cachedOpcodes(opcodes), m_dirty(dirty), m_focusIndex(focusIndex) {}
+        : m_cheatId(cheatId), m_cheatName(name), m_enabled(enabled), m_fontSize(g_cheatFontSize), m_list(nullptr), m_cachedOpcodes(opcodes), m_dirty(dirty), m_focusIndex(focusIndex) {
+            
+            DmntCheatProcessMetadata metadata;
+            if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
+                std::stringstream ss;
+                ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16) << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+                m_notesPath = ss.str();
+            }
+
+            if (!m_notesPath.empty()) {
+                std::string fontSizeStr = ult::parseValueFromIniSection(m_notesPath, "Breeze", "editor_font_size");
+                if (!fontSizeStr.empty()) {
+                    m_fontSize = std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+                }
+            }
+        }
 
     void refreshList() {
         m_list->clear();
@@ -7568,6 +7585,12 @@ public:
             if (keysDown & KEY_L) {
                 m_fontSize = std::max(m_fontSize - 1, 10);
                 changed = true;
+            }
+
+            if (changed) {
+                if (!m_notesPath.empty()) {
+                    setIniFileValue(m_notesPath, "Breeze", "editor_font_size", std::to_string(m_fontSize));
+                }
             }
 
             if (changed && m_list) {
