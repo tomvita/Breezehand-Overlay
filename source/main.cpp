@@ -10540,7 +10540,24 @@ namespace {
             // Cursor logic
             s32 prefixWidth = renderer->getTextDimensions(val.substr(0, pos).c_str(), false, effectiveSize).first;
             s32 cursorX = this->getX() + 15 + prefixWidth;
-            renderer->drawRect(cursorX, this->getY() + 15, 2, effectiveSize + 15, a(tsl::style::color::ColorHighlight));
+            
+            if (m_gui->isOvertypeMode()) {
+                 // Underline Cursor for Overtype (User request: lighten/underline to see text)
+                 s32 charWidth = 12; // Fallback default
+                 if (pos < val.length()) {
+                    charWidth = renderer->getTextDimensions(val.substr(pos, 1).c_str(), false, effectiveSize).first;
+                 }
+                 // Draw underline below the text position
+                 // textY is centered baseline-ish. Let's position underline just below it.
+                 s32 underlineY = textY + (effectiveSize / 2) + 2; 
+                 // Ensure it doesn't go out of bounds of the element
+                 if (underlineY > this->getY() + this->getHeight() - 5) underlineY = this->getY() + this->getHeight() - 5;
+                 
+                 renderer->drawRect(cursorX, underlineY, charWidth, 3, a(tsl::style::color::ColorHighlight));
+            } else {
+                 // Line Cursor for Insert
+                 renderer->drawRect(cursorX, this->getY() + 15, 2, effectiveSize + 15, a(tsl::style::color::ColorHighlight));
+            }
         }
 
         void changeFontSize(int delta) {
@@ -10636,6 +10653,14 @@ namespace tsl {
              auto* row5 = new KeyboardRow();
              row5->addButton(new KeyboardButton("BS(B)", [this]{ this->handleBackspace(); }));
              row5->addButton(new KeyboardButton("SPACE", [this]{ this->handleKeyPress(' '); }));
+             
+             // Toggle Insert/Overtype
+             row5->addButton(new KeyboardButton("INS", [this]{ 
+                 this->toggleManualOvertype(); 
+                 // Force redraw
+                 if (m_valueDisplay) m_valueDisplay->invalidate();
+             }));
+
              row5->addButton(new KeyboardButton("OK(+)", [this]{ this->handleConfirm(); }));
              list->addItem(row5);
         } else if (m_type == SEARCH_TYPE_TEXT) {
@@ -10786,8 +10811,16 @@ namespace tsl {
 
     void KeyboardGui::handleKeyPress(char c) {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        m_value.insert(m_cursorPos, 1, c);
-        m_cursorPos++;
+        
+        // Overtype mode check
+        if (isOvertypeMode() && m_cursorPos < m_value.length()) {
+             m_value[m_cursorPos] = c;
+             m_cursorPos++;
+        } else {
+             m_value.insert(m_cursorPos, 1, c);
+             m_cursorPos++;
+        }
+
         if (m_onNoteUpdate && m_frame) {
             m_frame->setSubtitle(m_onNoteUpdate(m_value));
         }
@@ -10795,6 +10828,10 @@ namespace tsl {
 
     void KeyboardGui::handleBackspace() {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        
+        // Disable backspace in Overtype Mode
+        if (isOvertypeMode()) return;
+
         if (m_cursorPos > 0) {
             m_value.erase(m_cursorPos - 1, 1);
             m_cursorPos--;
@@ -10823,5 +10860,10 @@ namespace tsl {
             m_isNumpad = (newType != SEARCH_TYPE_POINTER);
         }
         tsl::swapTo<KeyboardGui>(m_type, m_value, m_title, m_onComplete);
+    }
+
+    // Implement helper
+    bool KeyboardGui::isOvertypeMode() const { 
+        return (m_type == SEARCH_TYPE_HEX && m_cursorPos < 8) || m_manualOvertype; 
     }
 }
