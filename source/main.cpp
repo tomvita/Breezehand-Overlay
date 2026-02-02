@@ -7563,7 +7563,7 @@ public:
                                 
                                 if (!dwords.empty()) {
                                     size_t idx = 0;
-                                    return WrapNote(GetOpcodeNote(dwords, idx));
+                                    return WrapNote(GetOpcodeNote(dwords, idx), 45);
                                 }
                                 return "";
                             }
@@ -10322,8 +10322,8 @@ namespace {
                 std::string line;
                 int yOffset = 0;
                 while (std::getline(ss, line, '\n')) {
-                    renderer->drawString(line.c_str(), false, this->getX() + 20, startY + yOffset, 20, tsl::style::color::ColorText);
-                    yOffset += 24; 
+                    renderer->drawString(line.c_str(), false, this->getX() + 20, startY + yOffset, 16, tsl::style::color::ColorText);
+                    yOffset += 20; 
                 }
                 effectiveHeight = yOffset;
             }
