@@ -100,6 +100,10 @@ CFLAGS += -DUSING_LOGGING_DIRECTIVE=$(USING_LOGGING_DIRECTIVE)
 USING_FPS_INDICATOR_DIRECTIVE := 0
 CFLAGS += -DUSING_FPS_INDICATOR_DIRECTIVE=$(USING_FPS_INDICATOR_DIRECTIVE)
 
+ifeq ($(strip $(TARGET)),editcheat)
+    CFLAGS += -DEDITCHEAT_OVL
+endif
+
 # Enable fstream (ideally for other overlays want full fstream instead of FILE*)
 #USING_FSTREAM_DIRECTIVE := 0
 #CFLAGS += -DUSING_FSTREAM_DIRECTIVE=$(USING_FSTREAM_DIRECTIVE)
@@ -247,11 +251,29 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all release full
+.PHONY: $(BUILD) clean all release full breezehand editcheat
 
 #---------------------------------------------------------------------------------
-all: $(BUILD)
+all: breezehand editcheat
 
+
+breezehand: $(BUILD)
+
+editcheat:
+	@mkdir -p build_editcheat
+	@rm -f editcheat.nacp
+	@$(MAKE) --no-print-directory -C build_editcheat -f $(CURDIR)/Makefile \
+		TARGET=editcheat \
+		BUILD=build_editcheat \
+		APP_TITLE="Edit Cheat" \
+		APP_VERSION="1.0.0" \
+		APP_JSON= \
+		OUTPUT=editcheat \
+		DEPSDIR=$(CURDIR)/build_editcheat \
+		NROFLAGS= \
+		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
+	@mkdir -p out/switch/.overlays/
+	@cp build_editcheat/editcheat.ovl out/switch/.overlays/editcheat.ovl
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
@@ -267,6 +289,7 @@ $(BUILD):
 #---------------------------------------------------------------------------------
 clean:
 	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+	@rm -fr build_editcheat editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf
 
 	@rm -rf out/
 	@rm -f $(TARGET).zip
