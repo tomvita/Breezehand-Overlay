@@ -8752,7 +8752,7 @@ public:
       setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME,
                       "to_packages", FALSE_STR);
       toPackages = false;
-      currentMenu = PACKAGES_STR;
+      currentMenu = OVERLAYS_STR;//hack it, something keep setting to_packages to true
     }
 
     menuMode = !hiddenMenuMode.empty() ? hiddenMenuMode : currentMenu;
