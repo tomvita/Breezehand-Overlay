@@ -8454,10 +8454,16 @@ public:
         }
       }
 #ifdef EDITCHEAT_OVL
-      if (g_cheatIdToEdit != 0) {
-        tsl::setNextOverlay("sdmc:/switch/.overlays/breezehand.ovl");
-      }
-      tsl::Overlay::get()->close();
+      std::string path = "sdmc:/switch/.overlays/breezehand.ovl";
+      std::string args = "--cheat_id " + std::to_string(g_cheatIdToEdit);
+
+      std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
+      ult::requestedOverlayPath = path;
+      ult::requestedOverlayArgs = args;
+      ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
+                           ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR,
+                           ult::TRUE_STR);
+      ult::overlayLaunchRequested.store(true, std::memory_order_release);
 #else
       tsl::goBack();
 #endif
@@ -10804,22 +10810,20 @@ public:
     dmntchtInitialize();
     nsInitialize();
 
+    // Set settingsInitialized so background event loop can process overlay
+    // launch requests
+    ult::settingsInitialized.store(true, std::memory_order_release);
+
     // Clear the flag so Breezehand doesn't think it's still in an overlay loop
     // if we crash
-    ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
-                         ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR,
-                         ult::FALSE_STR);
+    // ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
+    //                      ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR,
+    //                      ult::FALSE_STR);
   }
 
   virtual void exitServices() override {
     dmntchtExit();
     nsExit();
-
-    // Chain back to Breezehand if we were launched with arguments (Breezehand
-    // launched us)
-    if (g_cheatIdToEdit != 0) {
-      tsl::setNextOverlay("sdmc:/switch/.overlays/breezehand.ovl");
-    }
 
     closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
 
