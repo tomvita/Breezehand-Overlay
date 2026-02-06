@@ -115,6 +115,7 @@ static int g_cheatFontSize = 17;
 u32 g_cheatIdToEdit = 0;
 std::string g_cheatNameToEdit = "";
 bool g_cheatEnabledToEdit = false;
+std::string g_focusCheatName = ""; // For focus restoration
 #endif
 
 static std::string ReplaceAll(std::string str, const std::string &from,
@@ -8455,7 +8456,10 @@ public:
       }
 #ifdef EDITCHEAT_OVL
       std::string path = "sdmc:/switch/.overlays/breezehand.ovl";
-      std::string args = "--cheat_id " + std::to_string(g_cheatIdToEdit);
+      std::string args = "";
+      if (!g_focusCheatName.empty()) {
+        args = "--focus_cheat_name \"" + g_focusCheatName + "\"";
+      }
 
       std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
       ult::requestedOverlayPath = path;
@@ -8670,9 +8674,16 @@ public:
       if (skipJumpReset.exchange(false, std::memory_order_acq_rel)) {
         return;
       }
+
       jumpItemName = std::move(returnJumpItemName);
       jumpItemValue = std::move(returnJumpItemValue);
-      jumpItemExactMatch.store(false, release);
+      
+      // If jumpItemName is set (from focus restoration), use exact match
+      if (!jumpItemName.empty()) {
+        jumpItemExactMatch.store(true, release);
+      } else {
+        jumpItemExactMatch.store(false, release);
+      }
     }
     settingsInitialized.store(true, release);
   }
@@ -8772,6 +8783,7 @@ public:
     }
     auto *rootFrame = new tsl::elm::OverlayFrame(
         frameTitle, versionLabel, noClickableItems, menuMode, "", "", "");
+
 
     list->jumpToItem(jumpItemName, jumpItemValue,
                      jumpItemExactMatch.load(acquire));
@@ -9116,7 +9128,7 @@ public:
                 item->setNote(noteIt->second);
             }
 
-            item->setClickListener([cheat](u64 keys) {
+            item->setClickListener([cheat, displayName](u64 keys) {
               if (keys & KEY_X) {
                 tsl::changeTo<CheatMenu>(cheat.cheat_id,
                                          cheat.definition.readable_name);
@@ -9129,7 +9141,8 @@ public:
                 std::string args =
                     "--cheat_id " + std::to_string(cheat.cheat_id) +
                     " --cheat_name " + cheat.definition.readable_name +
-                    " --enabled " + std::to_string(cheat.enabled);
+                    " --enabled " + std::to_string(cheat.enabled) +
+                    " --focus_cheat_name \"" + displayName + "\"";
 
                 std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
                 ult::requestedOverlayPath = path;
@@ -9183,6 +9196,8 @@ public:
 
       list->addItem(new tsl::elm::ListItem("No cheats found"));
     }
+
+
   }
 
   /* LEGACY OVERLAY CODE - DISABLED
@@ -11638,6 +11653,12 @@ int main(int argc, char *argv[]) {
       g_cheatNameToEdit = argv[++arg];
     } else if (strcmp(argv[arg], "--enabled") == 0 && arg + 1 < argc) {
       g_cheatEnabledToEdit = std::stoi(argv[++arg]) != 0;
+    } else if (strcmp(argv[arg], "--focus_cheat_name") == 0 && arg + 1 < argc) {
+      g_focusCheatName = argv[++arg];
+    }
+#else
+    else if (strcmp(argv[arg], "--focus_cheat_name") == 0 && arg + 1 < argc) {
+      returnJumpItemName = argv[++arg];
     }
 #endif
   }
