@@ -1747,15 +1747,21 @@ void addHelpInfo(tsl::elm::List* list) {
     std::vector<std::string> sectionLines = {
         SETTINGS_MENU,
         SCRIPT_OVERLAY,
+        EDIT_CHEAT,
         SETTINGS,
-        NOTES
+        NOTES,
+        FONT_SIZE_INCREASE,
+        FONT_SIZE_DECREASE,
     };
 
     std::vector<std::string> infoLines = {
-        "\uE0B5 (" + ON_MAIN_MENU + ")",
-        "\uE0B6 (" + ON_A_COMMAND + ")",
-        "\uE0E2 (" + ON_OVERLAY + ")",
-        "\uE0E3 (" + ON_OVERLAY + ")"
+        "\uE0B5 ( " + ON_MAIN_MENU + " )",
+        "\uE0B6 ( " + ON_A_COMMAND + " )",
+        "\uE0B6 ( " + ON_MAIN_MENU + " )",
+        "\uE0E2 ( " + ON_MAIN_MENU + " )",
+        "\uE0E3 ( " + ON_MAIN_MENU + " )",
+        "\uE0E6\uE0B5 ( " + ON_MAIN_MENU + " )",
+        "\uE0E6\uE0B6 ( " + ON_MAIN_MENU + " )"
     };
 
     std::vector<std::vector<std::string>> dummyTableData;

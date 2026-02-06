@@ -92,5 +92,12 @@
     "C_Cpp.default.includePath": [
         "include"
     ],
-    "C_Cpp.errorSquiggles": "Disabled"
+    "C_Cpp.errorSquiggles": "Disabled",
+    
+    // Auto-formatting settings
+    "editor.formatOnSave": false,
+    "editor.formatOnPaste": false,
+    "C_Cpp.formatting": "clangFormat",
+    "C_Cpp.clang_format_style": "file",
+    "C_Cpp.clang_format_fallbackStyle": "LLVM"
 }
