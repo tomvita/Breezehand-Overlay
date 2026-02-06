@@ -8851,25 +8851,97 @@ public:
           }
         }
 
-        // Add "Current Game" category header
-        auto *categoryHeader = new tsl::elm::CategoryHeader("Current Game");
-        list->addItem(categoryHeader);
+        
+        // Create CustomDrawer for game info with text wrapping (includes header)
+        std::string fullTitle = titleStr + (versionStr.empty() ? "" : " v" + versionStr);
+        std::string tidLine = "TID: " + tidStr;
+        std::string bidLine = "BID: " + bidStr;
+        
+        const s32 fontSize = 20;
+        const s32 lineHeight = 24;
+        const s32 maxWidth = tsl::cfg::FramebufferWidth - 50;
+        
+        auto *gameInfoDrawer = new tsl::elm::CustomDrawer([fullTitle, tidLine, bidLine, fontSize, lineHeight, maxWidth](tsl::gfx::Renderer* r, s32 x, s32 y, s32 w, s32 h) {
+            s32 currentY = y + lineHeight;  // Top padding
+            
+            // Draw "Current Game" header
+            // r->drawString("Current Game", false, x + 10, currentY, fontSize, tsl::style::color::ColorText);
+            // currentY += lineHeight;
+            
+            // Helper lambda to wrap and draw text
+            auto drawWrappedText = [&](const std::string& text, s32& yPos) {
+                std::string currentLine;
+                std::string word;
+                
+                for (size_t i = 0; i <= text.length(); ++i) {
+                    if (i == text.length() || text[i] == ' ') {
+                        // End of word or string
+                        if (!word.empty()) {
+                            std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
+                            auto dims = r->getTextDimensions(testLine, false, fontSize);
+                            
+                            if (dims.first <= maxWidth - 40) {
+                                currentLine = testLine;
+                            } else {
+                                // Line would be too long, draw current line and start new one
+                                if (!currentLine.empty()) {
+                                    r->drawString(currentLine, false, x + 10, yPos, fontSize, tsl::style::color::ColorText);
+                                    yPos += lineHeight;
+                                    currentLine = word;
+                                } else {
+                                    // Single word is too long, draw it anyway
+                                    r->drawString(word, false, x + 10, yPos, fontSize, tsl::style::color::ColorText);
+                                    yPos += lineHeight;
+                                    currentLine = "";
+                                }
+                            }
+                            word = "";
+                        }
+                    } else {
+                        word += text[i];
+                    }
+                }
+                
+                // Draw remaining text
+                if (!currentLine.empty()) {
+                    r->drawString(currentLine, false, x + 10, yPos, fontSize, tsl::style::color::ColorText);
+                    yPos += lineHeight;
+                }
+            };
+            
+            // Draw title (with wrapping)
+            drawWrappedText(fullTitle, currentY);
+            
+            // Draw TID
+            r->drawString(tidLine, false, x + 10, currentY, fontSize, tsl::style::color::ColorText);
+            currentY += lineHeight;
+            
+            // Draw BID
+            r->drawString(bidLine, false, x + 10, currentY, fontSize, tsl::style::color::ColorText);
+            currentY += lineHeight;
+            
 
-        auto *titleItem = new tsl::elm::ListItem(
-            titleStr + (versionStr.empty() ? "" : " v" + versionStr));
-        titleItem->setUseWrapping(true);
-        titleItem->setFontSize(m_cheatFontSize);
-        list->addItem(titleItem);
+        });
+        
+        // Use generous fixed height (accommodates up to 3-line wrapped titles)
+        gameInfoDrawer->setBoundaries(0, 0, tsl::cfg::FramebufferWidth, lineHeight*4);
+        list->addItem(gameInfoDrawer);
 
-        auto *tidItem = new tsl::elm::ListItem("TID: " + tidStr);
-        tidItem->setUseWrapping(true);
-        tidItem->setFontSize(m_cheatFontSize);
-        list->addItem(tidItem);
+        // auto *titleItem = new tsl::elm::ListItem(
+        //     titleStr + (versionStr.empty() ? "" : " v" + versionStr));
+        // titleItem->setUseWrapping(true);
+        // titleItem->setFontSize(m_cheatFontSize);
+        // list->addItem(titleItem);
 
-        auto *bidItem = new tsl::elm::ListItem("BID: " + bidStr);
-        bidItem->setUseWrapping(true);
-        bidItem->setFontSize(m_cheatFontSize);
-        list->addItem(bidItem);
+        // auto *tidItem = new tsl::elm::ListItem("TID: " + tidStr);
+        // tidItem->setUseWrapping(true);
+        // tidItem->setFontSize(m_cheatFontSize);
+        // list->addItem(tidItem);
+
+        // auto *bidItem = new tsl::elm::ListItem("BID: " + bidStr);
+        // bidItem->setUseWrapping(true);
+        // bidItem->setFontSize(m_cheatFontSize);
+        // list->addItem(bidItem);
       }
     }
 
