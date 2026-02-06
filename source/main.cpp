@@ -116,6 +116,8 @@ u32 g_cheatIdToEdit = 0;
 std::string g_cheatNameToEdit = "";
 bool g_cheatEnabledToEdit = false;
 std::string g_focusCheatName = ""; // For focus restoration
+std::vector<u32> g_focusFolderIndices; // Folder indices for focus restoration
+std::vector<std::string> g_focusFolderNames; // Folder names for focus restoration
 #endif
 
 static std::string ReplaceAll(std::string str, const std::string &from,
@@ -8459,6 +8461,18 @@ public:
       std::string args = "";
       if (!g_focusCheatName.empty()) {
         args = "--focus_cheat_name \"" + g_focusCheatName + "\"";
+        
+        // Pass folder stack (both indices and names)
+        if (!g_focusFolderIndices.empty()) {
+          args += " --folder_indices";
+          for (u32 idx : g_focusFolderIndices) {
+            args += " " + std::to_string(idx);
+          }
+          args += " --folder_names";
+          for (const auto& name : g_focusFolderNames) {
+            args += " \"" + name + "\"";
+          }
+        }
       }
 
       std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
@@ -9141,8 +9155,22 @@ public:
                 std::string args =
                     "--cheat_id " + std::to_string(cheat.cheat_id) +
                     " --cheat_name " + cheat.definition.readable_name +
-                    " --enabled " + std::to_string(cheat.enabled) +
-                    " --focus_cheat_name \"" + displayName + "\"";
+                    " --enabled " + std::to_string(cheat.enabled);
+                
+                // Pass focus info and folder stack for restoration
+                args += " --focus_cheat_name \"" + displayName + "\"";
+                
+                // Pass folder stack (both indices and names)
+                if (!g_cheatFolderIndexStack.empty()) {
+                  args += " --folder_indices";
+                  for (u32 idx : g_cheatFolderIndexStack) {
+                    args += " " + std::to_string(idx);
+                  }
+                  args += " --folder_names";
+                  for (const auto& name : g_cheatFolderNameStack) {
+                    args += " \"" + name + "\"";
+                  }
+                }
 
                 std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
                 ult::requestedOverlayPath = path;
@@ -11655,10 +11683,28 @@ int main(int argc, char *argv[]) {
       g_cheatEnabledToEdit = std::stoi(argv[++arg]) != 0;
     } else if (strcmp(argv[arg], "--focus_cheat_name") == 0 && arg + 1 < argc) {
       g_focusCheatName = argv[++arg];
+    } else if (strcmp(argv[arg], "--folder_indices") == 0) {
+      while (arg + 1 < argc && argv[arg + 1][0] != '-') {
+        g_focusFolderIndices.push_back(std::stoul(argv[++arg]));
+      }
+    } else if (strcmp(argv[arg], "--folder_names") == 0) {
+      while (arg + 1 < argc && argv[arg + 1][0] != '-') {
+        g_focusFolderNames.push_back(argv[++arg]);
+      }
     }
 #else
     else if (strcmp(argv[arg], "--focus_cheat_name") == 0 && arg + 1 < argc) {
       returnJumpItemName = argv[++arg];
+    } else if (strcmp(argv[arg], "--folder_indices") == 0) {
+      g_cheatFolderIndexStack.clear();
+      while (arg + 1 < argc && argv[arg + 1][0] != '-') {
+        g_cheatFolderIndexStack.push_back(std::stoul(argv[++arg]));
+      }
+    } else if (strcmp(argv[arg], "--folder_names") == 0) {
+      g_cheatFolderNameStack.clear();
+      while (arg + 1 < argc && argv[arg + 1][0] != '-') {
+        g_cheatFolderNameStack.push_back(argv[++arg]);
+      }
     }
 #endif
   }
