@@ -7830,8 +7830,9 @@ static const char *const condition_str[] = {"",     " > ",  " >= ", " < ",
 static const char *const math_str[] = {
     " + ",   " - ",   " * ",         " << ",   " >> ",   " & ",    " | ",
     " NOT ", " XOR ", " None/Move ", " fadd ", " fsub ", " fmul ", " fdiv "};
-static const char *const heap_str[] = {"main", "heap", "alias", "aslr",
-                                       "blank"};
+static const char *const heap_str[] = {"main+", "heap+", "alias+", "aslr+",
+                                       "blank+","?","?","?","?","?","?","?",
+                                       "?","?","?","?"};
 static const std::vector<u32> buttonCodes = {
     0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002,
     0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800,
@@ -7953,7 +7954,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
       snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr,
                DisassembleARM64((u32)val, addr).c_str());
     } else {
-      snprintf(buffer, sizeof(buffer), "[%s+R%d+0x%010lX] = 0x%lX%s (W=%d)",
+      snprintf(buffer, sizeof(buffer), "[%sR%d+0x%010lX] = 0x%lX%s (W=%d)",
                (memType < 5) ? heap_str[memType] : "", regIdx, addr, val,
                FormatValueNote(val, width, addr).c_str(), width);
     }
@@ -8019,17 +8020,17 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u32 second_dword = GetNextDword();
     u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
     if (s_noteMinimalMode) {
-      snprintf(buffer, sizeof(buffer), "R%X = [0x%010lX]%s", regIdx, addr,
+      snprintf(buffer, sizeof(buffer), "R%d = [0x%010lX]%s", regIdx, addr,
                (width == 4) ? FormatValueNote(0, 0).c_str()
                             : ""); // Placeholder for ASM if applicable
     } else if (loadFrom == 3)
-      snprintf(buffer, sizeof(buffer), "R%X = [%sR%X+0x%010lX] (W=%d)", regIdx,
+      snprintf(buffer, sizeof(buffer), "R%d = [%sR%d+0x%010lX] (W=%d)", regIdx,
                heap_str[memType < 5 ? memType : 4], offReg, addr, width);
     else if (loadFrom)
-      snprintf(buffer, sizeof(buffer), "R%X = [R%X+0x%010lX] (W=%d)", regIdx,
+      snprintf(buffer, sizeof(buffer), "R%d = [R%d+0x%010lX] (W=%d)", regIdx,
                (loadFrom == 1 ? regIdx : offReg), addr, width);
     else
-      snprintf(buffer, sizeof(buffer), "R%X = [%s+0x%010lX] (W=%d)", regIdx,
+      snprintf(buffer, sizeof(buffer), "R%d = [%s0x%010lX] (W=%d)", regIdx,
                heap_str[memType < 5 ? memType : 4], addr, width);
     break;
   }
@@ -8061,7 +8062,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                FormatValueNote(val, 4).c_str());
     } else {
       snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%08X%s", regIdx, regIdx,
-               (mathOp < 14) ? math_str[mathOp] : " ?", val,
+               (mathOp < 5) ? math_str[mathOp] : " ?", val,
                FormatValueNote(val, 4).c_str());
     }
     break;
@@ -8087,84 +8088,128 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     if (hasImm) {
       u64 val = GetNextVmInt(width);
       if (s_noteMinimalMode) {
-        snprintf(buffer, sizeof(buffer), "R%X = R%X...%s", dstReg, srcReg1,
+        snprintf(buffer, sizeof(buffer), "R%d = R%d...%s", dstReg, srcReg1,
                  FormatValueNote(val, width).c_str());
       } else {
-        snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%lX%s", dstReg, srcReg1,
+        snprintf(buffer, sizeof(buffer), "R%d = R%d%s0x%lX%s", dstReg, srcReg1,
                  (mathOp < 14) ? math_str[mathOp] : " ?", val,
                  FormatValueNote(val, width).c_str());
       }
     } else {
       u8 srcReg2 = (first_dword >> 4) & 0xF;
-      snprintf(buffer, sizeof(buffer), "R%X = R%X%sR%X", dstReg, srcReg1,
+      snprintf(buffer, sizeof(buffer), "R%d = R%d%sR%d", dstReg, srcReg1,
                (mathOp < 14) ? math_str[mathOp] : " ?", srcReg2);
     }
     break;
   }
   case 0xA: // Store Register to Address
   {
+    u8 width = (first_dword >> 24) & 0xF;
     u8 srcReg = (first_dword >> 20) & 0xF;
     u8 addrReg = (first_dword >> 16) & 0xF;
+    bool incReg = (first_dword >> 12) & 0xF;
     u8 offType = (first_dword >> 8) & 0xF;
     u8 offReg = (first_dword >> 4) & 0xF;
+    
+    std::string incNote = "";
+    if (incReg) {
+      char incBuf[32];
+      snprintf(incBuf, sizeof(incBuf), " R%d+=%d", addrReg, width);
+      incNote = incBuf;
+    }
+    
     if (s_noteMinimalMode) {
       if (offType == 0)
-        snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+        snprintf(buffer, sizeof(buffer), "[R%d] = R%d%s W=%d", addrReg, srcReg, incNote.c_str(), width);
       else if (offType == 1)
-        snprintf(buffer, sizeof(buffer), "[R%X+R%X] = R%X", addrReg, offReg,
-                 srcReg);
+        snprintf(buffer, sizeof(buffer), "[R%d+R%d] = R%d%s W=%d", addrReg, offReg,
+                 srcReg, incNote.c_str(), width);
       else if (offType == 3)
-        snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+        snprintf(buffer, sizeof(buffer), "[R%d] = R%d%s W=%d", addrReg, srcReg, incNote.c_str(), width);
       else {
         u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
-        snprintf(buffer, sizeof(buffer), "[0x%lX] = R%X", addr, srcReg);
+        snprintf(buffer, sizeof(buffer), "[0x%lX] = R%d%s W=%d", addr, srcReg, incNote.c_str(), width);
       }
     } else if (offType == 0)
-      snprintf(buffer, sizeof(buffer), "[R%X] = R%X", addrReg, srcReg);
+      snprintf(buffer, sizeof(buffer), "[R%d] = R%d%s (W=%d)", addrReg, srcReg, incNote.c_str(), width);
     else if (offType == 1)
-      snprintf(buffer, sizeof(buffer), "[R%X+R%X] = R%X", addrReg, offReg,
-               srcReg);
+      snprintf(buffer, sizeof(buffer), "[R%d+R%d] = R%d%s (W=%d)", addrReg, offReg,
+               srcReg, incNote.c_str(), width);
     else if (offType == 2) {
       u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
-      snprintf(buffer, sizeof(buffer), "[R%X+0x%lX] = R%X", addrReg, addr,
-               srcReg);
+      snprintf(buffer, sizeof(buffer), "[R%d+0x%lX] = R%d%s (W=%d)", addrReg, addr,
+               srcReg, incNote.c_str(), width);
     } else if (offType == 3) {
       u8 mType = offReg;
-      snprintf(buffer, sizeof(buffer), "[%s+R%X] = R%X",
-               (mType < 5 ? heap_str[mType] : ""), addrReg, srcReg);
+      snprintf(buffer, sizeof(buffer), "[%sR%d] = R%d%s (W=%d)",
+               (mType < 5 ? heap_str[mType] : "?"), addrReg, srcReg, incNote.c_str(), width);
     } else if (offType >= 4) {
       u8 mType = offReg;
       u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
       if (offType == 4)
-        snprintf(buffer, sizeof(buffer), "[%s+0x%lX] = R%X",
-                 (mType < 5 ? heap_str[mType] : ""), addr, srcReg);
+        snprintf(buffer, sizeof(buffer), "[%s0x%lX] = R%d%s (W=%d)",
+                 (mType < 5 ? heap_str[mType] : "?"), addr, srcReg, incNote.c_str(), width);
       else
-        snprintf(buffer, sizeof(buffer), "[%s+R%X+0x%lX] = R%X",
-                 (mType < 5 ? heap_str[mType] : ""), addrReg, addr, srcReg);
+        snprintf(buffer, sizeof(buffer), "[%sR%d+0x%lX] = R%d%s (W=%d)",
+                 (mType < 5 ? heap_str[mType] : "?"), addrReg, addr, srcReg, incNote.c_str(), width);
     }
     break;
   }
   case 0xC0: // Begin Register Conditional Block
   {
-    u8 width = (first_dword >> 24) & 0xF;
-    u8 cond = (first_dword >> 20) & 0xF;
-    u8 valReg = (first_dword >> 16) & 0xF;
-    u8 compType = (first_dword >> 12) & 0xF;
-    snprintf(buffer, sizeof(buffer), "If R%X %s ...", valReg,
-             (cond < 7) ? condition_str[cond] : "?");
-    if (compType == 0 || compType == 1 || compType == 2 || compType == 3 ||
-        compType == 6)
-      GetNextDword();
-    else if (compType == 4) {
+    u8 width = (first_dword >> 20) & 0xF;
+    u8 cond = (first_dword >> 16) & 0xF;
+    u8 valReg = (first_dword >> 12) & 0xF;
+    u8 compType = (first_dword >> 8) & 0xF;
+    u8 memType = (first_dword >> 4) & 0xF;
+    u8 addrReg = first_dword & 0xF;
+    
+    char condBuf[256];
+    if (compType == 0) {
+      // Memory Base + Relative Offset
+      u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s [%s0x%010lX]", valReg,
+               (cond < 7) ? condition_str[cond] : "?",
+               (memType < 5) ? heap_str[memType] : "?", addr);
+    } else if (compType == 1) {
+      // Memory Base + Offset Register
+      u8 offReg = first_dword & 0xF;
+      GetNextDword(); // Skip reserved dword
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s [%sR%d]", valReg,
+               (cond < 7) ? condition_str[cond] : "?",
+               (memType < 5) ? heap_str[memType] : "?", offReg);
+    } else if (compType == 2) {
+      // Register + Relative Offset
+      u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+0x%010lX]", valReg,
+               (cond < 7) ? condition_str[cond] : "?", addrReg, addr);
+    } else if (compType == 3) {
+      // Register + Offset Register
+      u8 offReg = first_dword & 0xF;
+      GetNextDword(); // Skip reserved dword
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+R%d]", valReg,
+               (cond < 7) ? condition_str[cond] : "?", addrReg, offReg);
+    } else if (compType == 4) {
+      // Static Value
       u64 val = GetNextVmInt(width);
       if (s_noteMinimalMode) {
-        snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer),
-                 "...%s", FormatValueNote(val, width).c_str());
+        snprintf(condBuf, sizeof(condBuf), "If R%d%s", valReg,
+                 FormatValueNote(val, width).c_str());
       } else {
-        snprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer),
-                 " 0x%lX%s", val, FormatValueNote(val, width).c_str());
+        snprintf(condBuf, sizeof(condBuf), "If R%d %s 0x%lX%s", valReg,
+                 (cond < 7) ? condition_str[cond] : "?", val,
+                 FormatValueNote(val, width).c_str());
       }
+    } else if (compType == 5) {
+      // Other Register
+      u8 otherReg = first_dword & 0xF;
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s R%d", valReg,
+               (cond < 7) ? condition_str[cond] : "?", otherReg);
+    } else {
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s ?", valReg,
+               (cond < 7) ? condition_str[cond] : "?");
     }
+    snprintf(buffer, sizeof(buffer), "%s (W=%d)", condBuf, width);
     break;
   }
   case 0xC1: // Save/Restore Register
@@ -8181,12 +8226,15 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   }
   case 0xC4: // Begin Extended Keypress Conditional
   {
+    bool autoRepeat = (first_dword >> 20) & 0xF;
     u64 mask = (((u64)GetNextDword()) << 32) | GetNextDword();
     std::string keys = "If keys(";
     for (size_t i = 0; i < buttonCodes.size(); i++)
       if (mask & buttonCodes[i])
         keys += buttonNames[i];
     keys += ")";
+    if (autoRepeat)
+      keys += " Auto-repeat";
     snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
     break;
   }
