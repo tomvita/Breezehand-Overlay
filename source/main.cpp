@@ -1152,7 +1152,7 @@ public:
 
       addHeader(list, SOFTWARE_UPDATE);
       addUpdateButton(list, UPDATE_ULTRAHAND, fullVersionLabel);
-      addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
+      // addUpdateButton(list, UPDATE_LANGUAGES, fullVersionLabel);
 
       PackageHeader overlayHeader;
       overlayHeader.title = "Breezehand Overlay";
