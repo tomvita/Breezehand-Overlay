@@ -525,6 +525,9 @@ bool processHold(uint64_t keysDown, uint64_t keysHeld, u64 &holdStartTick,
 static std::string returnJumpItemName;
 static std::string returnJumpItemValue;
 
+// Forward declarations
+bool checkOverlayMemory(u32 requiredMB);
+
 // Forward declaration of the MainMenu class.
 class MainMenu;
 
@@ -787,6 +790,12 @@ private:
 
       if (!(keys & KEY_A && !(keys & ~KEY_A & ALL_KEYS_MASK))) {
         return false;
+      }
+
+      // Check if we have sufficient memory for download operations (6MB required)
+      if (!checkOverlayMemory(6)) {
+        // User didn't increase memory, abort the operation
+        return true;
       }
 
       executingCommands = true;
@@ -7049,6 +7058,241 @@ public:
 #include <thread>
 #include <vector>
 
+// --- Memory Warning Menu ---
+
+// Global flag to track if memory was adjusted
+static std::atomic<bool> memoryWasAdjusted{false};
+
+class MemoryWarningMenu : public tsl::Gui {
+private:
+  u32 requiredMB;
+  u32 currentMB;
+  bool userIncreasedMemory = false;
+
+public:
+  MemoryWarningMenu(u32 required) 
+      : requiredMB(required), 
+        currentMB(bytesToMB(static_cast<u64>(currentHeapSize))) {}
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *list = new tsl::elm::List();
+
+    // Warning header
+    addHeader(list, WARNING_SYMBOL + " " + INSUFFICIENT_MEMORY);
+
+    // Explanation table
+    std::vector<std::vector<std::string>> tableData = {
+        {REQUIRED_MEMORY, "", std::to_string(requiredMB) + " MB"},
+        {CURRENT_MEMORY, "", std::to_string(currentMB) + " MB"}
+    };
+    addTable(list, tableData, "", 164, 20, 28, 4);
+
+    addGap(list, 20);
+
+    // Get system memory info for trackbar
+    u64 RAM_Used_system_u, RAM_Total_system_u;
+    svcGetSystemInfo(&RAM_Used_system_u, 1, INVALID_HANDLE, 2);
+    svcGetSystemInfo(&RAM_Total_system_u, 0, INVALID_HANDLE, 2);
+
+    const float freeRamMB =
+        static_cast<float>(RAM_Total_system_u - RAM_Used_system_u) /
+        (1024.0f * 1024.0f);
+
+    // System RAM display
+    char ramString[24];
+    snprintf(ramString, sizeof(ramString), "%.2f MB %s", freeRamMB,
+             FREE.c_str());
+
+    const char *ramColor =
+        freeRamMB >= 9.0f ? "healthy_ram"
+                          : (freeRamMB >= 3.0f ? "neutral_ram" : "bad_ram");
+
+    tableData.clear();
+    tableData = {{SYSTEM_RAM, "", ramString}};
+    addTable(list, tableData, "", 165 + 2, 19 - 2, 19 - 2, 0, "header",
+             ramColor, DEFAULT_STR, RIGHT_STR, true, true);
+
+    // Read custom overlay memory from INI
+    const std::string customMemoryStr = parseValueFromIniSection(
+        ULTRAHAND_CONFIG_INI_PATH, MEMORY_STR, "custom_overlay_memory_MB");
+
+    u32 customMemoryMB = 0;
+    bool hasIniEntry = false;
+
+    if (!customMemoryStr.empty()) {
+      int parsedValue = 0;
+      bool isValid = true;
+
+      for (char c : customMemoryStr) {
+        if (c < '0' || c > '9') {
+          isValid = false;
+          break;
+        }
+      }
+
+      if (isValid && !customMemoryStr.empty()) {
+        parsedValue = std::atoi(customMemoryStr.c_str());
+        if (parsedValue > 8 && parsedValue % 2 == 0) {
+          customMemoryMB = static_cast<u32>(parsedValue);
+          heapSizeCache.customSizeMB = customMemoryMB;
+          hasIniEntry = true;
+        }
+      }
+    }
+
+    if (!hasIniEntry && currentMB > 8) {
+      customMemoryMB = currentMB;
+    }
+
+    // Create step descriptions for the trackbar
+    std::vector<std::string> heapSizeLabels = {"4 MB", "6 MB", "8 MB"};
+
+    if (customMemoryMB > 8) {
+      heapSizeLabels.push_back(std::to_string(customMemoryMB) + " MB");
+    }
+
+    // Create the trackbar
+    auto *heapTrackbar = new tsl::elm::NamedStepTrackBarV2(
+        OVERLAY_MEMORY,
+        "", // Empty packagePath
+        heapSizeLabels, nullptr, nullptr, {}, "",
+        false, // unlockedTrackbar
+        false  // executeOnEveryTick
+    );
+
+    // Set initial position
+    u8 initialStep = 1; // Default to 6MB
+
+    if (currentMB == 4) {
+      initialStep = 0;
+    } else if (currentMB == 6) {
+      initialStep = 1;
+    } else if (currentMB == 8) {
+      initialStep = 2;
+    } else if (customMemoryMB > 8 && currentMB == customMemoryMB) {
+      initialStep = 3;
+    }
+
+    auto lastSliderMB = std::make_shared<u32>(currentMB);
+
+    heapTrackbar->setSimpleCallback([this, freeRamMB, lastSliderMB,
+                                      customMemoryMB,
+                                      hasIniEntry](s16 value, s16 index) {
+      u64 newHeapBytes;
+      u32 newMB;
+
+      switch (index) {
+      case 0:
+        newHeapBytes = 0x400000;
+        newMB = 4;
+        break;
+      case 1:
+        newHeapBytes = 0x600000;
+        newMB = 6;
+        break;
+      case 2:
+        newHeapBytes = 0x800000;
+        newMB = 8;
+        break;
+      case 3:
+        if (hasIniEntry && customMemoryMB > 8) {
+          newHeapBytes = mbToBytes(customMemoryMB);
+          newMB = customMemoryMB;
+        } else {
+          return;
+        }
+        break;
+      default:
+        return;
+      }
+
+      OverlayHeapSize newHeapSize = static_cast<OverlayHeapSize>(newHeapBytes);
+      const u32 oldMB = bytesToMB(static_cast<u64>(currentHeapSize));
+      const u32 previousSliderMB = *lastSliderMB;
+
+      if (newMB == previousSliderMB) {
+        return;
+      }
+
+      // Check if we have enough memory for growth
+      if (newMB > oldMB) {
+        const float totalAvailableMB = freeRamMB + static_cast<float>(oldMB);
+        constexpr float SAFETY_MARGIN_MB = 5.3f;
+
+        if (static_cast<float>(newMB) > (totalAvailableMB - SAFETY_MARGIN_MB)) {
+          if (tsl::notification) {
+            tsl::notification->showNow(NOTIFY_HEADER + NOT_ENOUGH_MEMORY);
+          }
+          setOverlayHeapSize(currentHeapSize);
+          *lastSliderMB = newMB;
+          return;
+        }
+      }
+
+      // Apply the change
+      setOverlayHeapSize(newHeapSize);
+      
+      // Track if memory was adjusted compared to ACTIVE size
+      memoryWasAdjusted.store(newHeapSize != currentHeapSize, std::memory_order_release);
+
+      // Track if user increased memory to meet requirement
+      if (newMB >= this->requiredMB) {
+        this->userIncreasedMemory = true;
+      }
+
+      *lastSliderMB = newMB;
+    });
+
+    heapTrackbar->setProgress(initialStep);
+    heapTrackbar->disableClickAnimation();
+    list->addItem(heapTrackbar);
+
+    addGap(list, 12);
+
+    auto *rootFrame = new tsl::elm::OverlayFrame("Breezehand", MEMORY_WARNING);
+    rootFrame->setContent(list);
+    return rootFrame;
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      if (memoryWasAdjusted.load(std::memory_order_acquire)) {
+        ult::launchingOverlay.store(true, std::memory_order_release);
+        tsl::Overlay::get()->close();
+      } else {
+        tsl::goBack();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  bool didUserIncreaseMemory() const { return userIncreasedMemory; }
+};
+
+// Function to check overlay memory and show warning if insufficient
+bool checkOverlayMemory(u32 requiredMB) {
+  const u32 currentMB = bytesToMB(static_cast<u64>(currentHeapSize));
+  
+  if (currentMB >= requiredMB) {
+    return true; // Sufficient memory
+  }
+
+  // Reset flag
+  memoryWasAdjusted.store(false, std::memory_order_release);
+
+  // Show warning menu
+  tsl::changeTo<MemoryWarningMenu>(requiredMB);
+
+  // Wait for menu to close and check if memory was adjusted
+  // Note: This is a synchronous blocking approach
+  // The actual check happens when the menu returns
+  
+  return false; // Insufficient memory, user needs to adjust
+}
+
 // --- Cheat / Combo Key Globals & Structs ---
 
 // toggles/thread removed
@@ -11494,6 +11738,12 @@ tsl::elm::Element *CheatMenu::createUI() {
   auto *downloadItem = new tsl::elm::ListItem("Download from URL");
   downloadItem->setClickListener([](u64 keys) {
     if (keys & KEY_A) {
+      // Check if we have sufficient memory for download operations (6MB required)
+      if (!checkOverlayMemory(6)) {
+        // User didn't increase memory, abort the operation
+        return true;
+      }
+      
       if (CheatUtils::TryDownloadCheats(true)) {
         refreshPage.store(true, std::memory_order_release);
         tsl::goBack();
@@ -11577,12 +11827,6 @@ bool CheatMenu::handleInput(u64 keysDown, u64 keysHeld,
                             touchPosition touchInput,
                             JoystickPosition leftJoyStick,
                             JoystickPosition rightJoyStick) {
-  if (auto focused = this->getFocusedElement()) {
-    if (focused->handleInput(keysDown, keysHeld, *touchInput, leftJoyStick,
-                             rightJoyStick))
-      return true;
-  }
-
   if (keysDown & KEY_B) {
     tsl::goBack();
     return true;
