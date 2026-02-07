@@ -1,8 +1,6 @@
 # Breezehand Overlay
 
-<p align="center">
-  <img src=".pics/logo.png" alt="Breezehand Logo" width="400"/>
-</p>
+<img width="480" height="1024" alt="image" src="https://github.com/user-attachments/assets/0377e731-0f4c-4c19-8cd6-2d719c49da4b" />
 
 <p align="center">
   <a href="https://gbatemp.net/forums/nintendo-switch.283/?prefix_id=44"><img src="https://img.shields.io/badge/platform-Switch-898c8c?logo=C++.svg" alt="platform"></a>
