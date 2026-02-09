@@ -36,6 +36,8 @@
 
 #include "disasm.hpp"
 #include <dmntcht.h>
+#include <cctype>
+#include <cerrno>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -8119,17 +8121,19 @@ std::string FormatValueNote(u64 val, u32 width, u64 address = 0) {
   char buf[128];
   std::string result = " (";
 
-  // Decimal representation
+  // Integer representation (show both unsigned and signed views)
   if (width == 1)
-    snprintf(buf, sizeof(buf), "%u", (u8)val);
+    snprintf(buf, sizeof(buf), "u=%u, s=%d", (u8)val, (s8)val);
   else if (width == 2)
-    snprintf(buf, sizeof(buf), "%u", (u16)val);
+    snprintf(buf, sizeof(buf), "u=%u, s=%d", (u16)val, (s16)val);
   else if (width == 4)
-    snprintf(buf, sizeof(buf), "%u", (u32)val);
+    snprintf(buf, sizeof(buf), "u=%u, s=%d", (u32)val, (s32)val);
   else if (width == 8)
-    snprintf(buf, sizeof(buf), "%lu", val);
+    snprintf(buf, sizeof(buf), "u=%llu, s=%lld",
+             (unsigned long long)val, (long long)(s64)val);
   else
-    snprintf(buf, sizeof(buf), "%lu", val);
+    snprintf(buf, sizeof(buf), "u=%llu, s=%lld",
+             (unsigned long long)val, (long long)(s64)val);
 
   result += buf;
 
@@ -8305,6 +8309,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   }
   case 6: // Store Static to Address
   {
+    u8 width = (first_dword >> 24) & 0xF;
     u8 regIdx = (first_dword >> 16) & 0xF;
     bool inc = (first_dword >> 12) & 0xF;
     bool useOffSet = (first_dword >> 8) & 0xF;
@@ -8312,12 +8317,12 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
     if (s_noteMinimalMode) {
       snprintf(buffer, sizeof(buffer), "[R%d] = 0x%lX%s", regIdx, val,
-               FormatValueNote(val, 8).c_str());
+               FormatValueNote(val, width).c_str());
     } else {
       snprintf(buffer, sizeof(buffer), "[R%d%s] = 0x%lX%s%s", regIdx,
                useOffSet ? (std::string("+R") + std::to_string(offReg)).c_str()
                          : "",
-               val, inc ? " (Inc)" : "", FormatValueNote(val, 8).c_str());
+               val, inc ? " (Inc)" : "", FormatValueNote(val, width).c_str());
     }
     break;
   }
@@ -8641,7 +8646,9 @@ private:
           else if (dwords.size() >= 2) m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | dwords[1];
         }
         break;
-      case 0x4: case 0x6: if (dwords.size() >= 4) m_storedValue = (((u64)dwords[2]) << 32) | dwords[3]; break;
+      case 0x4: case 0x6:
+        if (dwords.size() >= 3) m_storedValue = (((u64)dwords[1]) << 32) | dwords[2];
+        break;
       case 0x3: case 0x7: case 0x9:
         if (vWidth == 8 && dwords.size() >= 3) m_storedValue = (((u64)dwords[1]) << 32) | dwords[2];
         else if (dwords.size() >= 2) m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | dwords[1];
@@ -8698,7 +8705,7 @@ private:
         }
         break;
       case 0x4: case 0x6:
-        if (dwords.size() >= 4) { dwords[2] = (u32)(m_storedValue >> 32); dwords[3] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        if (dwords.size() >= 3) { dwords[1] = (u32)(m_storedValue >> 32); dwords[2] = (u32)(m_storedValue & 0xFFFFFFFF); }
         break;
       case 0x3: case 0x7: case 0x9:
         if (vWidth == 8 && dwords.size() >= 3) { dwords[1] = (u32)(m_storedValue >> 32); dwords[2] = (u32)(m_storedValue & 0xFFFFFFFF); }
@@ -8781,9 +8788,168 @@ private:
     }
   }
 
+  static std::string trimCopy(const std::string &s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace((unsigned char)s[b])) b++;
+    size_t e = s.size();
+    while (e > b && std::isspace((unsigned char)s[e - 1])) e--;
+    return s.substr(b, e - b);
+  }
+
+  static std::vector<u32> parseDwords(const std::string &hex) {
+    std::vector<u32> out;
+    std::string token;
+    for (char c : hex) {
+      if (std::isxdigit((unsigned char)c)) {
+        token += (char)std::toupper((unsigned char)c);
+      } else if (!token.empty()) {
+        out.push_back((u32)std::strtoul(token.c_str(), nullptr, 16));
+        token.clear();
+      }
+    }
+    if (!token.empty()) out.push_back((u32)std::strtoul(token.c_str(), nullptr, 16));
+    return out;
+  }
+
+  static u32 decodeType(u32 firstRaw) {
+    u32 type = (firstRaw >> 28) & 0xF;
+    if (type >= 0xC) type = (type << 4) | ((firstRaw >> 24) & 0xF);
+    if (type >= 0xF0) type = (type << 4) | ((firstRaw >> 20) & 0xF);
+    return type;
+  }
+
+  void rebuildHex(std::string &hex, size_t &cursor, const std::vector<u32> &dwords) {
+    std::string result;
+    for (size_t i = 0; i < dwords.size(); i++) {
+      char buf[10];
+      snprintf(buf, sizeof(buf), "%08X", dwords[i]);
+      result += buf;
+      if (i + 1 < dwords.size()) result += " ";
+    }
+    hex = result;
+    if (cursor > hex.length()) cursor = hex.length();
+    std::string finalClean;
+    for (char c : hex) if (isxdigit(c)) finalClean += c;
+    for (size_t i = 0; i < finalClean.length() && i < 32; i++) m_nibbleBackup[i] = finalClean[i];
+  }
+
+  bool applyStoredValueToHex(std::string &hex, size_t &cursor) {
+    std::vector<u32> dwords = parseDwords(hex);
+    if (dwords.empty()) return false;
+    u32 type = decodeType(dwords[0]);
+    syncVariables(dwords[0], type);
+    applyStored(dwords, type);
+    applyVariables(dwords[0], type);
+    rebuildHex(hex, cursor, dwords);
+    return true;
+  }
+
+  u64 widthMask() const {
+    if (vWidth == 1) return 0xFFULL;
+    if (vWidth == 2) return 0xFFFFULL;
+    if (vWidth == 4) return 0xFFFFFFFFULL;
+    return 0xFFFFFFFFFFFFFFFFULL;
+  }
+
 public:
   CheatFormatManager() {
     memset(m_nibbleBackup, '0', 32);
+  }
+
+  std::string getStoredValueSignedText(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    if (vWidth == 1) return std::to_string((s8)m_storedValue);
+    if (vWidth == 2) return std::to_string((s16)m_storedValue);
+    if (vWidth == 4) return std::to_string((s32)m_storedValue);
+    return std::to_string((s64)m_storedValue);
+  }
+
+  std::string getStoredValueUnsignedText(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    if (vWidth == 1) return std::to_string((u8)m_storedValue);
+    if (vWidth == 2) return std::to_string((u16)m_storedValue);
+    if (vWidth == 4) return std::to_string((u32)m_storedValue);
+    return std::to_string((u64)m_storedValue);
+  }
+
+  std::string getStoredValueFloatText(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    std::ostringstream oss;
+    if (vWidth == 8) {
+      union { u64 u; double d; } cvt;
+      cvt.u = m_storedValue;
+      oss << std::setprecision(17) << cvt.d;
+    } else {
+      union { u32 u; float f; } cvt;
+      cvt.u = (u32)(m_storedValue & 0xFFFFFFFFULL);
+      oss << std::setprecision(9) << cvt.f;
+    }
+    return oss.str();
+  }
+
+  bool setStoredValueFromIntegerText(std::string &hex, size_t &cursor, const std::string &input) {
+    processEdit(hex, cursor);
+    std::string t = trimCopy(input);
+    if (t.empty()) return false;
+    char *end = nullptr;
+    errno = 0;
+    long long s = std::strtoll(t.c_str(), &end, 10);
+    if (end && *end == '\0' && errno == 0) {
+      m_storedValue = ((u64)s) & widthMask();
+    } else {
+      end = nullptr;
+      errno = 0;
+      unsigned long long u = std::strtoull(t.c_str(), &end, 10);
+      if (!(end && *end == '\0' && errno == 0)) return false;
+      m_storedValue = ((u64)u) & widthMask();
+    }
+    if (!applyStoredValueToHex(hex, cursor)) return false;
+    processEdit(hex, cursor);
+    return true;
+  }
+
+  bool setStoredValueFromUnsignedText(std::string &hex, size_t &cursor, const std::string &input) {
+    processEdit(hex, cursor);
+    std::string t = trimCopy(input);
+    if (t.empty()) return false;
+    char *end = nullptr;
+    errno = 0;
+    unsigned long long u = std::strtoull(t.c_str(), &end, 10);
+    if (!(end && *end == '\0' && errno == 0)) return false;
+    m_storedValue = ((u64)u) & widthMask();
+    if (!applyStoredValueToHex(hex, cursor)) return false;
+    processEdit(hex, cursor);
+    return true;
+  }
+
+  bool setStoredValueFromFloatText(std::string &hex, size_t &cursor, const std::string &input) {
+    processEdit(hex, cursor);
+    std::string t = trimCopy(input);
+    if (t.empty()) return false;
+    char *end = nullptr;
+    errno = 0;
+    if (vWidth == 8) {
+      union { u64 u; double d; } cvt;
+      cvt.d = std::strtod(t.c_str(), &end);
+      if (!(end && *end == '\0' && errno == 0)) return false;
+      m_storedValue = cvt.u;
+    } else {
+      union { u32 u; float f; } cvt;
+      cvt.f = std::strtof(t.c_str(), &end);
+      if (!(end && *end == '\0' && errno == 0)) return false;
+      m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | (u64)cvt.u;
+    }
+    if (!applyStoredValueToHex(hex, cursor)) return false;
+    processEdit(hex, cursor);
+    return true;
+  }
+
+  bool clearStoredValue(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    m_storedValue = 0;
+    if (!applyStoredValueToHex(hex, cursor)) return false;
+    processEdit(hex, cursor);
+    return true;
   }
 
   std::string processEdit(std::string &hex, size_t &cursor) {
@@ -9268,7 +9434,28 @@ public:
                 [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
                   return fmtMgr->processEdit(currentVal, cursor);
                 },
-                true);
+                true,
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
+                  return fmtMgr->getStoredValueSignedText(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
+                  return fmtMgr->getStoredValueUnsignedText(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
+                  return fmtMgr->getStoredValueFloatText(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, const std::string &input) -> bool {
+                  return fmtMgr->setStoredValueFromIntegerText(currentVal, cursor, input);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, const std::string &input) -> bool {
+                  return fmtMgr->setStoredValueFromUnsignedText(currentVal, cursor, input);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, const std::string &input) -> bool {
+                  return fmtMgr->setStoredValueFromFloatText(currentVal, cursor, input);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> bool {
+                  return fmtMgr->clearStoredValue(currentVal, cursor);
+                });
             return true;
           }
         }
@@ -12810,9 +12997,24 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
                          const std::string &title,
                          std::function<void(std::string)> onComplete,
                          std::function<std::string(std::string&, size_t&)> onNoteUpdate,
-                         bool constrained)
+                         bool constrained,
+                         std::function<std::string(std::string&, size_t&)> onGetSignedEditValue,
+                         std::function<std::string(std::string&, size_t&)> onGetUnsignedEditValue,
+                         std::function<std::string(std::string&, size_t&)> onGetFloatEditValue,
+                         std::function<bool(std::string&, size_t&, const std::string&)> onApplySignedEdit,
+                         std::function<bool(std::string&, size_t&, const std::string&)> onApplyUnsignedEdit,
+                         std::function<bool(std::string&, size_t&, const std::string&)> onApplyFloatEdit,
+                         std::function<bool(std::string&, size_t&)> onClearStoredValue)
     : m_type(type), m_value(initialValue), m_title(title),
-      m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate), m_isConstrained(constrained) {
+      m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate),
+      m_onGetSignedEditValue(onGetSignedEditValue),
+      m_onGetUnsignedEditValue(onGetUnsignedEditValue),
+      m_onGetFloatEditValue(onGetFloatEditValue),
+      m_onApplySignedEdit(onApplySignedEdit),
+      m_onApplyUnsignedEdit(onApplyUnsignedEdit),
+      m_onApplyFloatEdit(onApplyFloatEdit),
+      m_onClearStoredValue(onClearStoredValue),
+      m_isConstrained(constrained) {
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
   m_cursorPos = m_value.length();
   tsl::disableJumpTo = true;
@@ -12848,6 +13050,103 @@ elm::Element *KeyboardGui::createUI() {
   }
 
   if (m_type == SEARCH_TYPE_HEX) {
+    if (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onClearStoredValue) {
+      auto *topRow = new KeyboardRow();
+      topRow->addButton(new KeyboardButton("signed", [this] {
+        if (!m_onGetSignedEditValue || !m_onApplySignedEdit) return;
+        std::string initial = "0";
+        {
+          std::lock_guard<std::recursive_mutex> lock(m_mutex);
+          initial = m_onGetSignedEditValue(m_value, m_cursorPos);
+        }
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_SIGNED_64BIT, initial, "Edit Signed",
+            [this](std::string result) {
+              std::lock_guard<std::recursive_mutex> lock(m_mutex);
+              if (m_onApplySignedEdit &&
+                  m_onApplySignedEdit(m_value, m_cursorPos, result) &&
+                  m_onNoteUpdate && m_frame) {
+                if (m_isConstrained) {
+                  m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+                } else {
+                  std::string valCopy = m_value;
+                  size_t cursorCopy = m_cursorPos;
+                  m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+                }
+              }
+              tsl::goBack();
+            },
+            nullptr, false);
+      }));
+      topRow->addButton(new KeyboardButton("unsigned", [this] {
+        if (!m_onGetUnsignedEditValue || !m_onApplyUnsignedEdit) return;
+        std::string initial = "0";
+        {
+          std::lock_guard<std::recursive_mutex> lock(m_mutex);
+          initial = m_onGetUnsignedEditValue(m_value, m_cursorPos);
+        }
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_UNSIGNED_64BIT, initial, "Edit Unsigned",
+            [this](std::string result) {
+              std::lock_guard<std::recursive_mutex> lock(m_mutex);
+              if (m_onApplyUnsignedEdit &&
+                  m_onApplyUnsignedEdit(m_value, m_cursorPos, result) &&
+                  m_onNoteUpdate && m_frame) {
+                if (m_isConstrained) {
+                  m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+                } else {
+                  std::string valCopy = m_value;
+                  size_t cursorCopy = m_cursorPos;
+                  m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+                }
+              }
+              tsl::goBack();
+            },
+            nullptr, false);
+      }));
+      topRow->addButton(new KeyboardButton("float", [this] {
+        if (!m_onGetFloatEditValue || !m_onApplyFloatEdit) return;
+        std::string initial = "0";
+        {
+          std::lock_guard<std::recursive_mutex> lock(m_mutex);
+          initial = m_onGetFloatEditValue(m_value, m_cursorPos);
+        }
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_DOUBLE, initial, "Edit Float",
+            [this](std::string result) {
+              std::lock_guard<std::recursive_mutex> lock(m_mutex);
+              if (m_onApplyFloatEdit &&
+                  m_onApplyFloatEdit(m_value, m_cursorPos, result) &&
+                  m_onNoteUpdate && m_frame) {
+                if (m_isConstrained) {
+                  m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+                } else {
+                  std::string valCopy = m_value;
+                  size_t cursorCopy = m_cursorPos;
+                  m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+                }
+              }
+              tsl::goBack();
+            },
+            nullptr, false);
+      }));
+      topRow->addButton(new KeyboardButton("AC", [this] {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        if (m_onClearStoredValue &&
+            m_onClearStoredValue(m_value, m_cursorPos) &&
+            m_onNoteUpdate && m_frame) {
+          if (m_isConstrained) {
+            m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+          } else {
+            std::string valCopy = m_value;
+            size_t cursorCopy = m_cursorPos;
+            m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+          }
+        }
+      }));
+      list->addItem(topRow);
+    }
+
     auto *row1 = new KeyboardRow();
     row1->addButton(new KeyboardButton('1', keyPress));
     row1->addButton(new KeyboardButton('2', keyPress));
@@ -12927,11 +13226,22 @@ elm::Element *KeyboardGui::createUI() {
     row5->addButton(
         new KeyboardButton("BS", [this] { this->handleBackspace(); }));
     row5->addButton(
+        new KeyboardButton("-", [this] { this->handleKeyPress('-'); }));
+    row5->addButton(
+        new KeyboardButton(".", [this] { this->handleKeyPress('.'); }));
+    row5->addButton(
         new KeyboardButton("SPACE", [this] { this->handleKeyPress(' '); }));
     row5->addButton(
         new KeyboardButton("OK", [this] { this->handleConfirm(); }));
     list->addItem(row5);
   } else if (m_isNumpad) {
+    const bool allowMinus =
+        (m_type == SEARCH_TYPE_SIGNED_8BIT || m_type == SEARCH_TYPE_SIGNED_16BIT ||
+         m_type == SEARCH_TYPE_SIGNED_32BIT || m_type == SEARCH_TYPE_SIGNED_64BIT ||
+         m_type == SEARCH_TYPE_FLOAT || m_type == SEARCH_TYPE_DOUBLE);
+    const bool allowDot =
+        (m_type == SEARCH_TYPE_FLOAT || m_type == SEARCH_TYPE_DOUBLE);
+
     auto *row1 = new KeyboardRow();
     row1->addButton(new KeyboardButton('1', keyPress));
     row1->addButton(new KeyboardButton('2', keyPress));
@@ -12953,9 +13263,13 @@ elm::Element *KeyboardGui::createUI() {
     auto *row4 = new KeyboardRow();
     row4->addButton(
         new KeyboardButton("BS", [this] { this->handleBackspace(); }));
+    if (allowMinus)
+      row4->addButton(
+          new KeyboardButton("-", [this] { this->handleKeyPress('-'); }));
     row4->addButton(new KeyboardButton('0', keyPress));
-    row4->addButton(
-        new KeyboardButton("SPACE", [this] { this->handleKeyPress(' '); }));
+    if (allowDot)
+      row4->addButton(
+          new KeyboardButton(".", [this] { this->handleKeyPress('.'); }));
     row4->addButton(
         new KeyboardButton("OK", [this] { this->handleConfirm(); }));
     list->addItem(row4);
@@ -13134,7 +13448,11 @@ void KeyboardGui::switchType(searchType_t newType) {
     m_type = newType;
     m_isNumpad = (newType != SEARCH_TYPE_POINTER);
   }
-  tsl::swapTo<KeyboardGui>(m_type, m_value, m_title, m_onComplete);
+  tsl::swapTo<KeyboardGui>(m_type, m_value, m_title, m_onComplete,
+                           m_onNoteUpdate, m_isConstrained,
+                           m_onGetSignedEditValue, m_onGetUnsignedEditValue, m_onGetFloatEditValue,
+                           m_onApplySignedEdit, m_onApplyUnsignedEdit, m_onApplyFloatEdit,
+                           m_onClearStoredValue);
 }
 
 // Implement helper

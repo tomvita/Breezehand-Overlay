@@ -14,7 +14,14 @@ namespace tsl {
         KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, 
                     std::function<void(std::string)> onComplete,
                     std::function<std::string(std::string&, size_t&)> onNoteUpdate = nullptr,
-                    bool constrained = true);
+                    bool constrained = true,
+                    std::function<std::string(std::string&, size_t&)> onGetSignedEditValue = nullptr,
+                    std::function<std::string(std::string&, size_t&)> onGetUnsignedEditValue = nullptr,
+                    std::function<std::string(std::string&, size_t&)> onGetFloatEditValue = nullptr,
+                    std::function<bool(std::string&, size_t&, const std::string&)> onApplySignedEdit = nullptr,
+                    std::function<bool(std::string&, size_t&, const std::string&)> onApplyUnsignedEdit = nullptr,
+                    std::function<bool(std::string&, size_t&, const std::string&)> onApplyFloatEdit = nullptr,
+                    std::function<bool(std::string&, size_t&)> onClearStoredValue = nullptr);
         virtual ~KeyboardGui();
 
         // Gui overrides
@@ -36,6 +43,13 @@ namespace tsl {
         std::string m_title;
         std::function<void(std::string)> m_onComplete;
         std::function<std::string(std::string&, size_t&)> m_onNoteUpdate;
+        std::function<std::string(std::string&, size_t&)> m_onGetSignedEditValue;
+        std::function<std::string(std::string&, size_t&)> m_onGetUnsignedEditValue;
+        std::function<std::string(std::string&, size_t&)> m_onGetFloatEditValue;
+        std::function<bool(std::string&, size_t&, const std::string&)> m_onApplySignedEdit;
+        std::function<bool(std::string&, size_t&, const std::string&)> m_onApplyUnsignedEdit;
+        std::function<bool(std::string&, size_t&, const std::string&)> m_onApplyFloatEdit;
+        std::function<bool(std::string&, size_t&)> m_onClearStoredValue;
         size_t m_cursorPos = 0;
         bool m_isNumpad;
         elm::Element* m_valueDisplay = nullptr;
