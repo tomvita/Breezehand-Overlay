@@ -8186,6 +8186,24 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     return 0;
   };
 
+  auto HeapText = [&](u8 memType) -> std::string {
+    if (memType < 5)
+      return heap_str[memType];
+    return "ERROR_HEAP(" + std::to_string(memType) + ")+";
+  };
+
+  auto ConditionText = [&](u8 cond) -> std::string {
+    if (cond < 7)
+      return condition_str[cond];
+    return " [ERROR_COND(" + std::to_string(cond) + ")] ";
+  };
+
+  auto MathText = [&](u8 op, u8 maxValid) -> std::string {
+    if (op <= maxValid)
+      return math_str[op];
+    return " [ERROR_MATH(" + std::to_string(op) + ")] ";
+  };
+
   switch (type) {
   case 0: // Store Static
   {
@@ -8199,8 +8217,9 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
       snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr,
                DisassembleARM64((u32)val, addr).c_str());
     } else {
+      std::string heapText = HeapText(memType);
       snprintf(buffer, sizeof(buffer), "[%sR%d+0x%010lX] = 0x%lX%s (W=%d)",
-               (memType < 5) ? heap_str[memType] : "", regIdx, addr, val,
+               heapText.c_str(), regIdx, addr, val,
                FormatValueNote(val, width, addr).c_str(), width);
     }
     break;
@@ -8219,12 +8238,11 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
       snprintf(buffer, sizeof(buffer), "If [0x%010lX]%s", addr,
                FormatValueNote(val, width, addr).c_str());
     } else {
+      std::string heapText = HeapText(memType);
+      std::string condText = ConditionText(cond);
+      std::string ofsText = useOfs ? ("R" + std::to_string(ofsReg) + "+") : "";
       snprintf(buffer, sizeof(buffer), "If [%s%s0x%010lX] %s 0x%lX%s",
-               heap_str[memType < 5 ? memType : 4],
-               useOfs
-                   ? (std::string("R") + std::to_string(ofsReg) + "+").c_str()
-                   : "",
-               addr, condition_str[cond < 7 ? cond : 5], val,
+               heapText.c_str(), ofsText.c_str(), addr, condText.c_str(), val,
                FormatValueNote(val, width, addr).c_str());
     }
     break;
@@ -8269,14 +8287,20 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                (width == 4) ? FormatValueNote(0, 0).c_str()
                             : ""); // Placeholder for ASM if applicable
     } else if (loadFrom == 3)
+      {
+      std::string heapText = HeapText(memType);
       snprintf(buffer, sizeof(buffer), "R%d = [%sR%d+0x%010lX] (W=%d)", regIdx,
-               heap_str[memType < 5 ? memType : 4], offReg, addr, width);
+               heapText.c_str(), offReg, addr, width);
+      }
     else if (loadFrom)
       snprintf(buffer, sizeof(buffer), "R%d = [R%d+0x%010lX] (W=%d)", regIdx,
                (loadFrom == 1 ? regIdx : offReg), addr, width);
     else
+      {
+      std::string heapText = HeapText(memType);
       snprintf(buffer, sizeof(buffer), "R%d = [%s0x%010lX] (W=%d)", regIdx,
-               heap_str[memType < 5 ? memType : 4], addr, width);
+               heapText.c_str(), addr, width);
+      }
     break;
   }
   case 6: // Store Static to Address
@@ -8307,8 +8331,9 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
       snprintf(buffer, sizeof(buffer), "R%d = R%d...%s", regIdx, regIdx,
                FormatValueNote(val, 4).c_str());
     } else {
+      std::string mathText = MathText(mathOp, 4);
       snprintf(buffer, sizeof(buffer), "R%d = R%d%s0x%08X%s (W=%d)", regIdx, regIdx,
-               math_str[mathOp < 5 ? mathOp : 4], val,
+               mathText.c_str(), val,
                FormatValueNote(val, 4).c_str(), width);
     }
     break;
@@ -8337,14 +8362,16 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
         snprintf(buffer, sizeof(buffer), "R%d = R%d...%s", dstReg, srcReg1,
                  FormatValueNote(val, width).c_str());
       } else {
+        std::string mathText = MathText(mathOp, 13);
         snprintf(buffer, sizeof(buffer), "R%d = R%d%s0x%lX%s", dstReg, srcReg1,
-                 math_str[mathOp < 14 ? mathOp : 13], val,
+                 mathText.c_str(), val,
                  FormatValueNote(val, width).c_str());
       }
     } else {
       u8 srcReg2 = (first_dword >> 4) & 0xF;
+      std::string mathText = MathText(mathOp, 13);
       snprintf(buffer, sizeof(buffer), "R%d = R%d%sR%d", dstReg, srcReg1,
-               math_str[mathOp < 14 ? mathOp : 13], srcReg2);
+               mathText.c_str(), srcReg2);
     }
     break;
   }
@@ -8387,17 +8414,19 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                srcReg, incNote.c_str(), width);
     } else if (offType == 3) {
       u8 mType = offReg;
+      std::string heapText = HeapText(mType);
       snprintf(buffer, sizeof(buffer), "[%sR%d] = R%d%s (W=%d)",
-               heap_str[mType < 5 ? mType : 4], addrReg, srcReg, incNote.c_str(), width);
+               heapText.c_str(), addrReg, srcReg, incNote.c_str(), width);
     } else if (offType >= 4) {
       u8 mType = offReg;
       u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+      std::string heapText = HeapText(mType);
       if (offType == 4)
         snprintf(buffer, sizeof(buffer), "[%s0x%lX] = R%d%s (W=%d)",
-                 heap_str[mType < 5 ? mType : 4], addr, srcReg, incNote.c_str(), width);
+                 heapText.c_str(), addr, srcReg, incNote.c_str(), width);
       else
         snprintf(buffer, sizeof(buffer), "[%sR%d+0x%lX] = R%d%s (W=%d)",
-                 heap_str[mType < 5 ? mType : 4], addrReg, addr, srcReg, incNote.c_str(), width);
+                 heapText.c_str(), addrReg, addr, srcReg, incNote.c_str(), width);
     }
     break;
   }
@@ -8414,23 +8443,27 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     if (compType == 0) {
       // Memory Base + Relative Offset
       u64 addr = (((u64)n7 << 32) | GetNextDword());
+      std::string condText = ConditionText(cond);
+      std::string heapText = HeapText(n6);
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [%s0x%010lX]", valReg,
-               condition_str[cond < 7 ? cond : 5],
-               heap_str[n6 < 5 ? n6 : 4], addr);
+               condText.c_str(), heapText.c_str(), addr);
     } else if (compType == 1) {
       // Memory Base + Offset Register
+      std::string condText = ConditionText(cond);
+      std::string heapText = HeapText(n6);
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [%sR%d]", valReg,
-               condition_str[cond < 7 ? cond : 5],
-               heap_str[n6 < 5 ? n6 : 4], n7);
+               condText.c_str(), heapText.c_str(), n7);
     } else if (compType == 2) {
       // Register + Relative Offset
       u64 addr = (((u64)n7 << 32) | GetNextDword());
+      std::string condText = ConditionText(cond);
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+0x%010lX]", valReg,
-               condition_str[cond < 7 ? cond : 5], n6, addr);
+               condText.c_str(), n6, addr);
     } else if (compType == 3) {
       // Register + Offset Register
+      std::string condText = ConditionText(cond);
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+R%d]", valReg,
-               condition_str[cond < 7 ? cond : 5], n6, n7);
+               condText.c_str(), n6, n7);
     } else if (compType == 4) {
       // Static Value
       u64 val = GetNextVmInt(width);
@@ -8438,17 +8471,20 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
         snprintf(condBuf, sizeof(condBuf), "If R%d%s", valReg,
                  FormatValueNote(val, width).c_str());
       } else {
+        std::string condText = ConditionText(cond);
         snprintf(condBuf, sizeof(condBuf), "If R%d %s 0x%lX%s", valReg,
-                 condition_str[cond < 7 ? cond : 5], val,
+                 condText.c_str(), val,
                  FormatValueNote(val, width).c_str());
       }
     } else if (compType == 5) {
       // Other Register
+      std::string condText = ConditionText(cond);
       snprintf(condBuf, sizeof(condBuf), "If R%d %s R%d", valReg,
-               condition_str[cond < 7 ? cond : 5], n6);
+               condText.c_str(), n6);
     } else {
-      snprintf(condBuf, sizeof(condBuf), "If R%d %s ?", valReg,
-               condition_str[cond < 7 ? cond : 5]);
+      std::string condText = ConditionText(cond);
+      snprintf(condBuf, sizeof(condBuf), "If R%d %s [Invalid Compare Type %u]",
+               valReg, condText.c_str(), compType);
     }
     snprintf(buffer, sizeof(buffer), "%s (W=%d)", condBuf, width);
     break;
@@ -8496,11 +8532,13 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     char logBuf[256];
     if (compType == 0) {
       u64 addr = (((u64)n7 << 32) | GetNextDword());
+      std::string heapText = HeapText(n6);
       snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [%s0x%010lX]", logId,
-               heap_str[n6 < 5 ? n6 : 4], addr);
+               heapText.c_str(), addr);
     } else if (compType == 1) {
+      std::string heapText = HeapText(n6);
       snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [%sR%d]", logId,
-               heap_str[n6 < 5 ? n6 : 4], n7);
+               heapText.c_str(), n7);
     } else if (compType == 2) {
       u64 addr = (((u64)n7 << 32) | GetNextDword());
       snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [R%d+0x%010lX]", logId,
@@ -8511,7 +8549,8 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     } else if (compType == 4) {
       snprintf(logBuf, sizeof(logBuf), "Log[%d] Main R%d", logId, n6);
     } else {
-      snprintf(logBuf, sizeof(logBuf), "Log[%d] ?", logId);
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [Invalid Source Type %u]",
+               logId, compType);
     }
     snprintf(buffer, sizeof(buffer), "%s (W=%d)", logBuf, width);
     break;
