@@ -13,7 +13,8 @@ namespace tsl {
     public:
         KeyboardGui(searchType_t type, const std::string& initialValue, const std::string& title, 
                     std::function<void(std::string)> onComplete,
-                    std::function<std::string(std::string)> onNoteUpdate = nullptr);
+                    std::function<std::string(std::string&, size_t&)> onNoteUpdate = nullptr,
+                    bool constrained = true);
         virtual ~KeyboardGui();
 
         // Gui overrides
@@ -34,7 +35,7 @@ namespace tsl {
         std::string m_value;
         std::string m_title;
         std::function<void(std::string)> m_onComplete;
-        std::function<std::string(std::string)> m_onNoteUpdate;
+        std::function<std::string(std::string&, size_t&)> m_onNoteUpdate;
         size_t m_cursorPos = 0;
         bool m_isNumpad;
         elm::Element* m_valueDisplay = nullptr;
@@ -49,6 +50,7 @@ namespace tsl {
 
     private:
         bool m_manualOvertype = false;
+        bool m_isConstrained = true;
     };
 
 }

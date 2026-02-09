@@ -8075,17 +8075,18 @@ static const char *const math_str[] = {
     " + ",   " - ",   " * ",         " << ",   " >> ",   " & ",    " | ",
     " NOT ", " XOR ", " None/Move ", " fadd ", " fsub ", " fmul ", " fdiv "};
 static const char *const heap_str[] = {"main+", "heap+", "alias+", "aslr+",
-                                       "blank+","?","?","?","?","?","?","?",
-                                       "?","?","?","?"};
+                                       "blank+"};
 static const std::vector<u32> buttonCodes = {
     0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002,
     0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800,
     0x80001000, 0x80002000, 0x80004000, 0x80008000, 0x80100000, 0x80200000,
-    0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000};
+    0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000,
+    0x81000000, 0x82000000};
 static const std::vector<std::string> buttonNames = {
     "", "", "", "", "", "", "", "",
     "", "", "", "", "", "", "", "",
-    "", "", "", "", "", "", "", ""};
+    "", "", "", "", "", "", "", "",
+    "SL", "SR"};
 
 static bool s_noteMinimalMode = false;
 
@@ -8223,7 +8224,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                useOfs
                    ? (std::string("R") + std::to_string(ofsReg) + "+").c_str()
                    : "",
-               addr, (cond < 7) ? condition_str[cond] : "?", val,
+               addr, condition_str[cond < 7 ? cond : 5], val,
                FormatValueNote(val, width, addr).c_str());
     }
     break;
@@ -8240,9 +8241,9 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u8 regIdx = (first_dword >> 16) & 0xF;
     if (start) {
       u32 iters = GetNextDword();
-      snprintf(buffer, sizeof(buffer), "Loop Start R%X = %d", regIdx, iters);
+      snprintf(buffer, sizeof(buffer), "Loop Start R%d = %d", regIdx, iters);
     } else {
-      snprintf(buffer, sizeof(buffer), "Loop End");
+      snprintf(buffer, sizeof(buffer), "Loop End R%d", regIdx);
     }
     break;
   }
@@ -8250,7 +8251,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   {
     u8 regIdx = (first_dword >> 16) & 0xF;
     u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
-    snprintf(buffer, sizeof(buffer), "R%X = 0x%016lX%s", regIdx, val,
+    snprintf(buffer, sizeof(buffer), "R%d = 0x%016lX%s", regIdx, val,
              FormatValueNote(val, 8).c_str());
     break;
   }
@@ -8286,10 +8287,10 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u8 offReg = (first_dword >> 4) & 0xF;
     u64 val = (((u64)GetNextDword()) << 32) | GetNextDword();
     if (s_noteMinimalMode) {
-      snprintf(buffer, sizeof(buffer), "[R%X] = 0x%lX%s", regIdx, val,
+      snprintf(buffer, sizeof(buffer), "[R%d] = 0x%lX%s", regIdx, val,
                FormatValueNote(val, 8).c_str());
     } else {
-      snprintf(buffer, sizeof(buffer), "[R%X%s] = 0x%lX%s%s", regIdx,
+      snprintf(buffer, sizeof(buffer), "[R%d%s] = 0x%lX%s%s", regIdx,
                useOffSet ? (std::string("+R") + std::to_string(offReg)).c_str()
                          : "",
                val, inc ? " (Inc)" : "", FormatValueNote(val, 8).c_str());
@@ -8301,19 +8302,20 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u8 regIdx = (first_dword >> 16) & 0xF;
     u8 mathOp = (first_dword >> 12) & 0xF;
     u32 val = GetNextDword();
+    u8 width = (first_dword >> 24) & 0xF;
     if (s_noteMinimalMode) {
-      snprintf(buffer, sizeof(buffer), "R%X = R%X...%s", regIdx, regIdx,
+      snprintf(buffer, sizeof(buffer), "R%d = R%d...%s", regIdx, regIdx,
                FormatValueNote(val, 4).c_str());
     } else {
-      snprintf(buffer, sizeof(buffer), "R%X = R%X%s0x%08X%s", regIdx, regIdx,
-               (mathOp < 5) ? math_str[mathOp] : " ?", val,
-               FormatValueNote(val, 4).c_str());
+      snprintf(buffer, sizeof(buffer), "R%d = R%d%s0x%08X%s (W=%d)", regIdx, regIdx,
+               math_str[mathOp < 5 ? mathOp : 4], val,
+               FormatValueNote(val, 4).c_str(), width);
     }
     break;
   }
   case 8: // Begin Keypress Conditional Block
   {
-    u32 mask = first_dword & 0x0FFFFFFF;
+    u32 mask = first_dword;
     std::string keys = "If keys(";
     for (size_t i = 0; i < buttonCodes.size(); i++)
       if (mask & buttonCodes[i])
@@ -8336,13 +8338,13 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                  FormatValueNote(val, width).c_str());
       } else {
         snprintf(buffer, sizeof(buffer), "R%d = R%d%s0x%lX%s", dstReg, srcReg1,
-                 (mathOp < 14) ? math_str[mathOp] : " ?", val,
+                 math_str[mathOp < 14 ? mathOp : 13], val,
                  FormatValueNote(val, width).c_str());
       }
     } else {
       u8 srcReg2 = (first_dword >> 4) & 0xF;
       snprintf(buffer, sizeof(buffer), "R%d = R%d%sR%d", dstReg, srcReg1,
-               (mathOp < 14) ? math_str[mathOp] : " ?", srcReg2);
+               math_str[mathOp < 14 ? mathOp : 13], srcReg2);
     }
     break;
   }
@@ -8386,16 +8388,16 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     } else if (offType == 3) {
       u8 mType = offReg;
       snprintf(buffer, sizeof(buffer), "[%sR%d] = R%d%s (W=%d)",
-               (mType < 5 ? heap_str[mType] : "?"), addrReg, srcReg, incNote.c_str(), width);
+               heap_str[mType < 5 ? mType : 4], addrReg, srcReg, incNote.c_str(), width);
     } else if (offType >= 4) {
       u8 mType = offReg;
       u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
       if (offType == 4)
         snprintf(buffer, sizeof(buffer), "[%s0x%lX] = R%d%s (W=%d)",
-                 (mType < 5 ? heap_str[mType] : "?"), addr, srcReg, incNote.c_str(), width);
+                 heap_str[mType < 5 ? mType : 4], addr, srcReg, incNote.c_str(), width);
       else
         snprintf(buffer, sizeof(buffer), "[%sR%d+0x%lX] = R%d%s (W=%d)",
-                 (mType < 5 ? heap_str[mType] : "?"), addrReg, addr, srcReg, incNote.c_str(), width);
+                 heap_str[mType < 5 ? mType : 4], addrReg, addr, srcReg, incNote.c_str(), width);
     }
     break;
   }
@@ -8405,34 +8407,30 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u8 cond = (first_dword >> 16) & 0xF;
     u8 valReg = (first_dword >> 12) & 0xF;
     u8 compType = (first_dword >> 8) & 0xF;
-    u8 memType = (first_dword >> 4) & 0xF;
-    u8 addrReg = first_dword & 0xF;
+    u8 n6 = (first_dword >> 4) & 0xF;
+    u8 n7 = first_dword & 0xF;
     
     char condBuf[256];
     if (compType == 0) {
       // Memory Base + Relative Offset
-      u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+      u64 addr = (((u64)n7 << 32) | GetNextDword());
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [%s0x%010lX]", valReg,
-               (cond < 7) ? condition_str[cond] : "?",
-               (memType < 5) ? heap_str[memType] : "?", addr);
+               condition_str[cond < 7 ? cond : 5],
+               heap_str[n6 < 5 ? n6 : 4], addr);
     } else if (compType == 1) {
       // Memory Base + Offset Register
-      u8 offReg = first_dword & 0xF;
-      GetNextDword(); // Skip reserved dword
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [%sR%d]", valReg,
-               (cond < 7) ? condition_str[cond] : "?",
-               (memType < 5) ? heap_str[memType] : "?", offReg);
+               condition_str[cond < 7 ? cond : 5],
+               heap_str[n6 < 5 ? n6 : 4], n7);
     } else if (compType == 2) {
       // Register + Relative Offset
-      u64 addr = (((u64)(first_dword & 0xF) << 32) | GetNextDword());
+      u64 addr = (((u64)n7 << 32) | GetNextDword());
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+0x%010lX]", valReg,
-               (cond < 7) ? condition_str[cond] : "?", addrReg, addr);
+               condition_str[cond < 7 ? cond : 5], n6, addr);
     } else if (compType == 3) {
       // Register + Offset Register
-      u8 offReg = first_dword & 0xF;
-      GetNextDword(); // Skip reserved dword
       snprintf(condBuf, sizeof(condBuf), "If R%d %s [R%d+R%d]", valReg,
-               (cond < 7) ? condition_str[cond] : "?", addrReg, offReg);
+               condition_str[cond < 7 ? cond : 5], n6, n7);
     } else if (compType == 4) {
       // Static Value
       u64 val = GetNextVmInt(width);
@@ -8441,17 +8439,16 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
                  FormatValueNote(val, width).c_str());
       } else {
         snprintf(condBuf, sizeof(condBuf), "If R%d %s 0x%lX%s", valReg,
-                 (cond < 7) ? condition_str[cond] : "?", val,
+                 condition_str[cond < 7 ? cond : 5], val,
                  FormatValueNote(val, width).c_str());
       }
     } else if (compType == 5) {
       // Other Register
-      u8 otherReg = first_dword & 0xF;
       snprintf(condBuf, sizeof(condBuf), "If R%d %s R%d", valReg,
-               (cond < 7) ? condition_str[cond] : "?", otherReg);
+               condition_str[cond < 7 ? cond : 5], n6);
     } else {
       snprintf(condBuf, sizeof(condBuf), "If R%d %s ?", valReg,
-               (cond < 7) ? condition_str[cond] : "?");
+               condition_str[cond < 7 ? cond : 5]);
     }
     snprintf(buffer, sizeof(buffer), "%s (W=%d)", condBuf, width);
     break;
@@ -8488,9 +8485,37 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   case 0xFF1:
     snprintf(buffer, sizeof(buffer), "Resume Process");
     break;
-  case 0xFFF:
-    snprintf(buffer, sizeof(buffer), "Debug Log");
+  case 0xFFF: // Debug Log
+  {
+    u8 width = (first_dword >> 16) & 0xF;
+    u8 logId = (first_dword >> 12) & 0xF;
+    u8 compType = (first_dword >> 8) & 0xF;
+    u8 n6 = (first_dword >> 4) & 0xF;
+    u8 n7 = first_dword & 0xF;
+
+    char logBuf[256];
+    if (compType == 0) {
+      u64 addr = (((u64)n7 << 32) | GetNextDword());
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [%s0x%010lX]", logId,
+               heap_str[n6 < 5 ? n6 : 4], addr);
+    } else if (compType == 1) {
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [%sR%d]", logId,
+               heap_str[n6 < 5 ? n6 : 4], n7);
+    } else if (compType == 2) {
+      u64 addr = (((u64)n7 << 32) | GetNextDword());
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [R%d+0x%010lX]", logId,
+               n6, addr);
+    } else if (compType == 3) {
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main [R%d+R%d]", logId,
+               n6, n7);
+    } else if (compType == 4) {
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] Main R%d", logId, n6);
+    } else {
+      snprintf(logBuf, sizeof(logBuf), "Log[%d] ?", logId);
+    }
+    snprintf(buffer, sizeof(buffer), "%s (W=%d)", logBuf, width);
     break;
+  }
 
   default:
     snprintf(buffer, sizeof(buffer), "Opcode Type %X", type);
@@ -8500,8 +8525,344 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   return buffer;
 }
 
-class CheatEditMenu : public tsl::Gui {
+class CheatFormatManager {
 private:
+  u64 m_storedAddress = 0;        // 40 bits (AAAAA...)
+  u64 m_storedRelativeOffset = 0; // 40 bits (aaaaa...)
+  u64 m_storedValue = 0;          // 64 bits (VVVVVVVVVVVVVVVV)
+  
+  char m_nibbleBackup[32] = {0}; 
+  u32 m_lastType = 0xFFFFFFFF;
+  u8 m_lastWidth = 0;
+  bool m_initialized = false;
+
+  u8 vWidth = 4;        // T (0, 1, 5, 6, 7, 9, A, C0, FFF)
+  u8 vMemRegion = 0;    // M (0, 1, 5, C0, FFF)
+  u8 vRegDest = 15;     // R/D (3, 4, 5, 7, 9, C1)
+  u8 vRegSource = 0;    // S (5, 9, A, C0, C1, C3)
+  u8 vRegOffset = 1;    // r/s/X (1, 6, 9, A)
+  u8 vRegBase = 15;     // R (0, 6, A)
+  u8 vCondition = 5;    // C/c (1, C0)
+  u8 vArithOp = 0;      // C (7, 9)
+  u8 vOpType = 0;       // X/O/x (1, A, C0, C1, C2, FFF)
+  u8 vEndType = 0;      // X (2)
+  u8 vIncFlag = 0;      // I (6, A)
+  u8 vLogID = 0;        // I (FFF)
+  u8 vImmFlag = 0;      // X (bit for 9)
+  u32 vBitMask = 0;     // XXXX / kkkk (8, C2, C4)
+  u8 vStaticIdx = 0;    // XX (C3)
+  u8 vCode5Type = 0;    // type 5 sub (5)
+  u8 vOffsetEnable = 0; // o (6)
+  u8 vAddressNib = 0;   // AA (0, 1, 5)
+  u8 vOffsetNib = 0;    // aa (A, C0, FFF)
+
+  static u8 n_nibble(u32 dword, int i) { return (dword >> (28 - i * 4)) & 0xF; }
+
+  void updateStored(const std::vector<u32> &dwords, u32 type) {
+    if (dwords.size() < 2) return;
+    // 1. Address Tracking
+    switch (type) {
+      case 0x0: case 0x4: case 0x5:
+        m_storedAddress = ((u64)(dwords[0] & 0xFF) << 32) | dwords[1];
+        m_storedAddress &= 0xFFFFFFFFFFULL;
+        vAddressNib = (u8)(m_storedAddress >> 32);
+        break;
+      case 0x1:
+        m_storedAddress = ((u64)(dwords[0] & 0xFF) << 32) | dwords[1];
+        m_storedAddress &= 0xFFFFFFFFFFULL;
+        vAddressNib = (u8)(m_storedAddress >> 32);
+        break;
+    }
+    // 2. Relative Offset Tracking
+    switch (type) {
+      case 0xA:
+        if (vOpType == 2 || vOpType == 4 || vOpType == 5) {
+          m_storedRelativeOffset = ((u64)(dwords[0] & 0xF) << 32) | dwords[1];
+          m_storedRelativeOffset &= 0xFFFFFFFFFFULL;
+          vOffsetNib = (u8)(m_storedRelativeOffset >> 32);
+        }
+        break;
+      case 0xC0: case 0xFFF:
+        m_storedRelativeOffset = ((u64)(dwords[0] & 0xF) << 32) | dwords[1];
+        m_storedRelativeOffset &= 0xFFFFFFFFFFULL;
+        vOffsetNib = (u8)(m_storedRelativeOffset >> 32);
+        break;
+    }
+    // 3. Value Tracking (VVVVV...)
+    switch (type) {
+      case 0x0: case 0x1:
+        if (vWidth == 8 && dwords.size() >= 4) m_storedValue = (((u64)dwords[2]) << 32) | dwords[3];
+        else if (vWidth == 4 && dwords.size() >= 3) m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | dwords[2];
+        else if (vWidth == 2 && dwords.size() >= 3) m_storedValue = (m_storedValue & 0xFFFFFFFFFFFF0000ULL) | (dwords[2] & 0xFFFF);
+        else if (vWidth == 1 && dwords.size() >= 3) m_storedValue = (m_storedValue & 0xFFFFFFFFFFFFFF00ULL) | (dwords[2] & 0xFF);
+        break;
+      case 0xC0:
+        if (vOpType == 4) {
+          if (vWidth == 8 && dwords.size() >= 3) m_storedValue = (((u64)dwords[1]) << 32) | dwords[2];
+          else if (dwords.size() >= 2) m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | dwords[1];
+        }
+        break;
+      case 0x4: case 0x6: if (dwords.size() >= 4) m_storedValue = (((u64)dwords[2]) << 32) | dwords[3]; break;
+      case 0x3: case 0x7: case 0x9:
+        if (vWidth == 8 && dwords.size() >= 3) m_storedValue = (((u64)dwords[1]) << 32) | dwords[2];
+        else if (dwords.size() >= 2) m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | dwords[1];
+        break;
+    }
+  }
+
+  void applyStored(std::vector<u32> &dwords, u32 type) {
+    if (dwords.size() < 1) return;
+    // 1. Address Apply
+    switch (type) {
+      case 0x0: case 0x4: case 0x5:
+        vAddressNib = (u8)(m_storedAddress >> 32);
+        dwords[0] = (dwords[0] & 0xFFFFFF00) | (u32)vAddressNib;
+        if (dwords.size() > 1) dwords[1] = (u32)(m_storedAddress & 0xFFFFFFFF);
+        break;
+      case 0x1:
+        vAddressNib = (u8)(m_storedAddress >> 32);
+        dwords[0] = (dwords[0] & 0xFFFFFF00) | (u32)vAddressNib;
+        if (dwords.size() > 1) dwords[1] = (u32)(m_storedAddress & 0xFFFFFFFF);
+        break;
+    }
+    // 2. Relative Offset Apply
+    switch (type) {
+      case 0xA:
+        if (vOpType == 2 || vOpType == 4 || vOpType == 5) {
+          vOffsetNib = (u8)(m_storedRelativeOffset >> 32) & 0xF;
+          dwords[0] = (dwords[0] & 0xFFFFFFF0) | (u32)vOffsetNib;
+          if (dwords.size() > 1) dwords[1] = (u32)(m_storedRelativeOffset & 0xFFFFFFFF);
+        }
+        break;
+      case 0xC0: case 0xFFF:
+        if (vOpType == 0 || vOpType == 2) {
+          vOffsetNib = (u8)(m_storedRelativeOffset >> 32) & 0xF;
+          dwords[0] = (dwords[0] & 0xFFFFFFF0) | (u32)vOffsetNib;
+          if (dwords.size() > 1) dwords[1] = (u32)(m_storedRelativeOffset & 0xFFFFFFFF);
+        }
+        break;
+    }
+    // 3. Value Apply
+    switch (type) {
+      case 0x0: case 0x1:
+        if (vWidth == 8 && dwords.size() >= 4) { dwords[2] = (u32)(m_storedValue >> 32); dwords[3] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        else if (dwords.size() >= 3) {
+            if (vWidth == 4) dwords[2] = (u32)(m_storedValue & 0xFFFFFFFF);
+            else if (vWidth == 2) dwords[2] = (u32)(m_storedValue & 0xFFFF);
+            else if (vWidth == 1) dwords[2] = (u32)(m_storedValue & 0xFF);
+        }
+        break;
+      case 0xC0:
+        if (vOpType == 4) {
+          if (vWidth == 8 && dwords.size() >= 3) { dwords[1] = (u32)(m_storedValue >> 32); dwords[2] = (u32)(m_storedValue & 0xFFFFFFFF); }
+          else if (dwords.size() >= 2) { dwords[1] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        }
+        break;
+      case 0x4: case 0x6:
+        if (dwords.size() >= 4) { dwords[2] = (u32)(m_storedValue >> 32); dwords[3] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        break;
+      case 0x3: case 0x7: case 0x9:
+        if (vWidth == 8 && dwords.size() >= 3) { dwords[1] = (u32)(m_storedValue >> 32); dwords[2] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        else if (dwords.size() >= 2) { dwords[1] = (u32)(m_storedValue & 0xFFFFFFFF); }
+        break;
+    }
+  }
+
+  void syncVariables(u32 dword, u32 type) {
+    auto n = [&](int i) -> u8 { return n_nibble(dword, i); };
+    if (type < 0xC) {
+      if (type == 0x0) { vWidth = n(1); vMemRegion = n(2); vRegBase = n(3); vAddressNib = (n(6) << 4) | n(7); }
+      else if (type == 0x1) { vWidth = n(1); vMemRegion = n(2); vCondition = n(3); vOpType = n(4); vRegOffset = n(5); vAddressNib = (n(6) << 4) | n(7); }
+      else if (type == 0x2) { vEndType = n(1); }
+      else if (type == 0x3) { vOpType = n(1); vRegDest = n(3); } // OpType 0=Start, 1=End
+      else if (type == 0x4) { vRegDest = n(3); }
+      else if (type == 0x5) { 
+          vWidth = n(1);
+          vRegDest = n(3); vCode5Type = n(4);
+          if (vCode5Type == 0 || vCode5Type == 3) vMemRegion = n(2);
+          if (vCode5Type == 2 || vCode5Type == 3) vRegSource = n(5);
+          vAddressNib = (n(6) << 4) | n(7);
+      }
+      else if (type == 0x6) { vWidth = n(1); vRegBase = n(3); vIncFlag = n(4); vOffsetEnable = n(5); vRegOffset = n(6); }
+      else if (type == 0x7) { vWidth = n(1); vRegDest = n(3); vArithOp = n(4); }
+      else if (type == 0x8) { vBitMask = dword & 0x0FFFFFFF; }
+      else if (type == 0x9) { vWidth = n(1); vArithOp = n(2); vRegDest = n(3); vRegSource = n(4); vImmFlag = n(5); vRegOffset = n(6); }
+      else if (type == 0xA) { vWidth = n(1); vRegSource = n(2); vRegBase = n(3); vIncFlag = n(4); vOpType = n(5); vRegOffset = n(6); vOffsetNib = n(7); }
+    } else if (type == 0xC0) {
+      vWidth = n(2); vCondition = n(3); vRegSource = n(4); vOpType = n(5);
+      if (vOpType == 2 || vOpType == 3 || vOpType == 5) vRegBase = n(6); else vMemRegion = n(6);
+      if (vOpType == 1 || vOpType == 3) vRegOffset = n(7); else vOffsetNib = n(7);
+    } else if (type == 0xC1) {
+      vRegDest = n(3); vRegSource = n(5); vOpType = n(6);
+    } else if (type == 0xC2) {
+      vOpType = n(1); vBitMask = (u16)(dword & 0xFFFF);
+    } else if (type == 0xC3) {
+      vStaticIdx = (u8)((dword >> 4) & 0xFF); vRegSource = n(7);
+    } else if (type == 0xFFF) {
+      vWidth = n(3); vLogID = n(4); vOpType = n(5);
+      if (vOpType == 2 || vOpType == 3 || vOpType == 4) vRegBase = n(6); else vMemRegion = n(6);
+      if (vOpType == 1 || vOpType == 3) vRegOffset = n(7); else vOffsetNib = n(7);
+    }
+  }
+
+  void applyVariables(u32 &dword, u32 type) {
+    auto set = [&](int i, u8 val) { dword = (dword & ~(0xF << (28 - i * 4))) | ((u32)(val & 0xF) << (28 - i * 4)); };
+    if (type < 0xC) {
+      set(1, vWidth);
+      if (type == 0x0) { set(2, vMemRegion); set(3, vRegBase); set(4, 0); set(5, 0); set(6, vAddressNib >> 4); set(7, vAddressNib); }
+      else if (type == 0x1) { set(2, vMemRegion); set(3, vCondition); set(4, vOpType); set(5, vRegOffset); set(6, vAddressNib >> 4); set(7, vAddressNib); }
+      else if (type == 0x2) { set(1, vEndType); for(int i=2; i<8; i++) set(i, 0); }
+      else if (type == 0x3) { set(1, vOpType); set(2, 0); set(3, vRegDest); for(int i=4; i<8; i++) set(i, 0); }
+      else if (type == 0x4) { set(1, 0); set(2, 0); set(3, vRegDest); for(int i=4; i<8; i++) set(i, 0); }
+      else if (type == 0x5) { 
+          set(2, (vCode5Type == 0 || vCode5Type == 3) ? vMemRegion : 0);
+          set(3, vRegDest); set(4, vCode5Type);
+          set(5, (vCode5Type == 2 || vCode5Type == 3) ? vRegSource : 0);
+          set(6, vAddressNib >> 4); set(7, vAddressNib);
+      }
+      else if (type == 0x6) { set(2, 0); set(3, vRegBase); set(4, vIncFlag); set(5, vOffsetEnable); set(6, vRegOffset); set(7, 0); }
+      else if (type == 0x7) { set(2, 0); set(3, vRegDest); set(4, vArithOp); set(5, 0); set(6, 0); set(7, 0); }
+      else if (type == 0x8) { dword = (0x80000000 | (vBitMask & 0x0FFFFFFF)); }
+      else if (type == 0x9) { set(2, vArithOp); set(3, vRegDest); set(4, vRegSource); set(5, vImmFlag); set(6, vRegOffset); set(7, 0); }
+      else if (type == 0xA) { set(2, vRegSource); set(3, vRegBase); set(4, vIncFlag); set(5, vOpType); set(6, vRegOffset); set(7, vOffsetNib); }
+    } else if (type == 0xC0) {
+      set(2, vWidth); set(3, vCondition); set(4, vRegSource); set(5, vOpType);
+      set(6, (vOpType == 2 || vOpType == 3 || vOpType == 5) ? vRegBase : vMemRegion);
+      set(7, (vOpType == 1 || vOpType == 3) ? vRegOffset : vOffsetNib);
+    } else if (type == 0xC1) {
+      set(2, 0); set(3, vRegDest); set(4, 0); set(5, vRegSource); set(6, vOpType); set(7, 0);
+    } else if (type == 0xC2) {
+      dword = (0xC2000000 | ((u32)(vOpType & 0xF) << 20) | (vBitMask & 0xFFFF));
+    } else if (type == 0xC3) {
+      dword = (0xC3000000 | ((u32)vStaticIdx << 4) | (vRegSource & 0xF));
+    } else if (type == 0xFFF) {
+      set(3, vWidth); set(4, vLogID); set(5, vOpType);
+      set(6, (vOpType == 2 || vOpType == 3 || vOpType == 4) ? vRegBase : vMemRegion);
+      set(7, (vOpType == 1 || vOpType == 3) ? vRegOffset : vOffsetNib);
+    }
+  }
+
+public:
+  CheatFormatManager() {
+    memset(m_nibbleBackup, '0', 32);
+  }
+
+  std::string processEdit(std::string &hex, size_t &cursor) {
+    std::string inputDigits;
+    for (char c : hex) if (isxdigit(c)) inputDigits += toupper(c);
+    if (inputDigits.empty()) return "";
+
+    for (size_t i = 0; i < inputDigits.length() && i < 32; i++) m_nibbleBackup[i] = inputDigits[i];
+
+    u32 firstRaw = std::strtoul(std::string(m_nibbleBackup, 8).c_str(), nullptr, 16);
+    u32 type = (firstRaw >> 28) & 0xF;
+    if (type >= 0xC) type = (type << 4) | ((firstRaw >> 24) & 0xF);
+
+    // Build current dwords from input
+    std::vector<u32> dwords;
+    for (size_t i = 0; i < 32; i += 8) dwords.push_back(std::strtoul(std::string(m_nibbleBackup + i, 8).c_str(), nullptr, 16));
+
+    if (!m_initialized) {
+        syncVariables(firstRaw, type);
+        updateStored(dwords, type);
+        m_initialized = true;
+    } else {
+        u8 inputT = 0;
+        bool hasWidth = false;
+        if (type < 0xC) {
+            if (type != 2 && type != 3 && type != 4 && type != 8) { inputT = n_nibble(firstRaw, 1); hasWidth = true; }
+        } else if (type == 0xC0 || type == 0xFFF) {
+            inputT = n_nibble(firstRaw, 2); hasWidth = true;
+        }
+
+        bool typeChanged = (type != m_lastType);
+        bool widthChanged = !typeChanged && hasWidth && (inputT != m_lastWidth && (inputT == 1 || inputT == 2 || inputT == 4 || inputT == 8));
+        
+        if (typeChanged || widthChanged) {
+            if (widthChanged) vWidth = inputT;
+            applyStored(dwords, type); 
+        } else {
+            syncVariables(firstRaw, type);
+            updateStored(dwords, type);
+        }
+    }
+
+    // Strict Enforcement of variable ranges
+    if (vWidth != 1 && vWidth != 2 && vWidth != 4 && vWidth != 8) vWidth = 4;
+    if (vMemRegion > 4) vMemRegion = 4;
+    if (vCondition < 1 || vCondition > 6) vCondition = 5;
+    if (vArithOp > 13) vArithOp = 0;
+    if (type == 0x7 && vArithOp > 4) vArithOp = 0;
+    if (vEndType > 1) vEndType = 0;
+    if (vIncFlag > 1) vIncFlag = 0;
+    if (vImmFlag > 1) vImmFlag = 0;
+    if (vCode5Type > 3) vCode5Type = 0;
+    if (vOffsetEnable > 1) vOffsetEnable = 0;
+    
+    // OpType limits based on code type
+    if (type == 0x1 && vOpType > 1) vOpType = 0;
+    if (type == 0x3 && vOpType > 1) vOpType = 0;
+    if (type == 0xA && vOpType > 5) vOpType = 0;
+    if (type == 0xC0 && vOpType > 5) vOpType = 0;
+    if (type == 0xC1 && vOpType > 3) vOpType = 0;
+    if (type == 0xC2 && vOpType > 3) vOpType = 0;
+    if (type == 0xFFF && vOpType > 4) vOpType = 0;
+
+    // Reg limits (already 4-bit via applying, but for logic safety)
+    if (vRegDest > 15) vRegDest = 15;
+    if (vRegSource > 15) vRegSource = 15;
+    if (vRegOffset > 15) vRegOffset = 15;
+    if (vRegBase > 15) vRegBase = 15;
+
+    // Special: Code A vRegOffset used as MemRegion if vOpType >= 3
+    if (type == 0xA && vOpType >= 3 && vRegOffset > 4) vRegOffset = 4;
+
+    // Apply owner variables back to the opcode
+    applyVariables(dwords[0], type);
+    m_lastType = type; m_lastWidth = vWidth;
+
+    // Resize and apply consistent variables
+    size_t targetCount = 1;
+    if (type == 0x0 || type == 0x1) targetCount = (vWidth == 8) ? 4 : 3;
+    else if (type == 0x2) targetCount = 1;
+    else if (type == 0x3) targetCount = (dwords[0] & 0x01000000) ? 1 : 2;
+    else if (type == 0x4 || type == 0x6) targetCount = 3;
+    else if (type == 0x5) targetCount = 2; 
+    else if (type == 0x7) targetCount = 2;
+    else if (type == 0x8) targetCount = 1;
+    else if (type == 0x9) targetCount = ((vImmFlag == 1) ? ((vWidth == 8) ? 3 : 2) : 1);
+    else if (type == 0xA) targetCount = (vOpType == 2 || vOpType == 4 || vOpType == 5) ? 2 : 1;
+    else if (type == 0xC0) {
+        if (vOpType == 1 || vOpType == 3 || vOpType == 5) targetCount = 1;
+        else if (vOpType == 4) targetCount = (vWidth == 8) ? 3 : 2;
+        else targetCount = 2; // types 0 and 2
+    }
+    else if (type == 0xFFF) targetCount = (vOpType == 1 || vOpType == 3 || vOpType == 4) ? 1 : 2;
+
+    if (dwords.size() > targetCount) dwords.resize(targetCount);
+    while (dwords.size() < targetCount) dwords.push_back(0);
+
+
+    // 8. Finalize hex string and update cursor if needed
+    std::string result;
+    for (size_t i = 0; i < dwords.size(); i++) {
+        char buf[10]; snprintf(buf, sizeof(buf), "%08X", dwords[i]);
+        result += buf; if (i < dwords.size() - 1) result += " ";
+    }
+    hex = result;
+    if (cursor > hex.length()) cursor = hex.length();
+
+    // Re-sync backup with validated dwords to ensure any "un-backuppable" zeroes (reserved fields) are reflected
+    std::string finalClean;
+    for (char c : hex) if (isxdigit(c)) finalClean += c;
+    for (size_t i = 0; i < finalClean.length() && i < 32; i++) m_nibbleBackup[i] = finalClean[i];
+
+    size_t idx = 0;
+    return WrapNote(GetOpcodeNote(dwords, idx), 45);
+  }
+};
+
+class CheatEditMenu : public tsl::Gui {
   u32 m_cheatId;
   std::string m_cheatName;
   bool m_enabled;
@@ -8589,7 +8950,9 @@ public:
                                           // handleConfirm skipping it when
                                           // callback exists
                                           tsl::goBack();
-                                        });
+                                        },
+                                        nullptr,
+                                        false);
         return true;
       }
       return false;
@@ -8848,6 +9211,8 @@ public:
             std::string val = listItem->m_text;
             u32 fIdx = proxy->m_focusedIndex;
 
+            auto fmtMgr = std::make_shared<CheatFormatManager>();
+
             tsl::changeTo<tsl::KeyboardGui>(
                 SEARCH_TYPE_HEX, val, "Edit Hex",
                 [this, proxy, fIdx](std::string result) {
@@ -8861,26 +9226,10 @@ public:
                   }
                   tsl::goBack();
                 },
-                [](std::string currentVal) -> std::string {
-                  std::vector<u32> dwords;
-                  std::string hex;
-                  for (char c : currentVal) {
-                    if (isxdigit(c))
-                      hex += c;
-                    else if (!hex.empty()) {
-                      dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
-                      hex.clear();
-                    }
-                  }
-                  if (!hex.empty())
-                    dwords.push_back(std::strtoul(hex.c_str(), nullptr, 16));
-
-                  if (!dwords.empty()) {
-                    size_t idx = 0;
-                    return WrapNote(GetOpcodeNote(dwords, idx), 45);
-                  }
-                  return "";
-                });
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
+                  return fmtMgr->processEdit(currentVal, cursor);
+                },
+                true);
             return true;
           }
         }
@@ -12421,9 +12770,10 @@ namespace tsl {
 KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
                          const std::string &title,
                          std::function<void(std::string)> onComplete,
-                         std::function<std::string(std::string)> onNoteUpdate)
+                         std::function<std::string(std::string&, size_t&)> onNoteUpdate,
+                         bool constrained)
     : m_type(type), m_value(initialValue), m_title(title),
-      m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate) {
+      m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate), m_isConstrained(constrained) {
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
   m_cursorPos = m_value.length();
   tsl::disableJumpTo = true;
@@ -12434,7 +12784,7 @@ KeyboardGui::~KeyboardGui() { tsl::disableJumpTo = false; }
 elm::Element *KeyboardGui::createUI() {
   std::string initialNote = "";
   if (m_onNoteUpdate)
-    initialNote = m_onNoteUpdate(m_value);
+    initialNote = m_onNoteUpdate(m_value, m_cursorPos);
   auto *frame = new KeyboardFrame(m_title, initialNote);
   m_frame = frame;
   auto *list = new elm::List();
@@ -12671,7 +13021,13 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
 
     s_noteMinimalMode = !s_noteMinimalMode;
     if (m_onNoteUpdate && m_frame) {
-      m_frame->setSubtitle(m_onNoteUpdate(m_value));
+      if (m_isConstrained) {
+        m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+      } else {
+        std::string valCopy = m_value;
+        size_t cursorCopy = m_cursorPos;
+        m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+      }
     }
     return true;
   }
@@ -12691,7 +13047,13 @@ void KeyboardGui::handleKeyPress(char c) {
   }
 
   if (m_onNoteUpdate && m_frame) {
-    m_frame->setSubtitle(m_onNoteUpdate(m_value));
+    if (m_isConstrained) {
+      m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+    } else {
+      std::string valCopy = m_value;
+      size_t cursorCopy = m_cursorPos;
+      m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+    }
   }
 }
 
@@ -12706,7 +13068,13 @@ void KeyboardGui::handleBackspace() {
     m_value.erase(m_cursorPos - 1, 1);
     m_cursorPos--;
     if (m_onNoteUpdate && m_frame) {
-      m_frame->setSubtitle(m_onNoteUpdate(m_value));
+      if (m_isConstrained) {
+        m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+      } else {
+        std::string valCopy = m_value;
+        size_t cursorCopy = m_cursorPos;
+        m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+      }
     }
   }
 }
@@ -12732,6 +13100,7 @@ void KeyboardGui::switchType(searchType_t newType) {
 
 // Implement helper
 bool KeyboardGui::isOvertypeMode() const {
+  if (!m_isConstrained) return m_manualOvertype;
   return (m_type == SEARCH_TYPE_HEX && m_cursorPos < 8) || m_manualOvertype;
 }
 } // namespace tsl
