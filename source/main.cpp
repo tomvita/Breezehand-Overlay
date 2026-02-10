@@ -8842,6 +8842,156 @@ private:
     return s.substr(b, e - b);
   }
 
+  static std::string normalizeAsmText(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prevSpace = false;
+    for (char c : s) {
+      const unsigned char uc = static_cast<unsigned char>(c);
+      if (std::isspace(uc)) {
+        if (!out.empty() && !prevSpace) {
+          out.push_back(' ');
+          prevSpace = true;
+        }
+        continue;
+      }
+      const char lc = static_cast<char>(std::tolower(uc));
+      if (lc == ',') {
+        if (!out.empty() && out.back() == ' ')
+          out.pop_back();
+        out.push_back(',');
+        prevSpace = false;
+        continue;
+      }
+      out.push_back(lc);
+      prevSpace = false;
+    }
+    while (!out.empty() && out.back() == ' ')
+      out.pop_back();
+    return out;
+  }
+
+  static bool tryParseRegisterToken(const std::string &tok, u8 &reg) {
+    if (tok.size() < 2 || tok[0] != 'x')
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    long n = std::strtol(tok.c_str() + 1, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || n < 0 || n > 30)
+      return false;
+    reg = static_cast<u8>(n);
+    return true;
+  }
+
+  static bool tryParseUImm(const std::string &tok, unsigned long &imm, unsigned long maxVal) {
+    std::string t = tok;
+    if (!t.empty() && t[0] == '#')
+      t.erase(0, 1);
+    if (t.empty())
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    unsigned long v = std::strtoul(t.c_str(), &end, 0);
+    if (errno != 0 || !end || *end != '\0' || v > maxVal)
+      return false;
+    imm = v;
+    return true;
+  }
+
+  static bool tryParseHexOpcode(const std::string &input, u32 &opcodeOut) {
+    std::string t = trimCopy(input);
+    if (t.empty())
+      return false;
+
+    std::string clean;
+    clean.reserve(t.size());
+    for (char c : t) {
+      if (!std::isspace(static_cast<unsigned char>(c)) && c != '_')
+        clean.push_back(c);
+    }
+
+    if (clean.size() > 2 && clean[0] == '0' &&
+        (clean[1] == 'x' || clean[1] == 'X')) {
+      clean.erase(0, 2);
+    }
+
+    if (clean.empty() || clean.size() > 8)
+      return false;
+    for (char c : clean) {
+      if (!std::isxdigit(static_cast<unsigned char>(c)))
+        return false;
+    }
+
+    char *end = nullptr;
+    errno = 0;
+    unsigned long v = std::strtoul(clean.c_str(), &end, 16);
+    if (errno != 0 || !end || *end != '\0')
+      return false;
+    opcodeOut = static_cast<u32>(v);
+    return true;
+  }
+
+  bool tryAssembleArm64(const std::string &input, u32 &opcodeOut) const {
+    // Always allow raw opcode entry as a fallback assembly path.
+    if (tryParseHexOpcode(input, opcodeOut))
+      return true;
+
+    const std::string normInput = normalizeAsmText(input);
+    if (normInput.empty())
+      return false;
+
+    // If user kept the disassembled text (possibly with spacing/case edits), keep the same opcode.
+    const std::string dis = DisassembleARM64(static_cast<u32>(m_storedValue), m_storedAddress);
+    if (!dis.empty() && normalizeAsmText(dis) == normInput) {
+      opcodeOut = static_cast<u32>(m_storedValue);
+      return true;
+    }
+
+    // Minimal built-in assembler for common instruction forms.
+    if (normInput == "nop")   { opcodeOut = 0xD503201F; return true; }
+    if (normInput == "yield") { opcodeOut = 0xD503203F; return true; }
+    if (normInput == "wfe")   { opcodeOut = 0xD503205F; return true; }
+    if (normInput == "wfi")   { opcodeOut = 0xD503207F; return true; }
+    if (normInput == "sev")   { opcodeOut = 0xD503209F; return true; }
+    if (normInput == "sevl")  { opcodeOut = 0xD50320BF; return true; }
+    if (normInput == "ret")   { opcodeOut = 0xD65F03C0; return true; }
+
+    auto parseSingleRegOp = [&](const char *mnemonic, u32 base) -> bool {
+      const std::string prefix = std::string(mnemonic) + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+      const std::string tok = trimCopy(normInput.substr(prefix.size()));
+      u8 reg = 0;
+      if (!tryParseRegisterToken(tok, reg))
+        return false;
+      opcodeOut = base | (static_cast<u32>(reg) << 5);
+      return true;
+    };
+
+    if (parseSingleRegOp("ret", 0xD65F0000)) return true;
+    if (parseSingleRegOp("br",  0xD61F0000)) return true;
+    if (parseSingleRegOp("blr", 0xD63F0000)) return true;
+
+    auto parseTrapOp = [&](const char *mnemonic, u32 base) -> bool {
+      const std::string prefix = std::string(mnemonic) + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+      unsigned long imm = 0;
+      if (!tryParseUImm(trimCopy(normInput.substr(prefix.size())), imm, 0xFFFF))
+        return false;
+      opcodeOut = base | (static_cast<u32>(imm) << 5);
+      return true;
+    };
+
+    if (parseTrapOp("svc", 0xD4000001)) return true;
+    if (parseTrapOp("hvc", 0xD4000002)) return true;
+    if (parseTrapOp("smc", 0xD4000003)) return true;
+    if (parseTrapOp("brk", 0xD4200000)) return true;
+    if (parseTrapOp("hlt", 0xD4400000)) return true;
+
+    return false;
+  }
+
   static std::vector<u32> parseDwords(const std::string &hex) {
     std::vector<u32> out;
     std::string token;
@@ -8933,6 +9083,12 @@ public:
     return oss.str();
   }
 
+  std::string getStoredValueAsmText(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    if (vWidth != 4) return "";
+    return DisassembleARM64(static_cast<u32>(m_storedValue), m_storedAddress);
+  }
+
   bool setStoredValueFromIntegerText(std::string &hex, size_t &cursor, const std::string &input) {
     processEdit(hex, cursor);
     std::string t = trimCopy(input);
@@ -8993,6 +9149,17 @@ public:
   bool clearStoredValue(std::string &hex, size_t &cursor) {
     processEdit(hex, cursor);
     m_storedValue = 0;
+    if (!applyStoredValueToHex(hex, cursor)) return false;
+    processEdit(hex, cursor);
+    return true;
+  }
+
+  bool setStoredValueFromAsmText(std::string &hex, size_t &cursor, const std::string &input) {
+    processEdit(hex, cursor);
+    if (vWidth != 4) return false;
+    u32 opcode = 0;
+    if (!tryAssembleArm64(input, opcode)) return false;
+    m_storedValue = (m_storedValue & 0xFFFFFFFF00000000ULL) | static_cast<u64>(opcode);
     if (!applyStoredValueToHex(hex, cursor)) return false;
     processEdit(hex, cursor);
     return true;
@@ -9502,6 +9669,12 @@ public:
                 },
                 [fmtMgr](std::string &currentVal, size_t &cursor, const std::string &input) -> bool {
                   return fmtMgr->setStoredValueFromFloatText(currentVal, cursor, input);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> std::string {
+                  return fmtMgr->getStoredValueAsmText(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, const std::string &input) -> bool {
+                  return fmtMgr->setStoredValueFromAsmText(currentVal, cursor, input);
                 },
                 [fmtMgr](std::string &currentVal, size_t &cursor) -> bool {
                   return fmtMgr->clearStoredValue(currentVal, cursor);
@@ -13079,6 +13252,8 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
                          std::function<bool(std::string&, size_t&, const std::string&)> onApplySignedEdit,
                          std::function<bool(std::string&, size_t&, const std::string&)> onApplyUnsignedEdit,
                          std::function<bool(std::string&, size_t&, const std::string&)> onApplyFloatEdit,
+                         std::function<std::string(std::string&, size_t&)> onGetAsmEditValue,
+                         std::function<bool(std::string&, size_t&, const std::string&)> onApplyAsmEdit,
                          std::function<bool(std::string&, size_t&)> onClearStoredValue)
     : m_type(type), m_value(initialValue), m_title(title),
       m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate),
@@ -13088,6 +13263,8 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
       m_onApplySignedEdit(onApplySignedEdit),
       m_onApplyUnsignedEdit(onApplyUnsignedEdit),
       m_onApplyFloatEdit(onApplyFloatEdit),
+      m_onGetAsmEditValue(onGetAsmEditValue),
+      m_onApplyAsmEdit(onApplyAsmEdit),
       m_onClearStoredValue(onClearStoredValue),
       m_isConstrained(constrained) {
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
@@ -13127,7 +13304,7 @@ elm::Element *KeyboardGui::createUI() {
   }
 
   if (m_type == SEARCH_TYPE_HEX) {
-    if (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onClearStoredValue) {
+    if (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onGetAsmEditValue || m_onClearStoredValue) {
       auto *topRow = new KeyboardRow();
       topRow->addButton(new KeyboardButton("[s]", [this] {
         if (!m_onGetSignedEditValue || !m_onApplySignedEdit) return;
@@ -13195,6 +13372,39 @@ elm::Element *KeyboardGui::createUI() {
               if (m_onApplyFloatEdit &&
                   m_onApplyFloatEdit(m_value, m_cursorPos, result) &&
                   m_onNoteUpdate && m_frame) {
+                if (m_isConstrained) {
+                  m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+                } else {
+                  std::string valCopy = m_value;
+                  size_t cursorCopy = m_cursorPos;
+                  m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+                }
+              }
+              tsl::goBack();
+            },
+            nullptr, false);
+      }));
+      topRow->addButton(new KeyboardButton("ASM", [this] {
+        if (!m_onGetAsmEditValue || !m_onApplyAsmEdit) return;
+        std::string initial;
+        {
+          std::lock_guard<std::recursive_mutex> lock(m_mutex);
+          initial = m_onGetAsmEditValue(m_value, m_cursorPos);
+        }
+        if (initial.empty()) {
+          tsl::notification->show("ASM edit: width must be 4");
+          return;
+        }
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_TEXT, initial, "Edit ASM",
+            [this](std::string result) {
+              std::lock_guard<std::recursive_mutex> lock(m_mutex);
+              if (!m_onApplyAsmEdit ||
+                  !m_onApplyAsmEdit(m_value, m_cursorPos, result)) {
+                tsl::notification->show("ASM assemble failed");
+                return;
+              }
+              if (m_onNoteUpdate && m_frame) {
                 if (m_isConstrained) {
                   m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
                 } else {
@@ -13600,6 +13810,7 @@ void KeyboardGui::switchType(searchType_t newType) {
                            m_onNoteUpdate, m_isConstrained,
                            m_onGetSignedEditValue, m_onGetUnsignedEditValue, m_onGetFloatEditValue,
                            m_onApplySignedEdit, m_onApplyUnsignedEdit, m_onApplyFloatEdit,
+                           m_onGetAsmEditValue, m_onApplyAsmEdit,
                            m_onClearStoredValue);
 }
 
