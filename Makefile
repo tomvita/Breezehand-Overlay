@@ -107,6 +107,22 @@ endif
 # Enable fstream (ideally for other overlays want full fstream instead of FILE*)
 #USING_FSTREAM_DIRECTIVE := 0
 #CFLAGS += -DUSING_FSTREAM_DIRECTIVE=$(USING_FSTREAM_DIRECTIVE)
+# Optional: use Keystone as ASM backend (broader instruction coverage).
+# Disabled by default to keep binary/memory overhead low.
+USE_KEYSTONE_ASM ?= 0
+CFLAGS += -DUSE_KEYSTONE_ASM=$(USE_KEYSTONE_ASM)
+# Local Keystone checkout root (override if needed).
+KEYSTONE_ROOT ?= $(TOPDIR)/../keystone
+ifeq ($(wildcard $(KEYSTONE_ROOT)/include/keystone/keystone.h),)
+ifneq ($(wildcard /c/GitHub/keystone/include/keystone/keystone.h),)
+KEYSTONE_ROOT := /c/GitHub/keystone
+endif
+endif
+ifeq ($(wildcard $(KEYSTONE_ROOT)/include/keystone/keystone.h),)
+ifneq ($(wildcard /mnt/c/GitHub/keystone/include/keystone/keystone.h),)
+KEYSTONE_ROOT := /mnt/c/GitHub/keystone
+endif
+endif
 #---------------------------------------------------------------------------------
 
 
@@ -117,6 +133,13 @@ LDFLAGS += -flto -fuse-linker-plugin -specs=$(DEVKITPRO)/libnx/switch.specs $(AR
 
 # Essential libraries for Ultrahand Overlay
 LIBS := -lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto -lnx
+ifeq ($(strip $(USE_KEYSTONE_ASM)),1)
+LIBS += -lkeystone
+INCLUDES += $(KEYSTONE_ROOT)/include
+LIBDIRS += $(KEYSTONE_ROOT)
+CFLAGS += -I$(KEYSTONE_ROOT)/include
+LDFLAGS += -L$(KEYSTONE_ROOT)/lib
+endif
 
 CXXFLAGS += -fno-exceptions -ffunction-sections -fdata-sections -fno-rtti
 LDFLAGS += -Wl,--as-needed -Wl,--gc-sections
@@ -203,7 +226,7 @@ export OFILES_SRC := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
 export OFILES := $(OFILES_BIN) $(OFILES_SRC)
 export HFILES_BIN := $(addsuffix .h,$(subst .,_,$(BINFILES)))
 
-export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+export INCLUDE := $(foreach dir,$(INCLUDES),$(if $(filter /% c:% C:% %:%,$(dir)),-I$(dir),-I$(CURDIR)/$(dir))) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
 			-I$(CURDIR)/$(BUILD)
 
@@ -271,6 +294,11 @@ editcheat:
 		OUTPUT=editcheat \
 		DEPSDIR=$(CURDIR)/build_editcheat \
 		NROFLAGS= \
+		TOPDIR=$(CURDIR) \
+		USE_KEYSTONE_ASM=0 \
+		KEYSTONE_ROOT=$(CURDIR)/../keystone \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
 		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
 	@mkdir -p out/switch/.overlays/
 	@cp build_editcheat/editcheat.ovl out/switch/.overlays/editcheat.ovl

@@ -44,6 +44,17 @@
 #include <sstream>
 #include <utils.hpp>
 
+#ifndef USE_KEYSTONE_ASM
+#define USE_KEYSTONE_ASM 0
+#endif
+
+#if USE_KEYSTONE_ASM && __has_include(<keystone/keystone.h>)
+#include <keystone/keystone.h>
+#define HAVE_KEYSTONE_ASM 1
+#else
+#define HAVE_KEYSTONE_ASM 0
+#endif
+
 using namespace ult;
 
 // Memory ordering constants for cleaner syntax
@@ -8995,6 +9006,59 @@ private:
     return true;
   }
 
+public:
+  static bool tryAssembleWithKeystone(const std::string &asmText, u64 address, u32 &opcodeOut) {
+#if HAVE_KEYSTONE_ASM
+    // Keep memory footprint low:
+    // - lazy one-time engine creation
+    // - single-instruction assembly only
+    // - free encoded buffer immediately
+    static ks_engine *ks = nullptr;
+    static bool initAttempted = false;
+    static bool initOk = false;
+
+    if (asmText == "__CLEANUP__") {
+      if (ks) {
+        ks_close(ks);
+        ks = nullptr;
+      }
+      initAttempted = false;
+      initOk = false;
+      return true;
+    }
+
+    if (!initAttempted) {
+      initAttempted = true;
+      if (ks_open(KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN, &ks) == KS_ERR_OK) {
+        initOk = true;
+      }
+    }
+    if (!initOk || !ks || asmText.empty() || asmText.size() > 160)
+      return false;
+
+    unsigned char *encode = nullptr;
+    size_t size = 0;
+    size_t count = 0;
+    if (ks_asm(ks, asmText.c_str(), address, &encode, &size, &count) != KS_ERR_OK)
+      return false;
+
+    const bool ok = (count == 1 && size == 4 && encode != nullptr);
+    if (ok) {
+      opcodeOut = static_cast<u32>(encode[0]) |
+                  (static_cast<u32>(encode[1]) << 8) |
+                  (static_cast<u32>(encode[2]) << 16) |
+                  (static_cast<u32>(encode[3]) << 24);
+    }
+    ks_free(encode);
+    return ok;
+#else
+    (void)asmText;
+    (void)address;
+    (void)opcodeOut;
+    return false;
+#endif
+  }
+
   bool tryAssembleArm64(const std::string &input, u32 &opcodeOut) const {
     // Always allow raw opcode entry as a fallback assembly path.
     if (tryParseHexOpcode(input, opcodeOut))
@@ -9010,6 +9074,11 @@ private:
       opcodeOut = static_cast<u32>(m_storedValue);
       return true;
     }
+
+    // Optional broad-coverage assembler backend.
+    // Falls back to the built-in subset if unavailable or failing.
+    if (tryAssembleWithKeystone(input, m_storedAddress, opcodeOut))
+      return true;
 
     // Minimal built-in assembler for common instruction forms.
     if (normInput == "nop")   { opcodeOut = 0xD503201F; return true; }
@@ -9902,6 +9971,13 @@ public:
         }
       }
     }
+  }
+
+  virtual ~CheatEditMenu() {
+#if HAVE_KEYSTONE_ASM
+    u32 dummy;
+    CheatFormatManager::tryAssembleWithKeystone("__CLEANUP__", 0, dummy);
+#endif
   }
 
   void refreshList() {
