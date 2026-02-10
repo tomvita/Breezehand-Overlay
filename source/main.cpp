@@ -9838,9 +9838,9 @@ public:
       }
     }
 
-    addHeader(list, ult::CHEATS + " " + DIVIDER_SYMBOL + " \uE0E3 " +
-                        ult::NOTES + " " + DIVIDER_SYMBOL + " \uE0E2 " +
-                        ult::SETTINGS);
+    addHeader(list, ult::CHEATS,
+              std::string("\uE0E3 ") + ult::NOTES + " " + DIVIDER_SYMBOL +
+                  " \uE0E2 " + ult::SETTINGS);
 
     bool hasCheatProcess = false;
     dmntchtHasCheatProcess(&hasCheatProcess);

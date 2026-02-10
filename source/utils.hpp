@@ -1151,6 +1151,33 @@ void addHeader(auto& list, const std::string& headerText) {
     list->addItem(new tsl::elm::CategoryHeader(headerText));
 }
 
+void addHeader(auto& list, const std::string& leftText, const std::string& rightText) {
+    class RightAlignedCategoryHeader : public tsl::elm::CategoryHeader {
+    public:
+        RightAlignedCategoryHeader(const std::string& left, const std::string& right)
+            : tsl::elm::CategoryHeader(left), m_rightText(right) {
+            ult::applyLangReplacements(m_rightText);
+            ult::convertComboToUnicode(m_rightText);
+        }
+
+        virtual void draw(tsl::gfx::Renderer* renderer) override {
+            tsl::elm::CategoryHeader::draw(renderer);
+
+            const s32 fontSize = 16;
+            const s32 textY = this->getBottomBound() - 12 - 4;
+            const s32 rightWidth = renderer->getTextDimensions(m_rightText, false, fontSize).first;
+            const s32 rightX = this->getX() + this->getWidth() - rightWidth - 12;
+
+            renderer->drawString(m_rightText, false, rightX, textY, fontSize, tsl::style::color::ColorText);
+        }
+
+    private:
+        std::string m_rightText;
+    };
+
+    list->addItem(new RightAlignedCategoryHeader(leftText, rightText));
+}
+
 void addBasicListItem(auto& list, const std::string& itemText, bool isMini = false) {
     list->addItem(new tsl::elm::ListItem(itemText, "", isMini));
 }
