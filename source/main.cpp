@@ -8883,6 +8883,70 @@ private:
     return true;
   }
 
+  static bool tryParseGprToken(const std::string &tok, char cls, u8 &reg, bool allow31 = false) {
+    if (tok.size() < 2 || tok[0] != cls)
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    long n = std::strtol(tok.c_str() + 1, &end, 10);
+    const long maxReg = allow31 ? 31 : 30;
+    if (errno != 0 || !end || *end != '\0' || n < 0 || n > maxReg)
+      return false;
+    reg = static_cast<u8>(n);
+    return true;
+  }
+
+  static bool tryParseBaseRegToken(const std::string &tok, u8 &reg) {
+    if (tok == "sp") {
+      reg = 31;
+      return true;
+    }
+    return tryParseGprToken(tok, 'x', reg, true);
+  }
+
+  static bool tryParseFpToken(const std::string &tok, char cls, u8 &reg) {
+    if (tok.size() < 2 || tok[0] != cls)
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    long n = std::strtol(tok.c_str() + 1, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || n < 0 || n > 31)
+      return false;
+    reg = static_cast<u8>(n);
+    return true;
+  }
+
+  static bool tryParseSImm(const std::string &tok, long long &imm) {
+    std::string t = tok;
+    if (!t.empty() && t[0] == '#')
+      t.erase(0, 1);
+    if (t.empty())
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    long long v = std::strtoll(t.c_str(), &end, 0);
+    if (errno != 0 || !end || *end != '\0')
+      return false;
+    imm = v;
+    return true;
+  }
+
+  static bool tryParseFloatLiteral(const std::string &tok, double &val) {
+    std::string t = tok;
+    if (!t.empty() && t[0] == '#')
+      t.erase(0, 1);
+    t = trimCopy(t);
+    if (t.empty())
+      return false;
+    char *end = nullptr;
+    errno = 0;
+    double v = std::strtod(t.c_str(), &end);
+    if (errno != 0 || !end || *end != '\0' || !std::isfinite(v))
+      return false;
+    val = v;
+    return true;
+  }
+
   static bool tryParseUImm(const std::string &tok, unsigned long &imm, unsigned long maxVal) {
     std::string t = tok;
     if (!t.empty() && t[0] == '#')
@@ -8988,6 +9052,497 @@ private:
     if (parseTrapOp("smc", 0xD4000003)) return true;
     if (parseTrapOp("brk", 0xD4200000)) return true;
     if (parseTrapOp("hlt", 0xD4400000)) return true;
+
+    auto splitOperands = [](const std::string &ops) -> std::vector<std::string> {
+      std::vector<std::string> out;
+      std::string cur;
+      for (char c : ops) {
+        if (c == ',') {
+          out.push_back(trimCopy(cur));
+          cur.clear();
+        } else {
+          cur.push_back(c);
+        }
+      }
+      if (!cur.empty())
+        out.push_back(trimCopy(cur));
+      return out;
+    };
+
+    auto stripSpaces = [](const std::string &s) -> std::string {
+      std::string out;
+      out.reserve(s.size());
+      for (char c : s) {
+        if (!std::isspace(static_cast<unsigned char>(c)))
+          out.push_back(c);
+      }
+      return out;
+    };
+
+    auto parseShiftSpec = [&](const std::string &tok, u32 &shiftType, u32 &shiftAmount, u32 maxShift) -> bool {
+      std::string s;
+      s.reserve(tok.size());
+      for (char c : tok) {
+        if (!std::isspace(static_cast<unsigned char>(c)))
+          s.push_back(c);
+      }
+      if (s.rfind("lsl#", 0) == 0) shiftType = 0;
+      else if (s.rfind("lsr#", 0) == 0) shiftType = 1;
+      else if (s.rfind("asr#", 0) == 0) shiftType = 2;
+      else return false;
+
+      long long sh = 0;
+      if (!tryParseSImm(s.substr(3), sh))
+        return false;
+      if (sh < 0 || sh > static_cast<long long>(maxShift))
+        return false;
+      shiftAmount = static_cast<u32>(sh);
+      return true;
+    };
+
+    auto parseAddSubCommon = [&](bool isSub, bool isCmp, bool setFlags) -> bool {
+      const std::string mnemonic =
+          isCmp ? "cmp " : (isSub ? (setFlags ? "subs " : "sub ")
+                                  : (setFlags ? "adds " : "add "));
+      if (normInput.rfind(mnemonic, 0) != 0)
+        return false;
+
+      const std::vector<std::string> ops = splitOperands(trimCopy(normInput.substr(mnemonic.size())));
+      if ((!isCmp && (ops.size() < 3 || ops.size() > 4)) || (isCmp && (ops.size() < 2 || ops.size() > 3)))
+        return false;
+
+      const size_t idxRn = isCmp ? 0 : 1;
+      const size_t idxOp2 = isCmp ? 1 : 2;
+      const size_t idxShift = isCmp ? 2 : 3;
+
+      u8 rd = 31; // cmp aliases to xzr/wzr
+      u8 rn = 0;
+      bool isX = false;
+
+      if (!isCmp) {
+        if (tryParseGprToken(ops[0], 'x', rd, false)) isX = true;
+        else if (tryParseGprToken(ops[0], 'w', rd, false)) isX = false;
+        else return false;
+      }
+
+      u8 rnX = 0, rnW = 0;
+      const bool rnIsX = tryParseGprToken(ops[idxRn], 'x', rnX, false);
+      const bool rnIsW = tryParseGprToken(ops[idxRn], 'w', rnW, false);
+      if (!rnIsX && !rnIsW) return false;
+      rn = rnIsX ? rnX : rnW;
+      if (isCmp) isX = rnIsX;
+      else if ((isX && !rnIsX) || (!isX && !rnIsW)) return false;
+
+      const std::string op2 = ops[idxOp2];
+      const bool isImm = !op2.empty() && op2[0] == '#';
+      if (isImm) {
+        unsigned long imm = 0;
+        if (!tryParseUImm(op2, imm, 0xFFFFFF))
+          return false;
+
+        u32 sh = 0;
+        if ((isCmp && ops.size() == 3) || (!isCmp && ops.size() == 4)) {
+          std::string shTok = stripSpaces(ops[idxShift]);
+          if (shTok != "lsl#12")
+            return false;
+          sh = 1;
+        }
+
+        if (sh == 0 && imm > 0xFFFul) return false;
+        if (sh == 1 && (imm > 0xFFF000ul || (imm & 0xFFFul) != 0)) return false;
+        const u32 imm12 = static_cast<u32>(sh ? (imm >> 12) : imm);
+
+        u32 base = 0;
+        if (isCmp) base = isX ? 0xF100001Fu : 0x7100001Fu;
+        else if (!isSub) base = isX ? (setFlags ? 0xB1000000u : 0x91000000u)
+                                    : (setFlags ? 0x31000000u : 0x11000000u);
+        else base = isX ? (setFlags ? 0xF1000000u : 0xD1000000u)
+                        : (setFlags ? 0x71000000u : 0x51000000u);
+
+        opcodeOut = base | (sh << 22) | (imm12 << 10) | (static_cast<u32>(rn) << 5) | rd;
+        return true;
+      }
+
+      u8 rm = 0;
+      if (isX) {
+        if (!tryParseGprToken(op2, 'x', rm, false)) return false;
+      } else {
+        if (!tryParseGprToken(op2, 'w', rm, false)) return false;
+      }
+
+      u32 shiftType = 0, shiftAmount = 0;
+      if ((isCmp && ops.size() == 3) || (!isCmp && ops.size() == 4)) {
+        if (!parseShiftSpec(ops[idxShift], shiftType, shiftAmount, isX ? 63 : 31))
+          return false;
+      }
+
+      u32 base = 0;
+      if (isCmp) base = isX ? 0xEB00001Fu : 0x6B00001Fu;
+      else if (!isSub) base = isX ? (setFlags ? 0xAB000000u : 0x8B000000u)
+                                  : (setFlags ? 0x2B000000u : 0x0B000000u);
+      else base = isX ? (setFlags ? 0xEB000000u : 0xCB000000u)
+                      : (setFlags ? 0x6B000000u : 0x4B000000u);
+
+      opcodeOut = base | (shiftType << 22) | (static_cast<u32>(rm) << 16) |
+                  (shiftAmount << 10) | (static_cast<u32>(rn) << 5) | rd;
+      return true;
+    };
+
+    auto parseCondBranch = [&]() -> bool {
+      if (normInput.rfind("b.", 0) != 0)
+        return false;
+      const size_t sp = normInput.find(' ');
+      if (sp == std::string::npos)
+        return false;
+      const std::string cond = normInput.substr(2, sp - 2);
+      const std::string op = trimCopy(normInput.substr(sp + 1));
+      if (op.empty())
+        return false;
+
+      int condCode = -1;
+      if (cond == "eq") condCode = 0;
+      else if (cond == "ne") condCode = 1;
+      else if (cond == "lo") condCode = 3;
+      else if (cond == "hi") condCode = 8;
+      else if (cond == "lt") condCode = 11;
+      else if (cond == "gt") condCode = 12;
+      else return false;
+
+      long long offset = 0;
+      const bool looksAbsolute =
+          (op.rfind("0x", 0) == 0) || (op.rfind("#0x", 0) == 0);
+      if (looksAbsolute) {
+        long long target = 0;
+        if (!tryParseSImm(op, target))
+          return false;
+        offset = target - static_cast<long long>(m_storedAddress);
+      } else {
+        if (!tryParseSImm(op, offset))
+          return false;
+      }
+
+      if ((offset & 0x3) != 0)
+        return false;
+      if (offset < -(1LL << 20) || offset > ((1LL << 20) - 4))
+        return false;
+
+      const s32 imm19 = static_cast<s32>(offset >> 2);
+      opcodeOut = 0x54000000u | ((static_cast<u32>(imm19) & 0x7FFFFu) << 5) |
+                  static_cast<u32>(condCode);
+      return true;
+    };
+
+    if (parseAddSubCommon(false, false, false)) return true; // add
+    if (parseAddSubCommon(false, false, true)) return true;  // adds
+    if (parseAddSubCommon(true, false, false)) return true;  // sub
+    if (parseAddSubCommon(true, false, true)) return true;   // subs
+    if (parseAddSubCommon(true, true, true)) return true;    // cmp
+    if (parseCondBranch()) return true;
+
+    auto parseBranchImm = [&](const char *mnemonic, u32 base) -> bool {
+      const std::string prefix = std::string(mnemonic) + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+      const std::string op = trimCopy(normInput.substr(prefix.size()));
+      if (op.empty())
+        return false;
+
+      long long offset = 0;
+      const bool looksAbsolute =
+          (op.rfind("0x", 0) == 0) || (op.rfind("#0x", 0) == 0);
+      if (looksAbsolute) {
+        long long target = 0;
+        if (!tryParseSImm(op, target))
+          return false;
+        offset = target - static_cast<long long>(m_storedAddress);
+      } else {
+        if (!tryParseSImm(op, offset))
+          return false;
+      }
+
+      if ((offset & 0x3) != 0)
+        return false;
+      if (offset < -(1LL << 27) || offset > ((1LL << 27) - 4))
+        return false;
+
+      const s32 imm26 = static_cast<s32>(offset >> 2);
+      opcodeOut = base | (static_cast<u32>(imm26) & 0x03FFFFFFu);
+      return true;
+    };
+
+    if (parseBranchImm("b", 0x14000000)) return true;
+    if (parseBranchImm("bl", 0x94000000)) return true;
+
+    auto parseLoadStore = [&](const std::string &mnemonic, bool isLoad) -> bool {
+      const std::string prefix = mnemonic + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+
+      const std::string rest = trimCopy(normInput.substr(prefix.size()));
+      const size_t commaPos = rest.find(',');
+      if (commaPos == std::string::npos)
+        return false;
+
+      const std::string rtTok = trimCopy(rest.substr(0, commaPos));
+      std::string memTok = trimCopy(rest.substr(commaPos + 1));
+
+      // LDR literal form: ldr wN/xN, #imm_or_abs
+      if (mnemonic == "ldr" && isLoad && !memTok.empty() && memTok.front() == '#') {
+        u8 rt = 0;
+        u32 base = 0;
+        if (tryParseGprToken(rtTok, 'w', rt, false)) {
+          base = 0x18000000u; // LDR (literal, 32-bit)
+        } else if (tryParseGprToken(rtTok, 'x', rt, false)) {
+          base = 0x58000000u; // LDR (literal, 64-bit)
+        } else {
+          return false;
+        }
+
+        long long offset = 0;
+        const bool looksAbsolute =
+            (memTok.rfind("#0x", 0) == 0) || (memTok.rfind("#0X", 0) == 0);
+        if (looksAbsolute) {
+          long long target = 0;
+          if (!tryParseSImm(memTok, target))
+            return false;
+          offset = target - static_cast<long long>(m_storedAddress);
+        } else {
+          if (!tryParseSImm(memTok, offset))
+            return false;
+        }
+
+        if ((offset & 0x3) != 0)
+          return false;
+        if (offset < -(1LL << 20) || offset > ((1LL << 20) - 4))
+          return false;
+
+        const s32 imm19 = static_cast<s32>(offset >> 2);
+        opcodeOut = base | ((static_cast<u32>(imm19) & 0x7FFFFu) << 5) | rt;
+        return true;
+      }
+
+      memTok = stripSpaces(memTok);
+
+      if (memTok.size() < 3 || memTok.front() != '[' || memTok.back() != ']')
+        return false;
+
+      const std::string inner = memTok.substr(1, memTok.size() - 2);
+      const size_t innerComma = inner.find(',');
+      std::string rnTok = inner;
+      std::string immTok;
+      if (innerComma != std::string::npos) {
+        rnTok = inner.substr(0, innerComma);
+        immTok = inner.substr(innerComma + 1);
+      }
+
+      u8 rt = 0, rn = 0;
+      u32 base = 0;
+      u32 scale = 0;
+      const bool wantByte = (mnemonic == "ldrb");
+      const bool wantHalf = (mnemonic == "ldrh");
+
+      if (wantByte) {
+        if (!isLoad || !tryParseGprToken(rtTok, 'w', rt, false))
+          return false;
+        base = 0x39400000u; // LDRB (unsigned immediate)
+        scale = 1;
+      } else if (wantHalf) {
+        if (!isLoad || !tryParseGprToken(rtTok, 'w', rt, false))
+          return false;
+        base = 0x79400000u; // LDRH (unsigned immediate)
+        scale = 2;
+      } else {
+        if (tryParseGprToken(rtTok, 'x', rt, false)) {
+          base = isLoad ? 0xF9400000u : 0xF9000000u;
+          scale = 8;
+        } else if (tryParseGprToken(rtTok, 'w', rt, false)) {
+          base = isLoad ? 0xB9400000u : 0xB9000000u;
+          scale = 4;
+        } else {
+          return false;
+        }
+      }
+
+      if (!tryParseBaseRegToken(rnTok, rn))
+        return false;
+
+      unsigned long immBytes = 0;
+      if (!immTok.empty()) {
+        if (!tryParseUImm(immTok, immBytes, 4095ul * scale))
+          return false;
+      }
+      if ((immBytes % scale) != 0)
+        return false;
+
+      const u32 imm12 = static_cast<u32>(immBytes / scale);
+      opcodeOut = base | (imm12 << 10) | (static_cast<u32>(rn) << 5) | rt;
+      return true;
+    };
+
+    if (parseLoadStore("ldr", true)) return true;
+    if (parseLoadStore("ldrb", true)) return true;
+    if (parseLoadStore("ldrh", true)) return true;
+    if (parseLoadStore("str", false)) return true;
+    if (parseLoadStore("ld", true)) return true;
+    if (parseLoadStore("st", false)) return true;
+
+    if (normInput.rfind("mov ", 0) == 0) {
+      const std::vector<std::string> ops = splitOperands(trimCopy(normInput.substr(4)));
+      if (ops.size() == 2 || ops.size() == 3) {
+        u8 rd = 0, rm = 0;
+        if (tryParseGprToken(ops[0], 'x', rd, false) &&
+            tryParseGprToken(ops[1], 'x', rm, false) &&
+            ops.size() == 2) {
+          opcodeOut = 0xAA0003E0u | (static_cast<u32>(rm) << 16) | rd;
+          return true;
+        }
+        if (tryParseGprToken(ops[0], 'w', rd, false) &&
+            tryParseGprToken(ops[1], 'w', rm, false) &&
+            ops.size() == 2) {
+          opcodeOut = 0x2A0003E0u | (static_cast<u32>(rm) << 16) | rd;
+          return true;
+        }
+
+        long long imm64 = 0;
+        if ((tryParseGprToken(ops[0], 'x', rd, false) ||
+             tryParseGprToken(ops[0], 'w', rd, false)) &&
+            tryParseSImm(ops[1], imm64)) {
+          if (imm64 < 0 || imm64 > 0xFFFF)
+            return false;
+
+          u32 shift = 0;
+          if (ops.size() == 3) {
+            std::string sh = stripSpaces(ops[2]);
+            if (sh.rfind("lsl#", 0) != 0)
+              return false;
+            long long shVal = 0;
+            if (!tryParseSImm(sh.substr(3), shVal))
+              return false;
+            if (shVal < 0 || (shVal % 16) != 0)
+              return false;
+            shift = static_cast<u32>(shVal);
+          }
+
+          const bool isX = (ops[0][0] == 'x');
+          if (isX) {
+            if (!(shift == 0 || shift == 16 || shift == 32 || shift == 48))
+              return false;
+            opcodeOut = 0xD2800000u | ((shift / 16) << 21) |
+                        ((static_cast<u32>(imm64) & 0xFFFFu) << 5) | rd;
+          } else {
+            if (!(shift == 0 || shift == 16))
+              return false;
+            opcodeOut = 0x52800000u | ((shift / 16) << 21) |
+                        ((static_cast<u32>(imm64) & 0xFFFFu) << 5) | rd;
+          }
+          return true;
+        }
+      }
+    }
+
+    if (normInput.rfind("fmov ", 0) == 0) {
+      const std::vector<std::string> ops = splitOperands(trimCopy(normInput.substr(5)));
+      if (ops.size() == 2) {
+        u8 rd = 0, rn = 0;
+        // FMOV scalar immediate form: fmov sN/dN, #imm
+        auto tryAssembleFmovImm = [&](bool isDouble, u8 dst, const std::string &immTok) -> bool {
+          double wanted = 0.0;
+          if (!tryParseFloatLiteral(immTok, wanted))
+            return false;
+
+          const u32 base = isDouble ? 0x1E601000u : 0x1E201000u;
+          const std::string prefix = isDouble ? "fmov d0, #" : "fmov s0, #";
+          const double relTol = isDouble ? 1e-12 : 1e-6;
+
+          for (u32 imm8 = 0; imm8 <= 0xFF; ++imm8) {
+            const u32 candidate = base | (imm8 << 13); // d0/s0 destination
+            const std::string dis = DisassembleARM64(candidate, 0);
+            if (dis.rfind(prefix, 0) != 0)
+              continue;
+
+            const std::string lit = trimCopy(dis.substr(prefix.size()));
+            char *end = nullptr;
+            errno = 0;
+            const double decoded = std::strtod(lit.c_str(), &end);
+            if (errno != 0 || !end || *end != '\0' || !std::isfinite(decoded))
+              continue;
+
+            const double scale = std::max(1.0, std::fabs(wanted));
+            if (std::fabs(decoded - wanted) <= relTol * scale) {
+              opcodeOut = candidate | static_cast<u32>(dst);
+              return true;
+            }
+          }
+          return false;
+        };
+
+        if (tryParseFpToken(ops[0], 's', rd) && tryAssembleFmovImm(false, rd, ops[1])) {
+          return true;
+        }
+        if (tryParseFpToken(ops[0], 'd', rd) && tryAssembleFmovImm(true, rd, ops[1])) {
+          return true;
+        }
+
+        if (tryParseFpToken(ops[0], 's', rd) && tryParseFpToken(ops[1], 's', rn)) {
+          opcodeOut = 0x1E204000u | (static_cast<u32>(rn) << 5) | rd;
+          return true;
+        }
+        if (tryParseFpToken(ops[0], 'd', rd) && tryParseFpToken(ops[1], 'd', rn)) {
+          opcodeOut = 0x1E604000u | (static_cast<u32>(rn) << 5) | rd;
+          return true;
+        }
+        // FMOV between GPR and FP scalar register.
+        // w<->s
+        if (tryParseGprToken(ops[0], 'w', rd, true) && tryParseFpToken(ops[1], 's', rn)) {
+          opcodeOut = 0x1E260000u | (static_cast<u32>(rn) << 5) | rd; // fmov wD, sN
+          return true;
+        }
+        if (tryParseFpToken(ops[0], 's', rd) && tryParseGprToken(ops[1], 'w', rn, true)) {
+          opcodeOut = 0x1E270000u | (static_cast<u32>(rn) << 5) | rd; // fmov sD, wN
+          return true;
+        }
+        // x<->d
+        if (tryParseGprToken(ops[0], 'x', rd, true) && tryParseFpToken(ops[1], 'd', rn)) {
+          opcodeOut = 0x9E660000u | (static_cast<u32>(rn) << 5) | rd; // fmov xD, dN
+          return true;
+        }
+        if (tryParseFpToken(ops[0], 'd', rd) && tryParseGprToken(ops[1], 'x', rn, true)) {
+          opcodeOut = 0x9E670000u | (static_cast<u32>(rn) << 5) | rd; // fmov dD, xN
+          return true;
+        }
+      }
+    }
+
+    auto parseFp3Op = [&](const char *mnemonic, u32 baseS, u32 baseD) -> bool {
+      const std::string prefix = std::string(mnemonic) + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+      const std::vector<std::string> ops = splitOperands(trimCopy(normInput.substr(prefix.size())));
+      if (ops.size() != 3)
+        return false;
+
+      u8 rd = 0, rn = 0, rm = 0;
+      if (tryParseFpToken(ops[0], 's', rd) &&
+          tryParseFpToken(ops[1], 's', rn) &&
+          tryParseFpToken(ops[2], 's', rm)) {
+        opcodeOut = baseS | (static_cast<u32>(rm) << 16) |
+                    (static_cast<u32>(rn) << 5) | rd;
+        return true;
+      }
+      if (tryParseFpToken(ops[0], 'd', rd) &&
+          tryParseFpToken(ops[1], 'd', rn) &&
+          tryParseFpToken(ops[2], 'd', rm)) {
+        opcodeOut = baseD | (static_cast<u32>(rm) << 16) |
+                    (static_cast<u32>(rn) << 5) | rd;
+        return true;
+      }
+      return false;
+    };
+
+    if (parseFp3Op("fadd", 0x1E202800u, 0x1E602800u)) return true;
+    if (parseFp3Op("fsub", 0x1E203800u, 0x1E603800u)) return true;
+    if (parseFp3Op("fmul", 0x1E200800u, 0x1E600800u)) return true;
+    if (parseFp3Op("fdiv", 0x1E201800u, 0x1E601800u)) return true;
 
     return false;
   }
@@ -13480,6 +14035,7 @@ elm::Element *KeyboardGui::createUI() {
         new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }));
     list->addItem(row5);
   } else if (m_type == SEARCH_TYPE_TEXT) {
+    const bool isAsmKeyboard = (m_title == "Edit ASM");
     // Row 1: Numbers
     auto *row1 = new KeyboardRow();
     for (char c = '1'; c <= '9'; c++)
@@ -13560,14 +14116,31 @@ elm::Element *KeyboardGui::createUI() {
     }, 20));
     row5->addButton(
         new KeyboardButton("BS \uE0E1", [this] { this->handleBackspace(); }, 20));
-    row5->addButton(
-        new KeyboardButton("-", [this] { this->handleKeyPress('-'); }, 20));
-    row5->addButton(
-        new KeyboardButton(".", [this] { this->handleKeyPress('.'); }, 20));
+    if (isAsmKeyboard) {
+      row5->addButton(
+          new KeyboardButton(",", [this] { this->handleKeyPress(','); }, 20));
+      row5->addButton(
+          new KeyboardButton("[", [this] { this->handleKeyPress('['); }, 20));
+      row5->addButton(
+          new KeyboardButton("]", [this] { this->handleKeyPress(']'); }, 20));
+      row5->addButton(
+          new KeyboardButton("#", [this] { this->handleKeyPress('#'); }, 20));
+    } else {
+      row5->addButton(
+          new KeyboardButton("-", [this] { this->handleKeyPress('-'); }, 20));
+      row5->addButton(
+          new KeyboardButton(".", [this] { this->handleKeyPress('.'); }, 20));
+    }
     list->addItem(row5);
 
     // Row 6: Action Keys (part 2)
     auto *row6 = new KeyboardRow();
+    if (isAsmKeyboard) {
+      row6->addButton(
+          new KeyboardButton("-", [this] { this->handleKeyPress('-'); }, 20));
+      row6->addButton(
+          new KeyboardButton(".", [this] { this->handleKeyPress('.'); }, 20));
+    }
     row6->addButton(
         new KeyboardButton("SP \uE0E3", [this] { this->handleKeyPress(' '); }, 20));
     row6->addButton(
