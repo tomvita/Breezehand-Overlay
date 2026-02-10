@@ -65,6 +65,8 @@ namespace tsl {
     private:
         bool m_manualOvertype = false;
         bool m_isConstrained = true;
+        bool m_capsMode = true;
+        std::function<void()> m_onToggleCapsVisual;
     };
 
 }

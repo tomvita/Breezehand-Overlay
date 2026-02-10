@@ -37,6 +37,7 @@
 #include "disasm.hpp"
 #include <dmntcht.h>
 #include <cctype>
+#include <cmath>
 #include <cerrno>
 #include <iomanip>
 #include <set>
@@ -8113,7 +8114,44 @@ std::string FormatValueNote(u64 val, u32 width, u64 address = 0) {
   if (s_noteMinimalMode) {
     if (width == 4) {
       std::string asmStr = DisassembleARM64((u32)val, address);
-      return asmStr.empty() ? "" : " asm=" + asmStr;
+      if (!asmStr.empty())
+        return " asm=" + asmStr;
+
+      searchValue_t sv{};
+      sv._u32 = static_cast<u32>(val);
+      const float absf = std::fabs(sv._f32);
+      if (std::isfinite(sv._f32) && absf >= 0.01f && absf <= 1000000.0f) {
+        char fbuf[64];
+        snprintf(fbuf, sizeof(fbuf), " f=%.6g", sv._f32);
+        return fbuf;
+      }
+
+      char ibuf[64];
+      snprintf(ibuf, sizeof(ibuf), " s32=%d", static_cast<s32>(sv._u32));
+      return ibuf;
+    }
+    if (width == 8) {
+      searchValue_t sv{};
+      sv._u64 = val;
+      const double absd = std::fabs(sv._f64);
+      if (std::isfinite(sv._f64) && absd >= 0.01 && absd <= 1000000.0) {
+        char dbuf[64];
+        snprintf(dbuf, sizeof(dbuf), " d=%.6g", sv._f64);
+        return dbuf;
+      }
+      char ibuf[64];
+      snprintf(ibuf, sizeof(ibuf), " s64=%lld", (long long)(s64)val);
+      return ibuf;
+    }
+    if (width == 2) {
+      char ibuf[64];
+      snprintf(ibuf, sizeof(ibuf), " s16=%d", (int)(s16)val);
+      return ibuf;
+    }
+    if (width == 1) {
+      char ibuf[64];
+      snprintf(ibuf, sizeof(ibuf), " u8=%u", (unsigned int)(u8)val);
+      return ibuf;
     }
     return "";
   }
@@ -8218,8 +8256,13 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     u64 addr = ((u64)(first_dword & 0xFF) << 32) | second_dword;
     u64 val = GetNextVmInt(width);
     if (s_noteMinimalMode) {
-      snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr,
-               DisassembleARM64((u32)val, addr).c_str());
+      std::string asmStr = DisassembleARM64((u32)val, addr);
+      if (!asmStr.empty()) {
+        snprintf(buffer, sizeof(buffer), "0x%010lX: %s", addr, asmStr.c_str());
+      } else {
+        std::string fallback = FormatValueNote(val, width, addr);
+        snprintf(buffer, sizeof(buffer), "0x%010lX:%s", addr, fallback.c_str());
+      }
     } else {
       std::string heapText = HeapText(memType);
       snprintf(buffer, sizeof(buffer), "[%sR%d+0x%010lX] = 0x%lX%s (W=%d)",
@@ -8566,6 +8609,9 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     break;
   }
 
+  if (s_noteMinimalMode && type != 0) {
+    return "";
+  }
   return buffer;
 }
 
@@ -9111,6 +9157,11 @@ public:
         m_fontSize =
             std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
       }
+      // std::string showNotesStr =
+      //     ult::parseValueFromIniSection(m_notesPath, "Breeze", "show_notes");
+      // if (!showNotesStr.empty()) {
+      //   ult::showCheatNotes = (showNotesStr == "true");
+      // }
     }
 
     if (m_cachedOpcodes.empty()) {
@@ -9135,7 +9186,7 @@ public:
     m_list->clear();
 
     // Cheat Info Header
-    m_list->addItem(new tsl::elm::CategoryHeader("Cheat Info"));
+    addHeader(m_list, "Cheat Info");
 
     auto *nameItem = new tsl::elm::ListItem(m_cheatName);
     nameItem->setUseWrapping(true);
@@ -9165,7 +9216,7 @@ public:
     m_list->addItem(nameItem);
 
     // Hex Codes Header
-    m_list->addItem(new tsl::elm::CategoryHeader("Hex Codes"));
+    addHeader(m_list, "Hex Codes", std::string("\uE0E3 ") + ult::NOTES);
 
     if (!m_cachedOpcodes.empty()) {
       size_t i = 0;
@@ -9194,7 +9245,6 @@ public:
 
         if (!note.empty()) {
           item->setNote(note);
-          item->setAlwaysShowNote(true);
         }
 
         m_list->addItem(item);
@@ -12695,20 +12745,43 @@ public:
 
       m_contentElement->frame(renderer);
     }
+
+    // 6. Keyboard-specific footer: show only "X Cancel" and "A Select".
+    const s32 footerY = tsl::cfg::FramebufferHeight - 73;
+    renderer->drawRect(15, footerY + 1, tsl::cfg::FramebufferWidth - 30, 72,
+                       a(tsl::defaultBackgroundColor));
+    renderer->drawRect(15, footerY, tsl::cfg::FramebufferWidth - 30, 1,
+                       a(tsl::bottomSeparatorColor));
+
+    const std::string bottomLine =
+        std::string("\uE0E2") + ult::GAP_2 + "Cancel" + ult::GAP_1 +
+        std::string("\uE0E0") + ult::GAP_2 + "Select";
+    static const std::vector<std::string> specialChars = {"\uE0E2", "\uE0E0"};
+    renderer->drawStringWithColoredSections(bottomLine, false, specialChars, 30,
+                                            693, 23, tsl::bottomTextColor,
+                                            tsl::buttonColor);
   }
 };
 
 // --- KeyboardButton ---
 class KeyboardButton : public tsl::elm::Element {
 public:
-  KeyboardButton(char c, std::function<void(char)> onClick)
-      : m_char(c), m_label(1, c), m_onClick(onClick) {
+  KeyboardButton(char c, std::function<void(char)> onClick, u8 fontSize = 25)
+      : m_char(c), m_label(1, c), m_fontSize(fontSize), m_onClick(onClick) {
     m_isItem = true;
   }
 
-  KeyboardButton(const std::string &label, std::function<void()> onClickAction)
-      : m_char(0), m_label(label), m_onClickAction(onClickAction) {
+  KeyboardButton(const std::string &label, std::function<void()> onClickAction,
+                 u8 fontSize = 25)
+      : m_char(0), m_label(label), m_fontSize(fontSize),
+        m_onClickAction(onClickAction) {
+    ult::convertComboToUnicode(m_label);
     m_isItem = true;
+  }
+
+  void setCharacter(char c) {
+    m_char = c;
+    m_label.assign(1, c);
   }
 
   virtual s32 getHeight() override { return 60; }
@@ -12724,9 +12797,10 @@ public:
     renderer->drawRect(this->getX(), this->getY(), this->getWidth(),
                        this->getHeight(), a(tsl::style::color::ColorFrame));
 
-    s32 textX = this->getX() + (this->getWidth() / 2) - (m_label.length() * 8);
-    s32 textY = this->getY() + (this->getHeight() / 2) + 12;
-    renderer->drawString(m_label.c_str(), false, textX, textY, 25, a(color));
+    const s32 textW = renderer->getTextDimensions(m_label, false, m_fontSize).first;
+    s32 textX = this->getX() + (this->getWidth() - textW) / 2;
+    s32 textY = this->getY() + (this->getHeight() / 2) + (m_fontSize / 2) - 1;
+    renderer->drawString(m_label.c_str(), false, textX, textY, m_fontSize, a(color));
   }
 
   virtual void layout(u16 parentX, u16 parentY, u16 parentWidth,
@@ -12771,6 +12845,7 @@ public:
 private:
   char m_char;
   std::string m_label;
+  u8 m_fontSize = 25;
   std::function<void(char)> m_onClick;
   std::function<void()> m_onClickAction;
 };
@@ -13023,6 +13098,8 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
 KeyboardGui::~KeyboardGui() { tsl::disableJumpTo = false; }
 
 elm::Element *KeyboardGui::createUI() {
+  m_onToggleCapsVisual = nullptr;
+
   std::string initialNote = "";
   if (m_onNoteUpdate)
     initialNote = m_onNoteUpdate(m_value, m_cursorPos);
@@ -13052,7 +13129,7 @@ elm::Element *KeyboardGui::createUI() {
   if (m_type == SEARCH_TYPE_HEX) {
     if (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onClearStoredValue) {
       auto *topRow = new KeyboardRow();
-      topRow->addButton(new KeyboardButton("signed", [this] {
+      topRow->addButton(new KeyboardButton("[s]", [this] {
         if (!m_onGetSignedEditValue || !m_onApplySignedEdit) return;
         std::string initial = "0";
         {
@@ -13078,7 +13155,7 @@ elm::Element *KeyboardGui::createUI() {
             },
             nullptr, false);
       }));
-      topRow->addButton(new KeyboardButton("unsigned", [this] {
+      topRow->addButton(new KeyboardButton("[u]", [this] {
         if (!m_onGetUnsignedEditValue || !m_onApplyUnsignedEdit) return;
         std::string initial = "0";
         {
@@ -13177,7 +13254,7 @@ elm::Element *KeyboardGui::createUI() {
 
     auto *row5 = new KeyboardRow();
     row5->addButton(
-        new KeyboardButton("BS(B)", [this] { this->handleBackspace(); }));
+        new KeyboardButton("BS \uE0E1", [this] { this->handleBackspace(); }));
     row5->addButton(
         new KeyboardButton("SPACE", [this] { this->handleKeyPress(' '); }));
 
@@ -13190,7 +13267,7 @@ elm::Element *KeyboardGui::createUI() {
     }));
 
     row5->addButton(
-        new KeyboardButton("OK(+)", [this] { this->handleConfirm(); }));
+        new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }));
     list->addItem(row5);
   } else if (m_type == SEARCH_TYPE_TEXT) {
     // Row 1: Numbers
@@ -13200,40 +13277,92 @@ elm::Element *KeyboardGui::createUI() {
     row1->addButton(new KeyboardButton('0', keyPress));
     list->addItem(row1);
 
+    std::vector<std::pair<KeyboardButton *, char>> letterButtons;
+
     // Row 2: QWERTYUIOP
     auto *row2 = new KeyboardRow();
-    const std::string r2 = "QWERTYUIOP";
-    for (char c : r2)
-      row2->addButton(new KeyboardButton(c, keyPress));
+    const std::string r2 = "qwertyuiop";
+    for (char c : r2) {
+      const char display = m_capsMode
+                               ? static_cast<char>(
+                                     std::toupper(static_cast<unsigned char>(c)))
+                               : c;
+      auto *btn = new KeyboardButton(display, keyPress);
+      letterButtons.emplace_back(btn, c);
+      row2->addButton(btn);
+    }
     list->addItem(row2);
 
     // Row 3: ASDFGHJKL
     auto *row3 = new KeyboardRow();
-    const std::string r3 = "ASDFGHJKL";
-    for (char c : r3)
-      row3->addButton(new KeyboardButton(c, keyPress));
+    const std::string r3 = "asdfghjkl";
+    for (char c : r3) {
+      const char display = m_capsMode
+                               ? static_cast<char>(
+                                     std::toupper(static_cast<unsigned char>(c)))
+                               : c;
+      auto *btn = new KeyboardButton(display, keyPress);
+      letterButtons.emplace_back(btn, c);
+      row3->addButton(btn);
+    }
     list->addItem(row3);
 
     // Row 4: ZXCVBNM
     auto *row4 = new KeyboardRow();
-    const std::string r4 = "ZXCVBNM";
-    for (char c : r4)
-      row4->addButton(new KeyboardButton(c, keyPress));
+    const std::string r4 = "zxcvbnm";
+    for (char c : r4) {
+      const char display = m_capsMode
+                               ? static_cast<char>(
+                                     std::toupper(static_cast<unsigned char>(c)))
+                               : c;
+      auto *btn = new KeyboardButton(display, keyPress);
+      letterButtons.emplace_back(btn, c);
+      row4->addButton(btn);
+    }
     list->addItem(row4);
 
-    // Row 5: Action Keys
+    m_onToggleCapsVisual = [this, letterButtons] {
+      m_capsMode = !m_capsMode;
+      for (const auto &[btn, baseLower] : letterButtons) {
+        if (!btn)
+          continue;
+        const char nextChar =
+            m_capsMode
+                ? static_cast<char>(
+                      std::toupper(static_cast<unsigned char>(baseLower)))
+                : baseLower;
+        btn->setCharacter(nextChar);
+      }
+      if (m_frame)
+        m_frame->invalidate();
+      if (m_valueDisplay)
+        m_valueDisplay->invalidate();
+    };
+
+    // Row 5: Action Keys (part 1)
     auto *row5 = new KeyboardRow();
+    row5->addButton(new KeyboardButton("Cap \uE104", [this] {
+      if (m_onToggleCapsVisual) {
+        m_onToggleCapsVisual();
+      } else {
+        m_capsMode = !m_capsMode;
+      }
+    }, 20));
     row5->addButton(
-        new KeyboardButton("BS", [this] { this->handleBackspace(); }));
+        new KeyboardButton("BS \uE0E1", [this] { this->handleBackspace(); }, 20));
     row5->addButton(
-        new KeyboardButton("-", [this] { this->handleKeyPress('-'); }));
+        new KeyboardButton("-", [this] { this->handleKeyPress('-'); }, 20));
     row5->addButton(
-        new KeyboardButton(".", [this] { this->handleKeyPress('.'); }));
-    row5->addButton(
-        new KeyboardButton("SPACE", [this] { this->handleKeyPress(' '); }));
-    row5->addButton(
-        new KeyboardButton("OK", [this] { this->handleConfirm(); }));
+        new KeyboardButton(".", [this] { this->handleKeyPress('.'); }, 20));
     list->addItem(row5);
+
+    // Row 6: Action Keys (part 2)
+    auto *row6 = new KeyboardRow();
+    row6->addButton(
+        new KeyboardButton("SP \uE0E3", [this] { this->handleKeyPress(' '); }, 20));
+    row6->addButton(
+        new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }, 20));
+    list->addItem(row6);
   } else if (m_isNumpad) {
     const bool allowMinus =
         (m_type == SEARCH_TYPE_SIGNED_8BIT || m_type == SEARCH_TYPE_SIGNED_16BIT ||
@@ -13262,7 +13391,7 @@ elm::Element *KeyboardGui::createUI() {
 
     auto *row4 = new KeyboardRow();
     row4->addButton(
-        new KeyboardButton("BS", [this] { this->handleBackspace(); }));
+        new KeyboardButton("BS \uE0E1", [this] { this->handleBackspace(); }));
     if (allowMinus)
       row4->addButton(
           new KeyboardButton("-", [this] { this->handleKeyPress('-'); }));
@@ -13271,7 +13400,7 @@ elm::Element *KeyboardGui::createUI() {
       row4->addButton(
           new KeyboardButton(".", [this] { this->handleKeyPress('.'); }));
     row4->addButton(
-        new KeyboardButton("OK", [this] { this->handleConfirm(); }));
+        new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }));
     list->addItem(row4);
   } else {
     // HEX logic moved up
@@ -13293,13 +13422,13 @@ elm::Element *KeyboardGui::createUI() {
 
       auto *row4 = new KeyboardRow();
       row4->addButton(
-          new KeyboardButton("BS", [this] { this->handleBackspace(); }));
+          new KeyboardButton("BS \uE0E1", [this] { this->handleBackspace(); }));
       for (char c : std::string("ZXCVBNM"))
         row4->addButton(new KeyboardButton(c, keyPress));
       row4->addButton(
           new KeyboardButton("SPACE", [this] { this->handleKeyPress(' '); }));
       row4->addButton(
-          new KeyboardButton("OK", [this] { this->handleConfirm(); }));
+          new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }));
       list->addItem(row4);
     }
   }
@@ -13351,6 +13480,8 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
       m_cursorPos = 0;
     return true;
   }
+  if (m_type == SEARCH_TYPE_HEX && (keysHeld & (KEY_L | KEY_R | KEY_ZL | KEY_ZR)))
+    return true;
   if (keysHeld & (KEY_L | KEY_R))
     return true;
 
@@ -13365,6 +13496,16 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
   if (keysDown & KEY_PLUS) {
     handleConfirm();
     return true;
+  }
+  if (keysDown & KEY_LSTICK) {
+    if (m_type == SEARCH_TYPE_TEXT) {
+      if (m_onToggleCapsVisual) {
+        m_onToggleCapsVisual();
+      } else {
+        m_capsMode = !m_capsMode;
+      }
+      return true;
+    }
   }
   if (keysDown & KEY_Y) {
     if (m_type == SEARCH_TYPE_TEXT) {
@@ -13389,6 +13530,13 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
 
 void KeyboardGui::handleKeyPress(char c) {
   std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+  if (m_type == SEARCH_TYPE_TEXT &&
+      std::isalpha(static_cast<unsigned char>(c))) {
+    c = m_capsMode
+            ? static_cast<char>(std::toupper(static_cast<unsigned char>(c)))
+            : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
 
   // Overtype mode check
   if (isOvertypeMode() && m_cursorPos < m_value.length()) {
