@@ -9455,6 +9455,122 @@ public:
     if (parseLoadStore("ld", true)) return true;
     if (parseLoadStore("st", false)) return true;
 
+    auto parsePairLoadStore = [&](const std::string &mnemonic, bool isLoad) -> bool {
+      const std::string prefix = mnemonic + " ";
+      if (normInput.rfind(prefix, 0) != 0)
+        return false;
+
+      const std::string rest = trimCopy(normInput.substr(prefix.size()));
+      const size_t c1 = rest.find(',');
+      if (c1 == std::string::npos)
+        return false;
+      const size_t c2 = rest.find(',', c1 + 1);
+      if (c2 == std::string::npos)
+        return false;
+
+      const std::string rt1Tok = trimCopy(rest.substr(0, c1));
+      const std::string rt2Tok = trimCopy(rest.substr(c1 + 1, c2 - c1 - 1));
+      const std::string addrTok = trimCopy(rest.substr(c2 + 1));
+      if (addrTok.empty() || addrTok.front() != '[')
+        return false;
+
+      const size_t rb = addrTok.find(']');
+      if (rb == std::string::npos)
+        return false;
+
+      const std::string inside = addrTok.substr(1, rb - 1);
+      std::string tail = trimCopy(addrTok.substr(rb + 1));
+      const bool preIndex = (!tail.empty() && tail == "!");
+      const bool postIndex = (!tail.empty() && !preIndex);
+
+      std::string baseTok;
+      std::string immInsideTok;
+      {
+        const size_t ic = inside.find(',');
+        if (ic == std::string::npos) {
+          baseTok = trimCopy(inside);
+        } else {
+          baseTok = trimCopy(inside.substr(0, ic));
+          immInsideTok = trimCopy(inside.substr(ic + 1));
+        }
+      }
+      if (baseTok.empty())
+        return false;
+
+      u8 rt1 = 0, rt2 = 0, rn = 0;
+      bool isX = false;
+      u32 scale = 0;
+      if (tryParseGprToken(rt1Tok, 'x', rt1, false) &&
+          tryParseGprToken(rt2Tok, 'x', rt2, false)) {
+        isX = true;
+        scale = 8;
+      } else if (tryParseGprToken(rt1Tok, 'w', rt1, false) &&
+                 tryParseGprToken(rt2Tok, 'w', rt2, false)) {
+        isX = false;
+        scale = 4;
+      } else {
+        return false;
+      }
+
+      if (!tryParseBaseRegToken(baseTok, rn))
+        return false;
+
+      long long immBytes = 0;
+      if (postIndex) {
+        // Post-index form: [xN], #imm
+        if (!immInsideTok.empty())
+          return false;
+        if (tail.front() != ',')
+          return false;
+        std::string postTok = trimCopy(tail.substr(1));
+        if (!tryParseSImm(postTok, immBytes))
+          return false;
+      } else {
+        // Offset/pre-index forms: [xN] / [xN,#imm] / [xN,#imm]!
+        if (!immInsideTok.empty()) {
+          if (!tryParseSImm(immInsideTok, immBytes))
+            return false;
+        }
+      }
+
+      if ((immBytes % static_cast<long long>(scale)) != 0)
+        return false;
+      const long long scaled = immBytes / static_cast<long long>(scale);
+      if (scaled < -64 || scaled > 63)
+        return false;
+
+      const u32 imm7 = static_cast<u32>(scaled) & 0x7Fu;
+      u32 base = 0;
+      if (isX) {
+        if (isLoad) {
+          if (postIndex) base = 0xA8C00000u;
+          else if (preIndex) base = 0xA9C00000u;
+          else base = 0xA9400000u;
+        } else {
+          if (postIndex) base = 0xA8800000u;
+          else if (preIndex) base = 0xA9800000u;
+          else base = 0xA9000000u;
+        }
+      } else {
+        if (isLoad) {
+          if (postIndex) base = 0x28C00000u;
+          else if (preIndex) base = 0x29C00000u;
+          else base = 0x29400000u;
+        } else {
+          if (postIndex) base = 0x28800000u;
+          else if (preIndex) base = 0x29800000u;
+          else base = 0x29000000u;
+        }
+      }
+
+      opcodeOut = base | (imm7 << 15) | (static_cast<u32>(rt2) << 10) |
+                  (static_cast<u32>(rn) << 5) | static_cast<u32>(rt1);
+      return true;
+    };
+
+    if (parsePairLoadStore("ldp", true)) return true;
+    if (parsePairLoadStore("stp", false)) return true;
+
     if (normInput.rfind("mov ", 0) == 0) {
       const std::vector<std::string> ops = splitOperands(trimCopy(normInput.substr(4)));
       if (ops.size() == 2 || ops.size() == 3) {
