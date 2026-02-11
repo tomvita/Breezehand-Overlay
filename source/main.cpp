@@ -47,6 +47,7 @@
 #include <limits>
 #include <set>
 #include <sstream>
+#include <sys/stat.h>
 #include <utils.hpp>
 
 #ifndef USE_KEYSTONE_ASM
@@ -133,6 +134,9 @@ static int g_cheatFontSize = 17;
 static bool g_searchConditionReady = false;
 static Search_condition g_searchCondition{};
 static std::string g_searchConditionSourcePath;
+static std::string g_searchStartOutputName;
+static bool g_searchStartOutputEdited = false;
+static std::string g_searchContinueSourcePath;
 
 #ifdef EDITCHEAT_OVL
 u32 g_cheatIdToEdit = 0;
@@ -11019,6 +11023,307 @@ std::string SearchConditionSummary(const Search_condition &condition) {
          " C=" + SearchDataNote(condition, 2);
 }
 
+std::string CandidateStemFromPath(const std::string &path) {
+  size_t slash = path.find_last_of("/\\");
+  const std::string file = (slash == std::string::npos) ? path : path.substr(slash + 1);
+  if (file.size() > 4 && file.substr(file.size() - 4) == ".dat") {
+    return file.substr(0, file.size() - 4);
+  }
+  return file;
+}
+
+std::string CandidateStatusFromHeader(const breeze::BreezeFileHeader_t &header) {
+  auto modeCode = [](searchMode_t mode) -> const char * {
+    switch (mode) {
+    case SM_EQ:
+      return "==A";
+    case SM_NE:
+      return "!=A";
+    case SM_GT:
+      return ">A";
+    case SM_LT:
+      return "<A";
+    case SM_GE:
+      return ">=A";
+    case SM_LE:
+      return "<=A";
+    case SM_RANGE_EQ:
+      return "[A..B]";
+    case SM_BMEQ:
+      return "&B=A";
+    case SM_RANGE_LT:
+      return "<A..B>";
+    case SM_MORE:
+      return "++";
+    case SM_LESS:
+      return "--";
+    case SM_DIFF:
+      return "DIFF";
+    case SM_SAME:
+      return "SAME";
+    case SM_TWO_VALUE:
+      return "[A,B]";
+    case SM_TWO_VALUE_PLUS:
+      return "[A,,B]";
+    case SM_STRING:
+      return "STRING";
+    case SM_INC_BY:
+      return "++Val";
+    case SM_DEC_BY:
+      return "--Val";
+    case SM_EQ_plus:
+      return "==*A";
+    case SM_EQ_plus_plus:
+      return "==**A";
+    case SM_NONE:
+      return "NONE";
+    case SM_DIFFB:
+      return "DIFFB";
+    case SM_SAMEB:
+      return "SAMEB";
+    case SM_MOREB:
+      return "B++";
+    case SM_LESSB:
+      return "B--";
+    case SM_NOTAB:
+      return "NotAB";
+    case SM_THREE_VALUE:
+      return "[A.B.C]";
+    case SM_BIT_FLIP:
+      return "[A bflip B]";
+    case SM_ADV:
+      return "Advance";
+    case SM_GAP:
+      return "GAP";
+    case SM_GAP_ALLOWANCE:
+      return "{GAP}";
+    case SM_PTR:
+      return "PTR";
+    case SM_NPTR:
+      return "~PTR";
+    case SM_NoDecimal:
+      return "[A..B]f.0";
+    case SM_Gen2_data:
+      return "Gen2 data";
+    case SM_Gen2_code:
+      return "Gen2 code";
+    case SM_GETB:
+      return "GETB";
+    case SM_REBASE:
+      return "REBASE";
+    case SM_Target:
+      return "Target";
+    case SM_Pointer_and_OFFSET:
+      return "ptr+off";
+    case SM_SKIP:
+      return "skip";
+    case SM_Aborted_Target:
+      return "Aborted Target";
+    case SM_Branch:
+      return "Branch";
+    case SM_LDRx:
+      return "LDRx";
+    case SM_ADRP:
+      return "ADRP";
+    case SM_EOR:
+      return "EOR";
+    case SM_GETBZ:
+      return "GETB==A";
+    default:
+      return "?";
+    }
+  };
+
+  auto stepCode = [](search_step_t step) -> const char * {
+    switch (step) {
+    case search_step_primary:
+      return "Primary";
+    case search_step_secondary:
+      return "Secondary";
+    case search_step_dump:
+      return "Dump";
+    case search_step_dump_compare:
+      return "DumpCmp";
+    case search_step_none:
+      return "None";
+    case search_target:
+      return "Target";
+    case search_step_dump_segment:
+      return "DumpSeg";
+    case search_step_save_memory_edit:
+      return "SaveEdit";
+    default:
+      return "Unknown";
+    }
+  };
+
+  const u64 entryCount = header.dataSize / 16;
+  const std::string aValue =
+      ValueToDisplay(header.search_condition.searchValue_1,
+                     header.search_condition.searchType);
+  char compact[256] = {};
+  std::snprintf(compact, sizeof(compact), "%llu %s Search %s %s %s%s",
+                static_cast<unsigned long long>(entryCount),
+                stepCode(header.search_condition.search_step),
+                SearchTypeLabel(header.search_condition.searchType),
+                modeCode(header.search_condition.searchMode), aValue.c_str(),
+                (header.prefilename[0] != '\0') ? " p=1" : "");
+
+  if (header.search_condition.searchMode == SM_Target ||
+      header.search_condition.searchMode == SM_Aborted_Target) {
+    char buf[192] = {};
+    std::snprintf(
+        buf, sizeof(buf), "%sSource=%dK Target=%dK New=%dK TimeTaken=%ds bm=%d sr=%04X",
+        (header.search_condition.searchMode == SM_Aborted_Target) ? "Aborted " : "",
+        static_cast<int>(header.from_to_size / 16 / 1000),
+        static_cast<int>((header.dataSize - header.from_to_size) / 16 / 1000),
+        static_cast<int>(header.new_targets / 1000),
+        static_cast<int>(header.timetaken),
+        static_cast<int>(header.bit_mask),
+        static_cast<unsigned>(header.ptr_search_range));
+    return std::string(compact) + " " + buf;
+  }
+  return compact;
+}
+
+std::string CandidateStatusFromPath(const std::string &path) {
+  breeze::BreezeFileHeader_t header{};
+  std::string err;
+  if (!breeze::ReadCandidateHeader(path, header, &err)) {
+    return "Invalid candidate file";
+  }
+  const std::string targetStatus = CandidateStatusFromHeader(header);
+  if (!targetStatus.empty()) {
+    return targetStatus;
+  }
+  return std::string("Mode=") + SearchModeLabel(header.search_condition.searchMode) +
+         " Type=" + SearchTypeLabel(header.search_condition.searchType) +
+         " Step=" + std::to_string(static_cast<int>(header.search_condition.search_step));
+}
+
+std::string ContinueSearchNoteFromPath(const std::string &path) {
+  if (path.empty()) {
+    return "No candidate file";
+  }
+  const std::string status = CandidateStatusFromPath(path);
+  const std::string stem = CandidateStemFromPath(path);
+  if (stem.empty()) {
+    return status;
+  }
+  return status + " file=" + stem;
+}
+
+bool GetLatestCandidatePath(std::string &outPath) {
+  const auto files = breeze::ListCandidateFiles();
+  if (files.empty()) {
+    return false;
+  }
+  std::string best;
+  time_t bestTime = 0;
+  for (const auto &path : files) {
+    struct stat st {};
+    if (stat(path.c_str(), &st) != 0) {
+      continue;
+    }
+    if (best.empty() || st.st_mtime > bestTime) {
+      best = path;
+      bestTime = st.st_mtime;
+    }
+  }
+  if (best.empty()) {
+    return false;
+  }
+  outPath = best;
+  return true;
+}
+
+std::string AutoGenerateStartOutputName() {
+  std::set<std::string> existing;
+  for (const auto &p : breeze::ListCandidateFiles()) {
+    existing.insert(CandidateStemFromPath(p));
+  }
+  // Match Breeze auto-name behavior: first free numeric file (1,2,3...).
+  for (int i = 1; i < 10000; ++i) {
+    const std::string candidate = std::to_string(i);
+    if (!existing.count(candidate)) {
+      return candidate;
+    }
+  }
+  return "1";
+}
+
+class ContinueSearchFileMenu : public tsl::Gui {
+public:
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame = new tsl::elm::OverlayFrame("Continue Source", "");
+    auto *list = new tsl::elm::List();
+    addHeader(list, "Candidate Files", std::string("\uE0E2 ") + "Copy condition");
+
+    const auto files = breeze::ListCandidateFiles();
+    if (files.empty()) {
+      list->addItem(new tsl::elm::ListItem("No candidate files found"));
+      frame->setContent(list);
+      return frame;
+    }
+
+    for (const auto &path : files) {
+      const std::string stem = CandidateStemFromPath(path);
+      auto *item = new tsl::elm::ListItem(stem);
+      const std::string status = CandidateStatusFromPath(path);
+      item->setNote(status);
+      item->setAlwaysShowNote(true);
+      item->setClickListener([path](u64 keys) {
+        if (keys & KEY_A) {
+          g_searchContinueSourcePath = path;
+          if (!g_searchStartOutputEdited || g_searchStartOutputName.empty()) {
+            g_searchStartOutputName = AutoGenerateStartOutputName();
+          }
+          tsl::goBack();
+          return true;
+        }
+        if (keys & KEY_X) {
+          breeze::BreezeFileHeader_t header{};
+          std::string err;
+          if (!breeze::ReadCandidateHeader(path, header, &err)) {
+            if (tsl::notification) {
+              tsl::notification->show("Load condition failed");
+            }
+            return true;
+          }
+          g_searchCondition = header.search_condition;
+          g_searchConditionReady = true;
+          g_searchConditionSourcePath = path;
+          if (tsl::notification) {
+            tsl::notification->show("Condition copied from " +
+                                    CandidateStemFromPath(path));
+          }
+          return true;
+        }
+        return false;
+      });
+      list->addItem(item);
+    }
+
+    std::string jumpStem = CandidateStemFromPath(g_searchContinueSourcePath);
+    if (!jumpStem.empty()) {
+      list->jumpToItem(jumpStem, "", true);
+    }
+
+    frame->setContent(list);
+    return frame;
+  }
+};
+
 std::string SearchDataNote(const Search_condition &condition, int slot,
                            bool hexMode) {
   auto eqPlusDerivedNote = [&](bool exclusiveRange) -> std::string {
@@ -11659,6 +11964,8 @@ private:
   static constexpr u32 CHECK_INTERVAL = 50;
   bool m_noGameRunning = false;
   tsl::elm::ListItem *m_setupSearchItem = nullptr;
+  tsl::elm::ListItem *m_startSearchItem = nullptr;
+  tsl::elm::ListItem *m_continueSearchItem = nullptr;
   // bool initializingSpawn = false;
   // std::string defaultLang = "en";
 
@@ -11838,11 +12145,21 @@ public:
     inOverlaysPage.store(false, std::memory_order_release);
     inPackagesPage.store(false, std::memory_order_release);
 
-    addHeader(list, "Search Manager", "");
+    addHeader(list, "Search Manager", std::string("\uE0E2 ") + "Option");
 
     if (!TryLoadConditionFromLatestCandidate() && !g_searchConditionReady) {
       g_searchCondition = Search_condition{};
       g_searchConditionReady = true;
+    }
+    if (g_searchContinueSourcePath.empty()) {
+      std::string latest;
+      if (GetLatestCandidatePath(latest)) {
+        g_searchContinueSourcePath = latest;
+      }
+    }
+    if (g_searchStartOutputName.empty()) {
+      g_searchStartOutputName = AutoGenerateStartOutputName();
+      g_searchStartOutputEdited = false;
     }
 
     auto *setupSearchItem = new tsl::elm::ListItem("Setup search");
@@ -11859,7 +12176,32 @@ public:
     m_setupSearchItem = setupSearchItem;
 
     auto *startSearchItem = new tsl::elm::ListItem("Start search");
+    startSearchItem->setAlwaysShowNote(true);
+    startSearchItem->setNote(g_searchStartOutputName + ".dat");
     startSearchItem->setClickListener([](u64 keys) {
+      if (keys & KEY_X) {
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_TEXT, g_searchStartOutputName, "Output file",
+            [](std::string result) {
+              const std::string trimmed = TrimCopy(result);
+              if (trimmed.empty()) {
+                if (tsl::notification) {
+                  tsl::notification->show("File name cannot be empty");
+                }
+                return;
+              }
+              g_searchStartOutputName = trimmed;
+              if (g_searchStartOutputName.size() > 4 &&
+                  g_searchStartOutputName.substr(g_searchStartOutputName.size() - 4) ==
+                      ".dat") {
+                g_searchStartOutputName.erase(g_searchStartOutputName.size() - 4);
+              }
+              g_searchStartOutputEdited = true;
+              tsl::goBack();
+            },
+            nullptr, false);
+        return true;
+      }
       if (keys & KEY_A) {
         if (tsl::notification) {
           tsl::notification->show("Ready: " +
@@ -11870,20 +12212,29 @@ public:
       return false;
     });
     list->addItem(startSearchItem);
+    m_startSearchItem = startSearchItem;
 
     auto *continueSearchItem = new tsl::elm::ListItem("Continue search");
+    continueSearchItem->setAlwaysShowNote(true);
+    continueSearchItem->setNote(
+        ContinueSearchNoteFromPath(g_searchContinueSourcePath));
     continueSearchItem->setClickListener([](u64 keys) {
+      if (keys & KEY_X) {
+        tsl::changeTo<ContinueSearchFileMenu>();
+        return true;
+      }
       if (keys & KEY_A) {
         if (tsl::notification) {
-          tsl::notification->show(g_searchConditionSourcePath.empty()
+          tsl::notification->show(g_searchContinueSourcePath.empty()
                                       ? "Continue search not implemented yet"
-                                      : "Source: " + g_searchConditionSourcePath);
+                                      : "Source: " + g_searchContinueSourcePath);
         }
         return true;
       }
       return false;
     });
     list->addItem(continueSearchItem);
+    m_continueSearchItem = continueSearchItem;
   }
 
   void createCheatsMenu(tsl::elm::List *list) {
@@ -12931,6 +13282,21 @@ public:
       const std::string summary = SearchConditionSummary(g_searchCondition);
       if (m_setupSearchItem->getNote() != summary) {
         m_setupSearchItem->setNote(summary);
+      }
+      if (m_startSearchItem) {
+        const std::string startNote = g_searchStartOutputName.empty()
+                                          ? std::string("output.dat")
+                                          : (g_searchStartOutputName + ".dat");
+        if (m_startSearchItem->getNote() != startNote) {
+          m_startSearchItem->setNote(startNote);
+        }
+      }
+      if (m_continueSearchItem) {
+        const std::string continueNote =
+            ContinueSearchNoteFromPath(g_searchContinueSourcePath);
+        if (m_continueSearchItem->getNote() != continueNote) {
+          m_continueSearchItem->setNote(continueNote);
+        }
       }
     }
 

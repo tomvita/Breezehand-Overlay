@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <set>
 #include <sys/stat.h>
 
 namespace breeze {
@@ -133,7 +134,7 @@ bool ReadCandidateHeader(const std::string &path, BreezeFileHeader_t &outHeader,
 }
 
 std::vector<std::string> ListCandidateFiles(const std::vector<std::string> &roots) {
-    std::vector<std::string> result;
+    std::vector<std::string> found;
     for (const auto &root : roots) {
         DIR *dir = opendir(root.c_str());
         if (!dir) {
@@ -144,12 +145,26 @@ std::vector<std::string> ListCandidateFiles(const std::vector<std::string> &root
             if (!EndsWithDat(entry->d_name)) {
                 continue;
             }
-            result.push_back(root + entry->d_name);
+            found.push_back(root + entry->d_name);
         }
         closedir(dir);
     }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
+
+    // Deduplicate by filename stem so sdmc:/switch/Breeze and /switch/Breeze
+    // aliases don't produce duplicates.
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> result;
+    std::set<std::string> stems;
+    for (const auto &path : found) {
+        size_t slash = path.find_last_of("/\\");
+        std::string file = (slash == std::string::npos) ? path : path.substr(slash + 1);
+        if (file.size() > 4 && file.substr(file.size() - 4) == ".dat") {
+            file = file.substr(0, file.size() - 4);
+        }
+        if (stems.insert(file).second) {
+            result.push_back(path);
+        }
+    }
     return result;
 }
 
@@ -208,4 +223,3 @@ std::string SearchConditionSummary(const Search_condition &condition) {
 }
 
 } // namespace breeze
-
