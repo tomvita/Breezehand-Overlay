@@ -30,6 +30,7 @@
 #define TESLA_INIT_IMPL
 
 #include "../common/breeze_search_compat.hpp"
+#include "../common/breeze_search_exec.hpp"
 #include "../common/search_types.hpp"
 #include "keyboard.hpp"
 #include <tesla.hpp>
@@ -137,6 +138,9 @@ static std::string g_searchConditionSourcePath;
 static std::string g_searchStartOutputName;
 static bool g_searchStartOutputEdited = false;
 static std::string g_searchContinueSourcePath;
+static bool g_lastSearchStatsValid = false;
+static size_t g_lastSearchBufferBytes = 0;
+static u32 g_lastSearchSeconds = 0;
 
 #ifdef EDITCHEAT_OVL
 u32 g_cheatIdToEdit = 0;
@@ -11032,6 +11036,16 @@ std::string CandidateStemFromPath(const std::string &path) {
   return file;
 }
 
+std::string CandidatePathFromStem(std::string stem) {
+  if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".dat") {
+    stem.erase(stem.size() - 4);
+  }
+  if (stem.empty()) {
+    stem = "1";
+  }
+  return std::string("sdmc:/switch/Breeze/") + stem + ".dat";
+}
+
 std::string CandidateStatusFromHeader(const breeze::BreezeFileHeader_t &header) {
   auto modeCode = [](searchMode_t mode) -> const char * {
     switch (mode) {
@@ -11213,6 +11227,32 @@ std::string ContinueSearchNoteFromPath(const std::string &path) {
   return status + " file=" + stem;
 }
 
+std::string LastSearchBufferNote() {
+  if (!g_lastSearchStatsValid || g_lastSearchBufferBytes == 0) {
+    return "N/A";
+  }
+  const unsigned long long kb =
+      static_cast<unsigned long long>(g_lastSearchBufferBytes / 1024ULL);
+  const unsigned long long mb =
+      static_cast<unsigned long long>(g_lastSearchBufferBytes / 1024ULL / 1024ULL);
+  char buf[64] = {};
+  if (mb > 0) {
+    std::snprintf(buf, sizeof(buf), "%llu MB (%llu KB)", mb, kb);
+  } else {
+    std::snprintf(buf, sizeof(buf), "%llu KB", kb);
+  }
+  return buf;
+}
+
+std::string LastSearchTimeNote() {
+  if (!g_lastSearchStatsValid) {
+    return "N/A";
+  }
+  char buf[64] = {};
+  std::snprintf(buf, sizeof(buf), "%u s", static_cast<unsigned>(g_lastSearchSeconds));
+  return buf;
+}
+
 bool GetLatestCandidatePath(std::string &outPath) {
   const auto files = breeze::ListCandidateFiles();
   if (files.empty()) {
@@ -11252,6 +11292,60 @@ std::string AutoGenerateStartOutputName() {
   return "1";
 }
 
+bool ParseSeriesSuffix(const std::string &stem, std::string &baseOut,
+                       int &indexOut) {
+  if (stem.size() < 4 || stem.back() != ')') {
+    return false;
+  }
+  const size_t open = stem.rfind('(');
+  if (open == std::string::npos || open >= stem.size() - 2) {
+    return false;
+  }
+  const std::string digits = stem.substr(open + 1, stem.size() - open - 2);
+  for (char c : digits) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  baseOut = stem.substr(0, open);
+  indexOut = std::atoi(digits.c_str());
+  return true;
+}
+
+std::string FormatSeriesStem(const std::string &base, int index) {
+  char suffix[32] = {};
+  std::snprintf(suffix, sizeof(suffix), "(%02d)", index);
+  return base + suffix;
+}
+
+std::string AutoGenerateContinueOutputName(const std::string &sourcePath) {
+  const std::string sourceStem = CandidateStemFromPath(sourcePath);
+  std::string base = sourceStem;
+  int startIndex = 0;
+
+  std::string parsedBase;
+  int parsedIndex = 0;
+  if (ParseSeriesSuffix(sourceStem, parsedBase, parsedIndex)) {
+    base = parsedBase;
+    startIndex = parsedIndex + 1;
+  } else {
+    startIndex = 0;
+  }
+
+  std::set<std::string> existing;
+  for (const auto &p : breeze::ListCandidateFiles()) {
+    existing.insert(CandidateStemFromPath(p));
+  }
+
+  for (int i = startIndex; i < 10000; ++i) {
+    const std::string candidate = FormatSeriesStem(base, i);
+    if (!existing.count(candidate)) {
+      return candidate;
+    }
+  }
+  return FormatSeriesStem(base, startIndex);
+}
+
 class ContinueSearchFileMenu : public tsl::Gui {
 public:
   virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
@@ -11286,7 +11380,8 @@ public:
         if (keys & KEY_A) {
           g_searchContinueSourcePath = path;
           if (!g_searchStartOutputEdited || g_searchStartOutputName.empty()) {
-            g_searchStartOutputName = AutoGenerateStartOutputName();
+            g_searchStartOutputName =
+                AutoGenerateContinueOutputName(g_searchContinueSourcePath);
           }
           tsl::goBack();
           return true;
@@ -11966,6 +12061,8 @@ private:
   tsl::elm::ListItem *m_setupSearchItem = nullptr;
   tsl::elm::ListItem *m_startSearchItem = nullptr;
   tsl::elm::ListItem *m_continueSearchItem = nullptr;
+  tsl::elm::ListItem *m_lastBufferItem = nullptr;
+  tsl::elm::ListItem *m_lastTimeItem = nullptr;
   // bool initializingSpawn = false;
   // std::string defaultLang = "en";
 
@@ -12203,9 +12300,38 @@ public:
         return true;
       }
       if (keys & KEY_A) {
+        if (!checkOverlayMemory(8)) {
+          return true;
+        }
+        if (!g_searchContinueSourcePath.empty() &&
+            CandidatePathFromStem(g_searchStartOutputName) ==
+                g_searchContinueSourcePath &&
+            !g_searchStartOutputEdited) {
+          g_searchStartOutputName = AutoGenerateStartOutputName();
+        }
+        breeze::SearchRunStats stats{};
+        std::string err;
+        if (!breeze::RunStartSearch(g_searchCondition, g_searchStartOutputName,
+                                    stats, &err)) {
+          if (tsl::notification) {
+            tsl::notification->show("Start failed: " + err);
+          }
+          return true;
+        }
+        g_searchContinueSourcePath = CandidatePathFromStem(g_searchStartOutputName);
+        g_searchConditionSourcePath = g_searchContinueSourcePath;
+        g_lastSearchStatsValid = true;
+        g_lastSearchBufferBytes = stats.scanBufferBytes;
+        g_lastSearchSeconds = stats.secondsTaken;
+        if (!g_searchStartOutputEdited || g_searchStartOutputName.empty()) {
+          g_searchStartOutputName = AutoGenerateStartOutputName();
+        }
         if (tsl::notification) {
-          tsl::notification->show("Ready: " +
-                                  SearchConditionSummary(g_searchCondition));
+          tsl::notification->show(
+              "Start done: " + std::to_string(stats.entriesWritten) +
+              " entries, buf=" +
+              std::to_string(static_cast<unsigned>(stats.scanBufferBytes / 1024 / 1024)) +
+              "MB");
         }
         return true;
       }
@@ -12224,10 +12350,41 @@ public:
         return true;
       }
       if (keys & KEY_A) {
+        if (!checkOverlayMemory(8)) {
+          return true;
+        }
+        if (g_searchContinueSourcePath.empty()) {
+          if (tsl::notification) {
+            tsl::notification->show("No source candidate selected");
+          }
+          return true;
+        }
+        if (!g_searchStartOutputEdited) {
+          g_searchStartOutputName =
+              AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+        }
+        breeze::SearchRunStats stats{};
+        std::string err;
+        if (!breeze::RunContinueSearch(g_searchCondition, g_searchContinueSourcePath,
+                                       g_searchStartOutputName, stats, &err)) {
+          if (tsl::notification) {
+            tsl::notification->show("Continue failed: " + err);
+          }
+          return true;
+        }
+        g_searchContinueSourcePath = CandidatePathFromStem(g_searchStartOutputName);
+        g_searchConditionSourcePath = g_searchContinueSourcePath;
+        g_lastSearchStatsValid = true;
+        g_lastSearchBufferBytes = stats.scanBufferBytes;
+        g_lastSearchSeconds = stats.secondsTaken;
+        if (!g_searchStartOutputEdited) {
+          g_searchStartOutputName =
+              AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+        }
         if (tsl::notification) {
-          tsl::notification->show(g_searchContinueSourcePath.empty()
-                                      ? "Continue search not implemented yet"
-                                      : "Source: " + g_searchContinueSourcePath);
+          tsl::notification->show(
+              "Continue done: " + std::to_string(stats.entriesWritten) +
+              " entries");
         }
         return true;
       }
@@ -12235,6 +12392,20 @@ public:
     });
     list->addItem(continueSearchItem);
     m_continueSearchItem = continueSearchItem;
+
+    list->addItem(new tsl::elm::CategoryHeader("Information"));
+
+    auto *lastBufferItem = new tsl::elm::ListItem("Buffer size");
+    lastBufferItem->setAlwaysShowNote(true);
+    lastBufferItem->setNote(LastSearchBufferNote());
+    list->addItem(lastBufferItem);
+    m_lastBufferItem = lastBufferItem;
+
+    auto *lastTimeItem = new tsl::elm::ListItem("Time taken");
+    lastTimeItem->setAlwaysShowNote(true);
+    lastTimeItem->setNote(LastSearchTimeNote());
+    list->addItem(lastTimeItem);
+    m_lastTimeItem = lastTimeItem;
   }
 
   void createCheatsMenu(tsl::elm::List *list) {
@@ -13296,6 +13467,18 @@ public:
             ContinueSearchNoteFromPath(g_searchContinueSourcePath);
         if (m_continueSearchItem->getNote() != continueNote) {
           m_continueSearchItem->setNote(continueNote);
+        }
+      }
+      if (m_lastBufferItem) {
+        const std::string bufferNote = LastSearchBufferNote();
+        if (m_lastBufferItem->getNote() != bufferNote) {
+          m_lastBufferItem->setNote(bufferNote);
+        }
+      }
+      if (m_lastTimeItem) {
+        const std::string timeNote = LastSearchTimeNote();
+        if (m_lastTimeItem->getNote() != timeNote) {
+          m_lastTimeItem->setNote(timeNote);
         }
       }
     }
