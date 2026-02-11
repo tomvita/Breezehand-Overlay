@@ -10487,6 +10487,7 @@ public:
 class MainMenu : public tsl::Gui {
 
 private:
+  static constexpr const char *SEARCH_MANAGER_MENU_MODE = "search_manager";
   std::string packageIniPath = PACKAGE_PATH + PACKAGE_FILENAME;
   std::string packageConfigIniPath = PACKAGE_PATH + CONFIG_FILENAME;
   std::string menuMode, fullPath, optionName, priority, starred, hide;
@@ -10622,18 +10623,40 @@ public:
     auto *list = new tsl::elm::List();
     bool noClickableItems = false;
 
-    if (menuMode == OVERLAYS_STR) {
+    if (menuMode == SEARCH_MANAGER_MENU_MODE) {
+      createSearchManagerMenu(list);
+    } else if (menuMode == OVERLAYS_STR) {
       createCheatsMenu(list);
     } else if (menuMode == PACKAGES_STR) {
       noClickableItems = createPackagesMenu(list);
+    } else {
+      // Fallback to cheats page if menu mode is unknown.
+      menuMode = OVERLAYS_STR;
+      createCheatsMenu(list);
     }
 
     std::string frameTitle = CAPITAL_ULTRAHAND_PROJECT_NAME;
     if (menuMode == OVERLAYS_STR && !g_cheatFolderNameStack.empty()) {
       frameTitle = g_cheatFolderNameStack.back();
     }
+    std::string pageLeftName;
+    std::string pageRightName;
+    if (menuMode == SEARCH_MANAGER_MENU_MODE) {
+      pageRightName = CHEATS;
+    } else if (menuMode == OVERLAYS_STR) {
+      pageLeftName = "Search";
+      pageRightName = PACKAGES;
+    } else if (menuMode == PACKAGES_STR) {
+      pageLeftName = CHEATS;
+    }
+
+    // Use custom page labels for 3-panel navigation and avoid duplicate footer
+    // labels from m_menuMode defaults.
+    const std::string frameMenuMode =
+        (!pageLeftName.empty() || !pageRightName.empty()) ? "" : menuMode;
     auto *rootFrame = new tsl::elm::OverlayFrame(
-        frameTitle, versionLabel, noClickableItems, menuMode, "", "", "");
+        frameTitle, versionLabel, noClickableItems, frameMenuMode, "",
+        pageLeftName, pageRightName);
 
 
     list->jumpToItem(jumpItemName, jumpItemValue,
@@ -10647,6 +10670,49 @@ public:
 
     rootFrame->setContent(list);
     return rootFrame;
+  }
+
+  void createSearchManagerMenu(tsl::elm::List *list) {
+    inOverlaysPage.store(false, std::memory_order_release);
+    inPackagesPage.store(false, std::memory_order_release);
+
+    addHeader(list, "Search Manager", "");
+
+    auto *setupSearchItem = new tsl::elm::ListItem("Setup search");
+    setupSearchItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        if (tsl::notification) {
+          tsl::notification->show("Setup search not implemented yet");
+        }
+        return true;
+      }
+      return false;
+    });
+    list->addItem(setupSearchItem);
+
+    auto *startSearchItem = new tsl::elm::ListItem("Start search");
+    startSearchItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        if (tsl::notification) {
+          tsl::notification->show("Start search not implemented yet");
+        }
+        return true;
+      }
+      return false;
+    });
+    list->addItem(startSearchItem);
+
+    auto *continueSearchItem = new tsl::elm::ListItem("Continue search");
+    continueSearchItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        if (tsl::notification) {
+          tsl::notification->show("Continue search not implemented yet");
+        }
+        return true;
+      }
+      return false;
+    });
+    list->addItem(continueSearchItem);
   }
 
   void createCheatsMenu(tsl::elm::List *list) {
@@ -12060,14 +12126,33 @@ public:
         //     keysDown |= toPackages ? (usePageSwap ? KEY_DLEFT : KEY_DRIGHT) :
         //     (usePageSwap ? KEY_DRIGHT : KEY_DLEFT);
         // }
-        const bool onLeftPage = (!usePageSwap && menuMode != PACKAGES_STR) ||
-                                (usePageSwap && menuMode != OVERLAYS_STR);
+        auto pageIndexFromMode = [&](const std::string &mode) -> int {
+          if (mode == SEARCH_MANAGER_MENU_MODE)
+            return 0;
+          if (mode == OVERLAYS_STR)
+            return 1;
+          if (mode == PACKAGES_STR)
+            return 2;
+          return 1; // default to center (cheats)
+        };
+        auto modeFromPageIndex = [&](int index) -> std::string {
+          switch (index) {
+          case 0:
+            return SEARCH_MANAGER_MENU_MODE;
+          case 2:
+            return PACKAGES_STR;
+          default:
+            return OVERLAYS_STR;
+          }
+        };
+
+        const int currentPageIndex = pageIndexFromMode(menuMode);
 
         bool wasSimulated = false;
         {
           // std::lock_guard<std::mutex> lock(ult::simulatedNextPageMutex);
           if (simulatedNextPage.exchange(false, std::memory_order_acq_rel)) {
-            if (onLeftPage) {
+            if (currentPageIndex < 2) {
               keysDown |= KEY_DRIGHT;
             } else {
               keysDown |= KEY_DLEFT;
@@ -12103,7 +12188,7 @@ public:
 
         // const bool switchToPackages = (!usePageSwap && menuMode !=
         // PACKAGES_STR) || (usePageSwap && menuMode != OVERLAYS_STR);
-        if (onLeftPage && !isTouching && slideCondition &&
+        if (currentPageIndex < 2 && !isTouching && slideCondition &&
             (keysDown & KEY_RIGHT) &&
             (!onTrack ? !(keysHeld & ~KEY_RIGHT & ALL_KEYS_MASK)
                       : !(keysHeld & ~KEY_RIGHT & ~KEY_R & ALL_KEYS_MASK))) {
@@ -12116,7 +12201,7 @@ public:
             //     simulatedNextPage.store(false, release);
             if (tsl::elm::s_safeToSwap.load(acquire)) {
               // tsl::elm::s_safeToSwap.store(false, release);
-              currentMenu = usePageSwap ? OVERLAYS_STR : PACKAGES_STR;
+              currentMenu = modeFromPageIndex(currentPageIndex + 1);
               // tsl::pop();
               tsl::swapTo<MainMenu>();
               resetNavState();
@@ -12133,7 +12218,7 @@ public:
 
         // const bool switchToOverlays = (!usePageSwap && menuMode !=
         // OVERLAYS_STR) || (usePageSwap && menuMode != PACKAGES_STR);
-        if (!onLeftPage && !isTouching && slideCondition &&
+        if (currentPageIndex > 0 && !isTouching && slideCondition &&
             (keysDown & KEY_LEFT) &&
             (!onTrack ? !(keysHeld & ~KEY_LEFT & ALL_KEYS_MASK)
                       : !(keysHeld & ~KEY_LEFT & ~KEY_R & ALL_KEYS_MASK))) {
@@ -12146,7 +12231,7 @@ public:
             //     simulatedNextPage.store(false, release);
             if (tsl::elm::s_safeToSwap.load(acquire)) {
               // tsl::elm::s_safeToSwap.store(false, release);
-              currentMenu = usePageSwap ? PACKAGES_STR : OVERLAYS_STR;
+              currentMenu = modeFromPageIndex(currentPageIndex - 1);
               // tsl::pop();
               tsl::swapTo<MainMenu>();
               resetNavState();
@@ -12468,10 +12553,7 @@ void initializeSettingsAndDirectories() {
   // Set current menu based on settings
   static bool hasInitialized = false;
   if (!hasInitialized) {
-    if (!usePageSwap)
-      currentMenu = OVERLAYS_STR;
-    else
-      currentMenu = PACKAGES_STR;
+    currentMenu = OVERLAYS_STR;
     hasInitialized = true;
   }
 }
