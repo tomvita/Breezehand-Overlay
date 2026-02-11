@@ -67,6 +67,7 @@ static std::mutex transitionMutex;
 // Forward declaration for helper to break dependency cycle
 void TransitionToMainMenu(const std::string &arg1, const std::string &arg2);
 void SwapToMainMenu();
+static void setFooterBackLabel(const bool useRestart);
 
 // Placeholder replacement
 const std::string valuePlaceholder = "{value}";
@@ -269,6 +270,7 @@ static std::string lastCommandMode;
 static bool lastCommandIsHold;
 static bool lastFooterHighlight;
 static bool lastFooterHighlightDefined;
+static std::string g_defaultBackLabel = "Back";
 
 static std::unordered_map<std::string, std::string> selectedFooterDict;
 
@@ -926,9 +928,49 @@ private:
             } else {
               Audio::exit();
             }
+          } else if (iniKey == "take_over_ovlmenu") {
+            const std::string ovlmenuPath = OVERLAY_PATH + "ovlmenu.ovl";
+            const std::string breezehandPath = OVERLAY_PATH + "breezehand.ovl";
+            const std::string backupPath = OVERLAY_PATH + "ovlmenu.ovl.bak";
+
+            if (actualState) {
+              if (!isFile(breezehandPath)) {
+                if (tsl::notification) {
+                  tsl::notification->show(
+                      "Missing breezehand.ovl\nCannot take over ovlmenu");
+                }
+                setIniFileValue(ULTRAHAND_CONFIG_INI_PATH,
+                                ULTRAHAND_PROJECT_NAME, iniKey, FALSE_STR);
+                listItem->setState(invertLogic ? true : false);
+                state = false;
+                return;
+              }
+
+              if (!isFile(backupPath) && isFile(ovlmenuPath)) {
+                copyFileOrDirectory(ovlmenuPath, backupPath);
+              }
+
+              copyFileOrDirectory(breezehandPath, ovlmenuPath);
+              if (tsl::notification) {
+                tsl::notification->show("ovlmenu takeover enabled");
+              }
+            } else {
+              if (!isFile(backupPath)) {
+                if (tsl::notification) {
+                  tsl::notification->show(
+                      "Backup not found\nNothing to restore");
+                }
+              } else {
+                copyFileOrDirectory(backupPath, ovlmenuPath);
+                deleteFileOrDirectory(backupPath);
+                if (tsl::notification) {
+                  tsl::notification->show("ovlmenu restored from backup");
+                }
+              }
+            }
           }
 
-          state = !state;
+          state = actualState;
 
           if (useReloadMenu)
             reloadMenu = true;
@@ -952,6 +994,7 @@ public:
   }
 
   virtual tsl::elm::Element *createUI() override {
+    setFooterBackLabel(false);
     inSettingsMenu = dropdownSelection.empty();
     inSubSettingsMenu = !dropdownSelection.empty();
 
@@ -989,6 +1032,7 @@ public:
       std::string keyCombo = "";
       std::string currentTheme = "";
       std::string currentWallpaper = "";
+      bool takeOverOvlmenuState = false;
 
       if (sectionIt != ultrahandIniData.end()) {
         auto langIt = sectionIt->second.find(DEFAULT_LANG_STR);
@@ -1011,6 +1055,11 @@ public:
           if (wallpaperIt != sectionIt->second.end()) {
             currentWallpaper = wallpaperIt->second;
           }
+        }
+
+        auto takeOverIt = sectionIt->second.find("take_over_ovlmenu");
+        if (takeOverIt != sectionIt->second.end()) {
+          takeOverOvlmenuState = (takeOverIt->second == TRUE_STR);
         }
       }
 
@@ -1040,6 +1089,9 @@ public:
       addListItem(list, KEY_COMBO, keyCombo, KEY_COMBO_STR);
       addListItem(list, LANGUAGE, getLanguageLabel(defaultLang),
                   "languageMenu");
+      takeOverOvlmenu = takeOverOvlmenuState;
+      createToggleListItem(list, "Take over ovlmenu", takeOverOvlmenu,
+                           "take_over_ovlmenu", false, false, false, false);
       addListItem(list, SYSTEM, DROPDOWN_SYMBOL, "systemMenu");
       addListItem(list, SOFTWARE_UPDATE, DROPDOWN_SYMBOL, "softwareUpdateMenu");
       addHeader(list, UI_SETTINGS);
@@ -2082,6 +2134,7 @@ public:
 
   // Helper lambdas and common setup
   virtual tsl::elm::Element *createUI() override {
+    setFooterBackLabel(false);
     settingsIniPath = (entryMode == OVERLAY_STR) ? OVERLAYS_INI_FILEPATH
                                                  : PACKAGES_INI_FILEPATH;
     const std::string header =
@@ -6426,6 +6479,7 @@ public:
    */
   virtual tsl::elm::Element *createUI() override {
     std::lock_guard<std::mutex> lock(transitionMutex);
+    setFooterBackLabel(false);
     // menuIsGenerated = false;
     if (dropdownSection.empty()) {
       inPackageMenu = true;
@@ -10601,6 +10655,12 @@ public:
     else
       inMainMenu.store(false, std::memory_order_release);
 
+    const bool showRestartInFooter =
+        takeOverOvlmenu && inMainMenu.load(std::memory_order_acquire) &&
+        !inHiddenMode.load(std::memory_order_acquire) &&
+        dropdownSection.empty();
+    setFooterBackLabel(showRestartInFooter);
+
     lastMenuMode = hiddenMenuMode;
 
     static bool hasInitialized = false;
@@ -11748,6 +11808,13 @@ public:
                            touchPosition touchInput,
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
+    // Keep footer back label in sync even when returning to an existing
+    // MainMenu instance (no createUI rebuild).
+    const bool shouldShowRestartLabel =
+        takeOverOvlmenu && inMainMenu.load(std::memory_order_acquire) &&
+        !inHiddenMode.load(std::memory_order_acquire) &&
+        dropdownSection.empty();
+    setFooterBackLabel(shouldShowRestartLabel);
 
     if ((keysHeld & KEY_ZL) && menuMode == OVERLAYS_STR) {
       if (keysDown & KEY_R) {
@@ -12362,10 +12429,15 @@ public:
     if (returningToMain && !(keysDown & KEY_B)) {
       returningToMain = false;
       inMainMenu.store(true, std::memory_order_release);
+      const bool showRestartInFooter =
+          takeOverOvlmenu && !inHiddenMode.load(std::memory_order_acquire) &&
+          dropdownSection.empty();
+      setFooterBackLabel(showRestartInFooter);
     }
     if (returningToHiddenMain && !(keysDown & KEY_B)) {
       returningToHiddenMain = false;
       inHiddenMode.store(true, std::memory_order_release);
+      setFooterBackLabel(false);
     }
 
     if (triggerExit.exchange(false, std::memory_order_acq_rel)) {
@@ -12471,6 +12543,7 @@ void initializeSettingsAndDirectories() {
   setDefaultValue("page_swap", FALSE_STR, usePageSwap);
   setDefaultValue("swipe_to_open", TRUE_STR, useSwipeToOpen);
   setDefaultValue("right_alignment", FALSE_STR, useRightAlignment);
+  setDefaultValue("take_over_ovlmenu", FALSE_STR, takeOverOvlmenu);
   setDefaultValue("opaque_screenshots", TRUE_STR, useOpaqueScreenshots);
 
   setDefaultStrValue(DEFAULT_LANG_STR, defaultLang, defaultLang);
@@ -12556,6 +12629,13 @@ void initializeSettingsAndDirectories() {
     currentMenu = OVERLAYS_STR;
     hasInitialized = true;
   }
+}
+
+static void setFooterBackLabel(const bool useRestart) {
+  if (BACK != "Restart") {
+    g_defaultBackLabel = BACK;
+  }
+  BACK = useRestart ? "Restart" : g_defaultBackLabel;
 }
 
 /**
@@ -13309,6 +13389,7 @@ void SwapToMainMenu() { tsl::swapTo<MainMenu>(); }
 // --- CheatMenu Implementation ---
 
 tsl::elm::Element *CheatMenu::createUI() {
+  setFooterBackLabel(false);
   auto *rootFrame = new tsl::elm::OverlayFrame("Breezehand", "Cheat Options");
   auto *list = new tsl::elm::List();
 
