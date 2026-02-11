@@ -187,34 +187,21 @@ bool FlushRecordBuffer(FILE *fp, std::vector<CandidateRecord> &records,
   return true;
 }
 
-bool MatchPrimaryValue(const Search_condition &condition, const u8 *bytes,
-                       size_t available, u64 heapBase, u64 heapEnd, u64 mainBase,
-                       u64 mainEnd) {
-  const searchMode_t mode = condition.searchMode;
-  if (mode == SM_EQ_plus) {
-    if (available < sizeof(double)) {
-      return false;
-    }
-    return search_exec::MatchEqPlus(condition, bytes);
+bool FlushRecordArray(FILE *fp, CandidateRecord *records, size_t &count,
+                      SearchRunStats &stats, std::string *errorOut) {
+  if (count == 0) {
+    return true;
   }
-  if (mode == SM_EQ_plus_plus) {
-    if (available < sizeof(double)) {
-      return false;
-    }
-    return search_exec::MatchEqPlusPlus(condition, bytes);
+  const size_t written = std::fwrite(records, sizeof(CandidateRecord), count, fp);
+  if (written != count) {
+    if (errorOut)
+      *errorOut = "failed to write candidate records";
+    return false;
   }
-
-  return search_exec::DispatchBySearchType(
-      condition.searchType, [&](auto tag) -> bool {
-        using T = typename decltype(tag)::type;
-        if (available < sizeof(T)) {
-          return false;
-        }
-        const T current = search_exec::ReadUnaligned<T>(bytes);
-        return search_exec::MatchModeTyped<T>(mode, current, condition, nullptr,
-                                              nullptr, heapBase, heapEnd,
-                                              mainBase, mainEnd);
-      });
+  stats.entriesWritten += static_cast<u64>(count);
+  stats.bytesWritten += static_cast<u64>(count * sizeof(CandidateRecord));
+  count = 0;
+  return true;
 }
 
 bool MatchSecondaryValue(const Search_condition &condition, u64 previousRaw,
@@ -255,6 +242,193 @@ u64 ReadRaw64FromBytes(const u8 *bytes, size_t available) {
   const size_t copySize = std::min<size_t>(sizeof(raw), available);
   std::memcpy(&raw, bytes, copySize);
   return raw;
+}
+
+template <typename T>
+inline T ReadUnalignedFast(const u8 *ptr) {
+  T out{};
+  std::memcpy(&out, ptr, sizeof(T));
+  return out;
+}
+
+template <typename T, searchMode_t Mode>
+bool ScanPrimaryChunkTight(const Search_condition &condition, const u8 *scanBuffer,
+                           size_t toRead, size_t step, u64 readAddr, u64 heapBase,
+                           u64 heapEnd, u64 mainBase, u64 mainEnd,
+                           CandidateRecord *outRecords, const size_t outCapacity,
+                           size_t &outCount, FILE *out, SearchRunStats &stats,
+                           std::string *errorOut) {
+  const T a = search_exec::SearchValueAs<T>(condition.searchValue_1);
+  const T b = search_exec::SearchValueAs<T>(condition.searchValue_2);
+  const u32 aEq = search_exec::ConditionValue1AsU32(condition);
+
+  for (size_t off = 0; off + sizeof(T) <= toRead; off += step) {
+    if constexpr (Mode == SM_EQ_plus || Mode == SM_EQ_plus_plus) {
+      if (off + sizeof(double) > toRead) {
+        break;
+      }
+    }
+
+    const u8 *ptr = scanBuffer + off;
+
+    bool matched = false;
+    if constexpr (Mode == SM_EQ_plus) {
+      const u32 vU32 = ReadUnalignedFast<u32>(ptr);
+      const float vF32 = ReadUnalignedFast<float>(ptr);
+      const double vF64 = ReadUnalignedFast<double>(ptr);
+      matched = (aEq == vU32) || (static_cast<float>(aEq) == vF32) ||
+                (static_cast<double>(aEq) == vF64);
+    } else if constexpr (Mode == SM_EQ_plus_plus) {
+      const u32 vU32 = ReadUnalignedFast<u32>(ptr);
+      const float vF32 = ReadUnalignedFast<float>(ptr);
+      const double vF64 = ReadUnalignedFast<double>(ptr);
+      const float aF32 = static_cast<float>(aEq);
+      const double aF64 = static_cast<double>(aEq);
+      matched = (aEq == vU32) ||
+                ((vF32 > (aF32 - 1.0f)) && (vF32 < (aF32 + 1.0f))) ||
+                ((vF64 > (aF64 - 1.0)) && (vF64 < (aF64 + 1.0)));
+    } else if constexpr (Mode == SM_EQ) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current == a);
+    } else if constexpr (Mode == SM_NE) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current != a);
+    } else if constexpr (Mode == SM_GT) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current > a);
+    } else if constexpr (Mode == SM_LT) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current < a);
+    } else if constexpr (Mode == SM_GE) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current >= a);
+    } else if constexpr (Mode == SM_LE) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current <= a);
+    } else if constexpr (Mode == SM_RANGE_EQ) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current >= a) && (current <= b);
+    } else if constexpr (Mode == SM_RANGE_LT) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      matched = (current > a) && (current < b);
+    } else if constexpr (Mode == SM_BMEQ) {
+      if constexpr (std::is_integral<T>::value) {
+        const T current = ReadUnalignedFast<T>(ptr);
+        matched = (static_cast<u64>(current) & static_cast<u64>(b)) ==
+                  static_cast<u64>(a);
+      } else {
+        matched = false;
+      }
+    } else if constexpr (Mode == SM_PTR) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      const u64 v = static_cast<u64>(current);
+      matched = ((v >= heapBase) && (v < heapEnd)) ||
+                ((v >= mainBase) && (v < mainEnd));
+    } else if constexpr (Mode == SM_NPTR) {
+      const T current = ReadUnalignedFast<T>(ptr);
+      const u64 v = static_cast<u64>(current);
+      matched = !(((v >= heapBase) && (v < heapEnd)) ||
+                  ((v >= mainBase) && (v < mainEnd)));
+    } else if constexpr (Mode == SM_NoDecimal) {
+      if constexpr (std::is_floating_point<T>::value) {
+        const T current = ReadUnalignedFast<T>(ptr);
+        matched = (current >= a) && (current <= b) &&
+                  (std::trunc(current) == current);
+      } else {
+        matched = false;
+      }
+    } else {
+      matched = false;
+    }
+
+    if (!matched) {
+      continue;
+    }
+
+    CandidateRecord &rec = outRecords[outCount++];
+    rec.address = readAddr + static_cast<u64>(off);
+    rec.value = 0;
+    std::memcpy(&rec.value, ptr, sizeof(T));
+
+    if (outCount == outCapacity) {
+      if (!FlushRecordArray(out, outRecords, outCount, stats, errorOut)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+using ScanPrimaryChunkFn = bool (*)(
+    const Search_condition &condition, const u8 *scanBuffer, size_t toRead,
+    size_t step, u64 readAddr, u64 heapBase, u64 heapEnd, u64 mainBase,
+    u64 mainEnd, CandidateRecord *outRecords, size_t outCapacity, size_t &outCount,
+    FILE *out, SearchRunStats &stats, std::string *errorOut);
+
+template <typename T>
+ScanPrimaryChunkFn ResolvePrimaryChunkScannerForType(searchMode_t mode) {
+  switch (mode) {
+  case SM_EQ:
+    return &ScanPrimaryChunkTight<T, SM_EQ>;
+  case SM_NE:
+    return &ScanPrimaryChunkTight<T, SM_NE>;
+  case SM_GT:
+    return &ScanPrimaryChunkTight<T, SM_GT>;
+  case SM_LT:
+    return &ScanPrimaryChunkTight<T, SM_LT>;
+  case SM_GE:
+    return &ScanPrimaryChunkTight<T, SM_GE>;
+  case SM_LE:
+    return &ScanPrimaryChunkTight<T, SM_LE>;
+  case SM_RANGE_EQ:
+    return &ScanPrimaryChunkTight<T, SM_RANGE_EQ>;
+  case SM_RANGE_LT:
+    return &ScanPrimaryChunkTight<T, SM_RANGE_LT>;
+  case SM_BMEQ:
+    return &ScanPrimaryChunkTight<T, SM_BMEQ>;
+  case SM_EQ_plus:
+    return &ScanPrimaryChunkTight<T, SM_EQ_plus>;
+  case SM_EQ_plus_plus:
+    return &ScanPrimaryChunkTight<T, SM_EQ_plus_plus>;
+  case SM_PTR:
+    return &ScanPrimaryChunkTight<T, SM_PTR>;
+  case SM_NPTR:
+    return &ScanPrimaryChunkTight<T, SM_NPTR>;
+  case SM_NoDecimal:
+    return &ScanPrimaryChunkTight<T, SM_NoDecimal>;
+  default:
+    return nullptr;
+  }
+}
+
+ScanPrimaryChunkFn ResolvePrimaryChunkScanner(const Search_condition &condition) {
+  switch (condition.searchType) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+    return ResolvePrimaryChunkScannerForType<u8>(condition.searchMode);
+  case SEARCH_TYPE_SIGNED_8BIT:
+    return ResolvePrimaryChunkScannerForType<s8>(condition.searchMode);
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+    return ResolvePrimaryChunkScannerForType<u16>(condition.searchMode);
+  case SEARCH_TYPE_SIGNED_16BIT:
+    return ResolvePrimaryChunkScannerForType<s16>(condition.searchMode);
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+    return ResolvePrimaryChunkScannerForType<u32>(condition.searchMode);
+  case SEARCH_TYPE_SIGNED_32BIT:
+    return ResolvePrimaryChunkScannerForType<s32>(condition.searchMode);
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER:
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return ResolvePrimaryChunkScannerForType<u64>(condition.searchMode);
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return ResolvePrimaryChunkScannerForType<s64>(condition.searchMode);
+  case SEARCH_TYPE_FLOAT_32BIT:
+    return ResolvePrimaryChunkScannerForType<float>(condition.searchMode);
+  case SEARCH_TYPE_FLOAT_64BIT:
+    return ResolvePrimaryChunkScannerForType<double>(condition.searchMode);
+  default:
+    return ResolvePrimaryChunkScannerForType<u32>(condition.searchMode);
+  }
 }
 
 void FillHeaderBase(BreezeFileHeader_t &header, const Search_condition &condition,
@@ -299,10 +473,18 @@ bool RunStartSearch(const Search_condition &condition,
 
   const size_t valueSize = TypeByteWidth(condition.searchType);
   const size_t step = SearchStepIncrement(condition.searchType);
+  const ScanPrimaryChunkFn scanChunkFn = ResolvePrimaryChunkScanner(condition);
+  if (!scanChunkFn) {
+    std::fclose(out);
+    if (errorOut)
+      *errorOut = "search mode/type combo not supported for start search";
+    return false;
+  }
   stats.scanBufferBytes = SelectScanBufferBytes();
   std::vector<u8> scanBuffer(stats.scanBufferBytes);
-  std::vector<CandidateRecord> outRecords;
-  outRecords.reserve(kOutputBuffer / sizeof(CandidateRecord));
+  const size_t outCapacity = kOutputBuffer / sizeof(CandidateRecord);
+  std::vector<CandidateRecord> outRecords(outCapacity);
+  size_t outCount = 0;
 
   const u64 heapBase = metadata.heap_extents.base;
   const u64 heapEnd = metadata.heap_extents.base + metadata.heap_extents.size;
@@ -334,22 +516,11 @@ bool RunStartSearch(const Search_condition &condition,
           break;
         }
 
-        for (size_t off = 0; off + valueSize <= toRead; off += step) {
-          const size_t remain = toRead - off;
-          if (!MatchPrimaryValue(condition, scanBuffer.data() + off, remain,
-                                 heapBase, heapEnd, mainBase, mainEnd)) {
-            continue;
-          }
-          CandidateRecord rec{};
-          rec.address = readAddr + static_cast<u64>(off);
-          rec.value = ReadRaw64FromBytes(scanBuffer.data() + off, remain);
-          outRecords.push_back(rec);
-          if (outRecords.size() >= (kOutputBuffer / sizeof(CandidateRecord))) {
-            if (!FlushRecordBuffer(out, outRecords, stats, errorOut)) {
-              std::fclose(out);
-              return false;
-            }
-          }
+        if (!scanChunkFn(condition, scanBuffer.data(), toRead, step, readAddr,
+                         heapBase, heapEnd, mainBase, mainEnd, outRecords.data(),
+                         outCapacity, outCount, out, stats, errorOut)) {
+          std::fclose(out);
+          return false;
         }
         stats.bytesScanned += toRead;
         readAddr += toRead;
@@ -362,7 +533,7 @@ bool RunStartSearch(const Search_condition &condition,
     address = segEnd;
   }
 
-  if (!FlushRecordBuffer(out, outRecords, stats, errorOut)) {
+  if (!FlushRecordArray(out, outRecords.data(), outCount, stats, errorOut)) {
     std::fclose(out);
     return false;
   }
