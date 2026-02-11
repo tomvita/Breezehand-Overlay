@@ -29,6 +29,7 @@
 // #define STBTT_STATIC
 #define TESLA_INIT_IMPL
 
+#include "../common/breeze_search_compat.hpp"
 #include "../common/search_types.hpp"
 #include "keyboard.hpp"
 #include <tesla.hpp>
@@ -39,7 +40,11 @@
 #include <cctype>
 #include <cmath>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <utils.hpp>
@@ -125,6 +130,9 @@ static std::vector<std::string> g_cheatFolderNameStack;
 
 static int g_cheatDownloadIndex = 0;
 static int g_cheatFontSize = 17;
+static bool g_searchConditionReady = false;
+static Search_condition g_searchCondition{};
+static std::string g_searchConditionSourcePath;
 
 #ifdef EDITCHEAT_OVL
 u32 g_cheatIdToEdit = 0;
@@ -10538,6 +10546,979 @@ public:
   }
 };
 
+namespace {
+
+const char *SearchTypeLabel(searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+    return "u8";
+  case SEARCH_TYPE_SIGNED_8BIT:
+    return "s8";
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+    return "u16";
+  case SEARCH_TYPE_SIGNED_16BIT:
+    return "s16";
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+    return "u32";
+  case SEARCH_TYPE_SIGNED_32BIT:
+    return "s32";
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+    return "u64";
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return "s64";
+  case SEARCH_TYPE_FLOAT_32BIT:
+    return "flt";
+  case SEARCH_TYPE_FLOAT_64BIT:
+    return "dbl";
+  case SEARCH_TYPE_POINTER:
+    return "ptr";
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return "u40";
+  default:
+    return "unknown";
+  }
+}
+
+const char *SearchModeLabel(searchMode_t mode) {
+  static const char *const modeNames[] = {
+      "==A",       "!=A",   ">A",      "<A",      ">=A",   "<=A",
+      "[A..B]",    "&B=A",  "<A..B>",  "++",      "--",    "DIFF",
+      "SAME",      "[A,B]", "[A,,B]",  "STRING",  "++Val", "--Val",
+      "==*A",      "==**A", "NONE",    "DIFFB",   "SAMEB", "B++",
+      "B--",       "NotAB", "[A.B.C]", "[A bflip B]", "Advance", "GAP",
+      "{GAP}",     "PTR",   "~PTR",    "[A..B]f.0", "Gen2 data",
+      "Gen2 code", "GETB",  "REBASE",  "Target",  "ptr and offset",
+      "skip",      "Aborted Target Search", "Branch code", "LDRx code",
+      "ADRP code", "EOR code", "GETB==A"};
+
+  const int idx = static_cast<int>(mode);
+  if (idx < 0 ||
+      idx >= static_cast<int>(sizeof(modeNames) / sizeof(modeNames[0]))) {
+    return "unknown";
+  }
+  return modeNames[idx];
+}
+
+std::string TrimCopy(std::string text) {
+  while (!text.empty() &&
+         std::isspace(static_cast<unsigned char>(text.front()))) {
+    text.erase(text.begin());
+  }
+  while (!text.empty() &&
+         std::isspace(static_cast<unsigned char>(text.back()))) {
+    text.pop_back();
+  }
+  return text;
+}
+
+std::string ValueToDisplay(searchValue_t value, searchType_t type) {
+  char buf[64] = {};
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+    std::snprintf(buf, sizeof(buf), "%u", value._u8);
+    break;
+  case SEARCH_TYPE_SIGNED_8BIT:
+    std::snprintf(buf, sizeof(buf), "%d", value._s8);
+    break;
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+    std::snprintf(buf, sizeof(buf), "%u", value._u16);
+    break;
+  case SEARCH_TYPE_SIGNED_16BIT:
+    std::snprintf(buf, sizeof(buf), "%d", value._s16);
+    break;
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+    std::snprintf(buf, sizeof(buf), "%u", value._u32);
+    break;
+  case SEARCH_TYPE_SIGNED_32BIT:
+    std::snprintf(buf, sizeof(buf), "%d", value._s32);
+    break;
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+    std::snprintf(buf, sizeof(buf), "%llu",
+                  static_cast<unsigned long long>(value._u64));
+    break;
+  case SEARCH_TYPE_SIGNED_64BIT:
+    std::snprintf(buf, sizeof(buf), "%lld",
+                  static_cast<long long>(value._s64));
+    break;
+  case SEARCH_TYPE_FLOAT_32BIT:
+    std::snprintf(buf, sizeof(buf), "%.8g", value._f32);
+    break;
+  case SEARCH_TYPE_FLOAT_64BIT:
+    std::snprintf(buf, sizeof(buf), "%.16g", value._f64);
+    break;
+  case SEARCH_TYPE_POINTER:
+    std::snprintf(buf, sizeof(buf), "0x%016llX",
+                  static_cast<unsigned long long>(value._u64));
+    break;
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    std::snprintf(buf, sizeof(buf), "0x%010llX",
+                  static_cast<unsigned long long>(value._u64 & 0xFFFFFFFFFFULL));
+    break;
+  default:
+    std::snprintf(buf, sizeof(buf), "0");
+    break;
+  }
+  return buf;
+}
+
+std::string ValueToEditable(searchValue_t value, searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_POINTER:
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return ValueToDisplay(value, type);
+  default:
+    return ValueToDisplay(value, type);
+  }
+}
+
+std::string ValueToHexDisplay(searchValue_t value, searchType_t type) {
+  char buf[32] = {};
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_8BIT:
+    std::snprintf(buf, sizeof(buf), "0x%02X", static_cast<unsigned>(value._u8));
+    break;
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_16BIT:
+    std::snprintf(buf, sizeof(buf), "0x%04X", static_cast<unsigned>(value._u16));
+    break;
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_FLOAT_32BIT:
+    std::snprintf(buf, sizeof(buf), "0x%08X", value._u32);
+    break;
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    std::snprintf(buf, sizeof(buf), "0x%010llX",
+                  static_cast<unsigned long long>(value._u64 & 0xFFFFFFFFFFULL));
+    break;
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+  case SEARCH_TYPE_POINTER:
+    std::snprintf(buf, sizeof(buf), "0x%016llX",
+                  static_cast<unsigned long long>(value._u64));
+    break;
+  default:
+    std::snprintf(buf, sizeof(buf), "0x0");
+    break;
+  }
+  return buf;
+}
+
+bool ParseHexValueForType(const std::string &text, searchType_t type,
+                          searchValue_t &outValue) {
+  std::string trimmed = TrimCopy(text);
+  if (trimmed.empty()) {
+    return false;
+  }
+  if (trimmed.rfind("0x", 0) == 0 || trimmed.rfind("0X", 0) == 0) {
+    trimmed = trimmed.substr(2);
+  }
+  if (trimmed.empty()) {
+    return false;
+  }
+  for (char c : trimmed) {
+    if (!std::isxdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 16);
+  if (errno != 0 || end == trimmed.c_str() || *end != '\0') {
+    return false;
+  }
+  const u64 v = static_cast<u64>(parsed);
+
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_8BIT:
+    outValue._u8 = static_cast<u8>(v & 0xFFULL);
+    return true;
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_16BIT:
+    outValue._u16 = static_cast<u16>(v & 0xFFFFULL);
+    return true;
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_FLOAT_32BIT:
+    outValue._u32 = static_cast<u32>(v & 0xFFFFFFFFULL);
+    return true;
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    outValue._u64 = v & 0xFFFFFFFFFFULL;
+    return true;
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+  case SEARCH_TYPE_POINTER:
+    outValue._u64 = v;
+    return true;
+  default:
+    return false;
+  }
+}
+
+long double ValueToNumeric(searchValue_t value, searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+    return static_cast<long double>(value._u8);
+  case SEARCH_TYPE_SIGNED_8BIT:
+    return static_cast<long double>(value._s8);
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+    return static_cast<long double>(value._u16);
+  case SEARCH_TYPE_SIGNED_16BIT:
+    return static_cast<long double>(value._s16);
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+    return static_cast<long double>(value._u32);
+  case SEARCH_TYPE_SIGNED_32BIT:
+    return static_cast<long double>(value._s32);
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER:
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return static_cast<long double>(value._u64);
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return static_cast<long double>(value._s64);
+  case SEARCH_TYPE_FLOAT_32BIT:
+    return static_cast<long double>(value._f32);
+  case SEARCH_TYPE_FLOAT_64BIT:
+    return static_cast<long double>(value._f64);
+  default:
+    return 0.0L;
+  }
+}
+
+long double ClampToRange(long double v, long double minV, long double maxV) {
+  if (std::isnan(static_cast<double>(v))) {
+    return 0.0L;
+  }
+  if (v < minV)
+    return minV;
+  if (v > maxV)
+    return maxV;
+  return v;
+}
+
+long double RoundNearest(long double v) { return std::nearbyintl(v); }
+
+searchValue_t ConvertValueType(searchValue_t input, searchType_t fromType,
+                               searchType_t toType) {
+  searchValue_t out{};
+  const long double n = ValueToNumeric(input, fromType);
+
+  switch (toType) {
+  case SEARCH_TYPE_UNSIGNED_8BIT: {
+    const long double r = ClampToRange(RoundNearest(n), 0.0L, 255.0L);
+    out._u8 = static_cast<u8>(r);
+    break;
+  }
+  case SEARCH_TYPE_SIGNED_8BIT: {
+    const long double r = ClampToRange(RoundNearest(n), -128.0L, 127.0L);
+    out._s8 = static_cast<s8>(r);
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_16BIT: {
+    const long double r = ClampToRange(RoundNearest(n), 0.0L, 65535.0L);
+    out._u16 = static_cast<u16>(r);
+    break;
+  }
+  case SEARCH_TYPE_SIGNED_16BIT: {
+    const long double r = ClampToRange(RoundNearest(n), -32768.0L, 32767.0L);
+    out._s16 = static_cast<s16>(r);
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_32BIT: {
+    const long double r =
+        ClampToRange(RoundNearest(n), 0.0L, 4294967295.0L);
+    out._u32 = static_cast<u32>(r);
+    break;
+  }
+  case SEARCH_TYPE_SIGNED_32BIT: {
+    const long double r =
+        ClampToRange(RoundNearest(n), -2147483648.0L, 2147483647.0L);
+    out._s32 = static_cast<s32>(r);
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER: {
+    const long double r = ClampToRange(
+        RoundNearest(n), 0.0L,
+        static_cast<long double>(std::numeric_limits<u64>::max()));
+    out._u64 = static_cast<u64>(r);
+    break;
+  }
+  case SEARCH_TYPE_SIGNED_64BIT: {
+    const long double r = ClampToRange(
+        RoundNearest(n), static_cast<long double>(std::numeric_limits<s64>::min()),
+        static_cast<long double>(std::numeric_limits<s64>::max()));
+    out._s64 = static_cast<s64>(r);
+    break;
+  }
+  case SEARCH_TYPE_FLOAT_32BIT: {
+    const long double r = ClampToRange(
+        n, -static_cast<long double>(std::numeric_limits<float>::max()),
+        static_cast<long double>(std::numeric_limits<float>::max()));
+    out._f32 = static_cast<float>(r);
+    break;
+  }
+  case SEARCH_TYPE_FLOAT_64BIT: {
+    const long double r = ClampToRange(
+        n, -static_cast<long double>(std::numeric_limits<double>::max()),
+        static_cast<long double>(std::numeric_limits<double>::max()));
+    out._f64 = static_cast<double>(r);
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_40BIT: {
+    const long double r = ClampToRange(
+        RoundNearest(n), 0.0L, static_cast<long double>(0xFFFFFFFFFFULL));
+    out._u64 = static_cast<u64>(r) & 0xFFFFFFFFFFULL;
+    break;
+  }
+  default:
+    break;
+  }
+  return out;
+}
+
+std::string SearchDataNote(const Search_condition &condition, int slot,
+                           bool hexMode = false);
+
+bool ParseValueFromText(const std::string &text, searchType_t type,
+                        searchValue_t &outValue) {
+  const std::string trimmed = TrimCopy(text);
+  if (trimmed.empty()) {
+    return false;
+  }
+
+  auto parseUnsigned = [&](u64 &value) -> bool {
+    if (!trimmed.empty() && trimmed[0] == '-') {
+      return false;
+    }
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed =
+        std::strtoull(trimmed.c_str(), &end, 0);
+    if (errno != 0 || end == trimmed.c_str() || *end != '\0') {
+      return false;
+    }
+    value = static_cast<u64>(parsed);
+    return true;
+  };
+
+  auto parseSigned = [&](s64 &value) -> bool {
+    errno = 0;
+    char *end = nullptr;
+    const long long parsed = std::strtoll(trimmed.c_str(), &end, 0);
+    if (errno != 0 || end == trimmed.c_str() || *end != '\0') {
+      return false;
+    }
+    value = static_cast<s64>(parsed);
+    return true;
+  };
+
+  auto parseDouble = [&](double &value) -> bool {
+    errno = 0;
+    char *end = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end);
+    if (errno != 0 || end == trimmed.c_str() || *end != '\0') {
+      return false;
+    }
+    value = parsed;
+    return true;
+  };
+
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT: {
+    u64 parsed = 0;
+    if (!parseUnsigned(parsed) || parsed > 0xFFULL)
+      return false;
+    outValue._u8 = static_cast<u8>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_SIGNED_8BIT: {
+    s64 parsed = 0;
+    if (!parseSigned(parsed) || parsed < -128 || parsed > 127)
+      return false;
+    outValue._s8 = static_cast<s8>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_UNSIGNED_16BIT: {
+    u64 parsed = 0;
+    if (!parseUnsigned(parsed) || parsed > 0xFFFFULL)
+      return false;
+    outValue._u16 = static_cast<u16>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_SIGNED_16BIT: {
+    s64 parsed = 0;
+    if (!parseSigned(parsed) || parsed < -32768 || parsed > 32767)
+      return false;
+    outValue._s16 = static_cast<s16>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_UNSIGNED_32BIT: {
+    u64 parsed = 0;
+    if (!parseUnsigned(parsed) || parsed > 0xFFFFFFFFULL)
+      return false;
+    outValue._u32 = static_cast<u32>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_SIGNED_32BIT: {
+    s64 parsed = 0;
+    if (!parseSigned(parsed) || parsed < -2147483648LL ||
+        parsed > 2147483647LL)
+      return false;
+    outValue._s32 = static_cast<s32>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER: {
+    u64 parsed = 0;
+    if (!parseUnsigned(parsed))
+      return false;
+    outValue._u64 = parsed;
+    return true;
+  }
+  case SEARCH_TYPE_SIGNED_64BIT: {
+    s64 parsed = 0;
+    if (!parseSigned(parsed))
+      return false;
+    outValue._s64 = parsed;
+    return true;
+  }
+  case SEARCH_TYPE_FLOAT_32BIT: {
+    double parsed = 0.0;
+    if (!parseDouble(parsed))
+      return false;
+    outValue._f32 = static_cast<float>(parsed);
+    return true;
+  }
+  case SEARCH_TYPE_FLOAT_64BIT: {
+    double parsed = 0.0;
+    if (!parseDouble(parsed))
+      return false;
+    outValue._f64 = parsed;
+    return true;
+  }
+  case SEARCH_TYPE_UNSIGNED_40BIT: {
+    u64 parsed = 0;
+    if (!parseUnsigned(parsed))
+      return false;
+    outValue._u64 = parsed & 0xFFFFFFFFFFULL;
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+std::string SearchConditionSummary(const Search_condition &condition) {
+  return std::string(SearchTypeLabel(condition.searchType)) + " " +
+         SearchModeLabel(condition.searchMode) + " A=" +
+         SearchDataNote(condition, 0) + " B=" + SearchDataNote(condition, 1) +
+         " C=" + SearchDataNote(condition, 2);
+}
+
+std::string SearchDataNote(const Search_condition &condition, int slot,
+                           bool hexMode) {
+  const bool stringMode = condition.searchMode == SM_STRING;
+  if (stringMode && slot == 0) {
+    return std::string("text=\"") + condition.searchString + "\"";
+  }
+  if (slot == 0) {
+    return hexMode ? ValueToHexDisplay(condition.searchValue_1, condition.searchType)
+                   : ValueToDisplay(condition.searchValue_1, condition.searchType);
+  }
+  if (slot == 1) {
+    return hexMode ? ValueToHexDisplay(condition.searchValue_2, condition.searchType)
+                   : ValueToDisplay(condition.searchValue_2, condition.searchType);
+  }
+  return hexMode ? ValueToHexDisplay(condition.searchValue_3, condition.searchType)
+                 : ValueToDisplay(condition.searchValue_3, condition.searchType);
+}
+
+bool TryLoadConditionFromLatestCandidate() {
+  Search_condition loaded{};
+  std::string filePath;
+  std::string error;
+  if (!breeze::LoadLatestCandidateCondition(loaded, filePath, &error)) {
+    return false;
+  }
+  g_searchCondition = loaded;
+  g_searchConditionSourcePath = filePath;
+  g_searchConditionReady = true;
+  return true;
+}
+
+searchType_t KeyboardTypeForDataSlot(const Search_condition &condition,
+                                     int slot, bool hexMode = false) {
+  if (condition.searchMode == SM_STRING && slot == 0) {
+    return SEARCH_TYPE_TEXT;
+  }
+  if (hexMode) {
+    return SEARCH_TYPE_HEX;
+  }
+  switch (condition.searchType) {
+  case SEARCH_TYPE_FLOAT_32BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+    return SEARCH_TYPE_DOUBLE;
+  case SEARCH_TYPE_SIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return SEARCH_TYPE_SIGNED_64BIT;
+  default:
+    return SEARCH_TYPE_UNSIGNED_64BIT;
+  }
+}
+
+std::string EditableDataText(const Search_condition &condition, int slot,
+                             bool hexMode = false) {
+  if (condition.searchMode == SM_STRING && slot == 0) {
+    return condition.searchString;
+  }
+  if (hexMode) {
+    if (slot == 0) {
+      return ValueToHexDisplay(condition.searchValue_1, condition.searchType);
+    }
+    if (slot == 1) {
+      return ValueToHexDisplay(condition.searchValue_2, condition.searchType);
+    }
+    return ValueToHexDisplay(condition.searchValue_3, condition.searchType);
+  }
+  if (slot == 0) {
+    return ValueToEditable(condition.searchValue_1, condition.searchType);
+  }
+  if (slot == 1) {
+    return ValueToEditable(condition.searchValue_2, condition.searchType);
+  }
+  return ValueToEditable(condition.searchValue_3, condition.searchType);
+}
+
+bool ApplyDataText(Search_condition &condition, int slot, const std::string &text,
+                   bool hexMode = false) {
+  if (condition.searchMode == SM_STRING && slot == 0) {
+    const std::string trimmed = text.substr(0, sizeof(condition.searchString) - 1);
+    std::memset(condition.searchString, 0, sizeof(condition.searchString));
+    std::memcpy(condition.searchString, trimmed.data(), trimmed.size());
+    condition.searchStringLen = static_cast<u8>(trimmed.size());
+    return true;
+  }
+
+  searchValue_t parsed{};
+  if (hexMode) {
+    if (!ParseHexValueForType(text, condition.searchType, parsed)) {
+      return false;
+    }
+  } else if (!ParseValueFromText(text, condition.searchType, parsed)) {
+    return false;
+  }
+  if (slot == 0) {
+    condition.searchValue_1 = parsed;
+  } else if (slot == 1) {
+    condition.searchValue_2 = parsed;
+  } else {
+    condition.searchValue_3 = parsed;
+  }
+  return true;
+}
+
+class SearchTypeSelectMenu : public tsl::Gui {
+public:
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame = new tsl::elm::OverlayFrame("Search Type", "");
+    auto *list = new tsl::elm::List();
+    list->addItem(new tsl::elm::CategoryHeader("Select Type"));
+
+    const std::vector<searchType_t> types = {
+        SEARCH_TYPE_UNSIGNED_8BIT,  SEARCH_TYPE_SIGNED_8BIT,
+        SEARCH_TYPE_UNSIGNED_16BIT, SEARCH_TYPE_SIGNED_16BIT,
+        SEARCH_TYPE_UNSIGNED_32BIT, SEARCH_TYPE_SIGNED_32BIT,
+        SEARCH_TYPE_UNSIGNED_64BIT, SEARCH_TYPE_SIGNED_64BIT,
+        SEARCH_TYPE_FLOAT_32BIT,    SEARCH_TYPE_FLOAT_64BIT,
+        SEARCH_TYPE_POINTER,        SEARCH_TYPE_UNSIGNED_40BIT};
+
+    for (const auto type : types) {
+      auto *item = new tsl::elm::ListItem(SearchTypeLabel(type));
+      item->setNote(type == g_searchCondition.searchType ? "current" : "");
+      item->setAlwaysShowNote(true);
+      item->setClickListener([type](u64 keys) {
+        if (keys & KEY_A) {
+          const searchType_t oldType = g_searchCondition.searchType;
+          if (oldType != type) {
+            g_searchCondition.searchValue_1 =
+                ConvertValueType(g_searchCondition.searchValue_1, oldType, type);
+            g_searchCondition.searchValue_2 =
+                ConvertValueType(g_searchCondition.searchValue_2, oldType, type);
+            g_searchCondition.searchValue_3 =
+                ConvertValueType(g_searchCondition.searchValue_3, oldType, type);
+          }
+          g_searchCondition.searchType = type;
+          return tsl::goBack(), true;
+        }
+        return false;
+      });
+      list->addItem(item);
+    }
+
+    frame->setContent(list);
+    return frame;
+  }
+};
+
+class SearchModeSelectMenu : public tsl::Gui {
+private:
+  struct ModeItemInfo {
+    tsl::elm::ListItem *item;
+    searchMode_t mode;
+  };
+
+  std::vector<ModeItemInfo> m_items;
+  static inline bool s_showModeHelpNotes = false;
+
+  std::string ModeHelpText(searchMode_t mode) const {
+    switch (mode) {
+    case SM_EQ:
+      return "Match values exactly equal to A.";
+    case SM_NE:
+      return "Match values not equal to A.";
+    case SM_GT:
+      return "Match values greater than A.";
+    case SM_GE:
+      return "Match values greater than or equal to A.";
+    case SM_LT:
+      return "Match values less than A.";
+    case SM_LE:
+      return "Match values less than or equal to A.";
+    case SM_RANGE_EQ:
+      return "Match values inside inclusive range [A..B].";
+    case SM_RANGE_LT:
+      return "Match values strictly between A and B.";
+    case SM_TWO_VALUE:
+      return "Pair search: match A and B in nearby slots.";
+    case SM_TWO_VALUE_PLUS:
+      return "Pair+ search with wider/relaxed pairing.";
+    case SM_THREE_VALUE:
+      return "Triple-value search using A, B and C.";
+    case SM_STRING:
+      return "String search using text in A.";
+    case SM_MORE:
+      return "Compare against previous scan; value increased.";
+    case SM_LESS:
+      return "Compare against previous scan; value decreased.";
+    case SM_DIFF:
+      return "Compare against previous scan; value changed.";
+    case SM_SAME:
+      return "Compare against previous scan; value unchanged.";
+    case SM_INC_BY:
+      return "Value increased by exactly A from previous scan.";
+    case SM_DEC_BY:
+      return "Value decreased by exactly A from previous scan.";
+    case SM_PTR:
+      return "Match values that look like valid pointers.";
+    case SM_NPTR:
+      return "Match values that are not valid pointers.";
+    case SM_BMEQ:
+      return "Bitmask compare: (value & B) equals A.";
+    case SM_NoDecimal:
+      return "Float-range match while enforcing integer-like result.";
+    case SM_GETB:
+      return "Take values from B-source candidate list.";
+    case SM_GETBZ:
+      return "Take B-source values where B equals A.";
+    default:
+      return "Mode behavior follows Breeze engine semantics.";
+    }
+  }
+
+  void RefreshModeNotes() {
+    for (auto &entry : m_items) {
+      if (entry.item == nullptr)
+        continue;
+      if (s_showModeHelpNotes) {
+        const std::string prefix =
+            (entry.mode == g_searchCondition.searchMode) ? "[Current] " : "";
+        entry.item->setNote(prefix + ModeHelpText(entry.mode));
+      } else {
+        entry.item->setNote("");
+      }
+    }
+  }
+
+  void AddModeItem(tsl::elm::List *list, const char *label, searchMode_t mode) {
+    auto *item = new tsl::elm::ListItem(label);
+    item->setAlwaysShowNote(true);
+    item->setClickListener([mode](u64 keys) {
+      if (keys & KEY_A) {
+        g_searchCondition.searchMode = mode;
+        return tsl::goBack(), true;
+      }
+      return false;
+    });
+    list->addItem(item);
+    m_items.push_back({item, mode});
+  }
+
+public:
+  ~SearchModeSelectMenu() override { ult::FOOTER_Y_HINT.clear(); }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_Y) {
+      s_showModeHelpNotes = !s_showModeHelpNotes;
+      RefreshModeNotes();
+      return true;
+    }
+    if (keysDown & KEY_B) {
+      ult::FOOTER_Y_HINT.clear();
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    ult::FOOTER_Y_HINT = NOTES;
+    auto *frame = new tsl::elm::OverlayFrame("Search Mode", "");
+    auto *list = new tsl::elm::List();
+
+    list->addItem(new tsl::elm::CategoryHeader("Basic"));
+    AddModeItem(list, "Equal (==A)", SM_EQ);
+    AddModeItem(list, "Not equal (!=A)", SM_NE);
+    AddModeItem(list, "Greater than (>A)", SM_GT);
+    AddModeItem(list, "Greater or equal (>=A)", SM_GE);
+    AddModeItem(list, "Less than (<A)", SM_LT);
+    AddModeItem(list, "Less or equal (<=A)", SM_LE);
+
+    list->addItem(new tsl::elm::CategoryHeader("Range / Multi-Value"));
+    AddModeItem(list, "Range [A..B]", SM_RANGE_EQ);
+    AddModeItem(list, "Range exclusive <A..B>", SM_RANGE_LT);
+    AddModeItem(list, "Two value [A,B]", SM_TWO_VALUE);
+    AddModeItem(list, "Two value + [A,,B]", SM_TWO_VALUE_PLUS);
+    AddModeItem(list, "Three value [A.B.C]", SM_THREE_VALUE);
+    AddModeItem(list, "String", SM_STRING);
+
+    list->addItem(new tsl::elm::CategoryHeader("Relative"));
+    AddModeItem(list, "More (++)", SM_MORE);
+    AddModeItem(list, "Less (--)", SM_LESS);
+    AddModeItem(list, "Different", SM_DIFF);
+    AddModeItem(list, "Same", SM_SAME);
+    AddModeItem(list, "Increase by A", SM_INC_BY);
+    AddModeItem(list, "Decrease by A", SM_DEC_BY);
+
+    list->addItem(new tsl::elm::CategoryHeader("Pointer / Other"));
+    AddModeItem(list, "Pointer", SM_PTR);
+    AddModeItem(list, "Not pointer", SM_NPTR);
+    AddModeItem(list, "Bitmask (&B=A)", SM_BMEQ);
+    AddModeItem(list, "No decimal [A..B]f.0", SM_NoDecimal);
+    AddModeItem(list, "GetB", SM_GETB);
+    AddModeItem(list, "GetB==A", SM_GETBZ);
+
+    RefreshModeNotes();
+    frame->setContent(list);
+    return frame;
+  }
+
+  virtual void update() override { RefreshModeNotes(); }
+};
+
+class SearchDataMenu : public tsl::Gui {
+private:
+  static inline bool s_hexMode = false;
+  tsl::elm::ListItem *m_hexModeItem = nullptr;
+  tsl::elm::ListItem *m_itemA = nullptr;
+  tsl::elm::ListItem *m_itemB = nullptr;
+  tsl::elm::ListItem *m_itemC = nullptr;
+
+  void RefreshNotes() {
+    if (m_hexModeItem) {
+      m_hexModeItem->setNote(s_hexMode ? ON : OFF);
+    }
+    if (m_itemA)
+      m_itemA->setNote("A=" + SearchDataNote(g_searchCondition, 0, s_hexMode));
+    if (m_itemB)
+      m_itemB->setNote("B=" + SearchDataNote(g_searchCondition, 1, s_hexMode));
+    if (m_itemC)
+      m_itemC->setNote("C=" + SearchDataNote(g_searchCondition, 2, s_hexMode));
+  }
+
+  void OpenEditorForSlot(int slot, const std::string &title) {
+    const searchType_t keyboardType =
+        KeyboardTypeForDataSlot(g_searchCondition, slot, s_hexMode);
+    const std::string initial = EditableDataText(g_searchCondition, slot, s_hexMode);
+    tsl::changeTo<tsl::KeyboardGui>(
+        keyboardType, initial, title,
+        [slot](std::string result) {
+          if (!ApplyDataText(g_searchCondition, slot, result, s_hexMode)) {
+            if (tsl::notification) {
+              tsl::notification->show("Invalid value");
+            }
+            return;
+          }
+          tsl::goBack();
+        },
+        nullptr, false);
+  }
+
+public:
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame = new tsl::elm::OverlayFrame("Search Data", "");
+    auto *list = new tsl::elm::List();
+    list->addItem(new tsl::elm::CategoryHeader("Edit Values"));
+
+    m_hexModeItem = new tsl::elm::ListItem("Hex mode");
+    m_hexModeItem->setAlwaysShowNote(true);
+    m_hexModeItem->setClickListener([this](u64 keys) {
+      if (keys & KEY_A) {
+        s_hexMode = !s_hexMode;
+        RefreshNotes();
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_hexModeItem);
+
+    m_itemA = new tsl::elm::ListItem("A");
+    m_itemA->setAlwaysShowNote(true);
+    m_itemA->setClickListener([this](u64 keys) {
+      if (keys & KEY_A) {
+        OpenEditorForSlot(0, "Edit A");
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_itemA);
+
+    m_itemB = new tsl::elm::ListItem("B");
+    m_itemB->setAlwaysShowNote(true);
+    m_itemB->setClickListener([this](u64 keys) {
+      if (keys & KEY_A) {
+        OpenEditorForSlot(1, "Edit B");
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_itemB);
+
+    m_itemC = new tsl::elm::ListItem("C");
+    m_itemC->setAlwaysShowNote(true);
+    m_itemC->setClickListener([this](u64 keys) {
+      if (keys & KEY_A) {
+        OpenEditorForSlot(2, "Edit C");
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_itemC);
+
+    RefreshNotes();
+    frame->setContent(list);
+    return frame;
+  }
+
+  virtual void update() override { RefreshNotes(); }
+};
+
+class SearchSetupMenu : public tsl::Gui {
+private:
+  tsl::elm::ListItem *m_modeItem = nullptr;
+  tsl::elm::ListItem *m_typeItem = nullptr;
+  tsl::elm::ListItem *m_dataItem = nullptr;
+
+  void RefreshNotes() {
+    if (m_modeItem) {
+      m_modeItem->setNote(SearchModeLabel(g_searchCondition.searchMode));
+    }
+    if (m_typeItem) {
+      m_typeItem->setNote(SearchTypeLabel(g_searchCondition.searchType));
+    }
+    if (m_dataItem) {
+      m_dataItem->setNote("A=" + SearchDataNote(g_searchCondition, 0) +
+                          " B=" + SearchDataNote(g_searchCondition, 1) +
+                          " C=" + SearchDataNote(g_searchCondition, 2));
+    }
+  }
+
+public:
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame = new tsl::elm::OverlayFrame("Setup Search", "");
+    auto *list = new tsl::elm::List();
+    list->addItem(new tsl::elm::CategoryHeader("Search Condition"));
+
+    m_modeItem = new tsl::elm::ListItem("Search mode");
+    m_modeItem->setAlwaysShowNote(true);
+    m_modeItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        tsl::changeTo<SearchModeSelectMenu>();
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_modeItem);
+
+    m_typeItem = new tsl::elm::ListItem("Search type");
+    m_typeItem->setAlwaysShowNote(true);
+    m_typeItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        tsl::changeTo<SearchTypeSelectMenu>();
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_typeItem);
+
+    m_dataItem = new tsl::elm::ListItem("Search data");
+    m_dataItem->setAlwaysShowNote(true);
+    m_dataItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        tsl::changeTo<SearchDataMenu>();
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_dataItem);
+
+    RefreshNotes();
+    frame->setContent(list);
+    return frame;
+  }
+
+  virtual void update() override { RefreshNotes(); }
+};
+
+} // namespace
+
 class MainMenu : public tsl::Gui {
 
 private:
@@ -10557,6 +11538,7 @@ private:
   u32 m_updateCounter = 0;
   static constexpr u32 CHECK_INTERVAL = 50;
   bool m_noGameRunning = false;
+  tsl::elm::ListItem *m_setupSearchItem = nullptr;
   // bool initializingSpawn = false;
   // std::string defaultLang = "en";
 
@@ -10738,23 +11720,30 @@ public:
 
     addHeader(list, "Search Manager", "");
 
+    if (!TryLoadConditionFromLatestCandidate() && !g_searchConditionReady) {
+      g_searchCondition = Search_condition{};
+      g_searchConditionReady = true;
+    }
+
     auto *setupSearchItem = new tsl::elm::ListItem("Setup search");
+    setupSearchItem->setAlwaysShowNote(true);
+    setupSearchItem->setNote(SearchConditionSummary(g_searchCondition));
     setupSearchItem->setClickListener([](u64 keys) {
       if (keys & KEY_A) {
-        if (tsl::notification) {
-          tsl::notification->show("Setup search not implemented yet");
-        }
+        tsl::changeTo<SearchSetupMenu>();
         return true;
       }
       return false;
     });
     list->addItem(setupSearchItem);
+    m_setupSearchItem = setupSearchItem;
 
     auto *startSearchItem = new tsl::elm::ListItem("Start search");
     startSearchItem->setClickListener([](u64 keys) {
       if (keys & KEY_A) {
         if (tsl::notification) {
-          tsl::notification->show("Start search not implemented yet");
+          tsl::notification->show("Ready: " +
+                                  SearchConditionSummary(g_searchCondition));
         }
         return true;
       }
@@ -10766,7 +11755,9 @@ public:
     continueSearchItem->setClickListener([](u64 keys) {
       if (keys & KEY_A) {
         if (tsl::notification) {
-          tsl::notification->show("Continue search not implemented yet");
+          tsl::notification->show(g_searchConditionSourcePath.empty()
+                                      ? "Continue search not implemented yet"
+                                      : "Source: " + g_searchConditionSourcePath);
         }
         return true;
       }
@@ -11815,6 +12806,13 @@ public:
         !inHiddenMode.load(std::memory_order_acquire) &&
         dropdownSection.empty();
     setFooterBackLabel(shouldShowRestartLabel);
+
+    if (menuMode == SEARCH_MANAGER_MENU_MODE && m_setupSearchItem) {
+      const std::string summary = SearchConditionSummary(g_searchCondition);
+      if (m_setupSearchItem->getNote() != summary) {
+        m_setupSearchItem->setNote(summary);
+      }
+    }
 
     if ((keysHeld & KEY_ZL) && menuMode == OVERLAYS_STR) {
       if (keysDown & KEY_R) {
