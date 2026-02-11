@@ -11907,18 +11907,6 @@ public:
     auto *list = new tsl::elm::List();
     list->addItem(new tsl::elm::CategoryHeader("Edit Values"));
 
-    m_hexModeItem = new tsl::elm::ListItem("Hex mode");
-    m_hexModeItem->setAlwaysShowNote(true);
-    m_hexModeItem->setClickListener([this](u64 keys) {
-      if (keys & KEY_A) {
-        s_hexMode = !s_hexMode;
-        RefreshNotes();
-        return true;
-      }
-      return false;
-    });
-    list->addItem(m_hexModeItem);
-
     m_itemA = new tsl::elm::ListItem("A");
     m_itemA->setAlwaysShowNote(true);
     m_itemA->setClickListener([this](u64 keys) {
@@ -11951,6 +11939,18 @@ public:
       return false;
     });
     list->addItem(m_itemC);
+    
+    m_hexModeItem = new tsl::elm::ListItem("Hex mode");
+    m_hexModeItem->setAlwaysShowNote(true);
+    m_hexModeItem->setClickListener([this](u64 keys) {
+      if (keys & KEY_A) {
+        s_hexMode = !s_hexMode;
+        RefreshNotes();
+        return true;
+      }
+      return false;
+    });
+    list->addItem(m_hexModeItem);
 
     RefreshNotes();
     frame->setContent(list);
