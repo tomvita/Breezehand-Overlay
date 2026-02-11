@@ -11021,11 +11021,50 @@ std::string SearchConditionSummary(const Search_condition &condition) {
 
 std::string SearchDataNote(const Search_condition &condition, int slot,
                            bool hexMode) {
+  auto eqPlusDerivedNote = [&](bool exclusiveRange) -> std::string {
+    const searchValue_t asU32 =
+        ConvertValueType(condition.searchValue_1, condition.searchType,
+                         SEARCH_TYPE_UNSIGNED_32BIT);
+    const searchValue_t asF32 =
+        ConvertValueType(condition.searchValue_1, condition.searchType,
+                         SEARCH_TYPE_FLOAT_32BIT);
+    const searchValue_t asF64 =
+        ConvertValueType(condition.searchValue_1, condition.searchType,
+                         SEARCH_TYPE_FLOAT_64BIT);
+
+    if (!exclusiveRange) {
+      return "u32=" + ValueToDisplay(asU32, SEARCH_TYPE_UNSIGNED_32BIT) +
+             " flt=" + ValueToDisplay(asF32, SEARCH_TYPE_FLOAT_32BIT) +
+             " dbl=" + ValueToDisplay(asF64, SEARCH_TYPE_FLOAT_64BIT);
+    }
+
+    const double f32Center = static_cast<double>(asF32._f32);
+    const double f32Low = f32Center - 1.0;
+    const double f32High = f32Center + 1.0;
+    const double f64Center = asF64._f64;
+    const double f64Low = f64Center - 1.0;
+    const double f64High = f64Center + 1.0;
+
+    char f32buf[96] = {};
+    char f64buf[128] = {};
+    std::snprintf(f32buf, sizeof(f32buf), "flt<%.8g..%.8g>", f32Low, f32High);
+    std::snprintf(f64buf, sizeof(f64buf), "dbl<%.16g..%.16g>", f64Low, f64High);
+
+    return "u32=" + ValueToDisplay(asU32, SEARCH_TYPE_UNSIGNED_32BIT) + " " +
+           std::string(f32buf) + " " + std::string(f64buf);
+  };
+
   const bool stringMode = condition.searchMode == SM_STRING;
   if (stringMode && slot == 0) {
     return std::string("text=\"") + condition.searchString + "\"";
   }
   if (slot == 0) {
+    if (condition.searchMode == SM_EQ_plus) {
+      return eqPlusDerivedNote(false);
+    }
+    if (condition.searchMode == SM_EQ_plus_plus) {
+      return eqPlusDerivedNote(true);
+    }
     return hexMode ? ValueToHexDisplay(condition.searchValue_1, condition.searchType)
                    : ValueToDisplay(condition.searchValue_1, condition.searchType);
   }
@@ -11171,6 +11210,11 @@ public:
       list->addItem(item);
     }
 
+    const char *selectedTypeLabel = SearchTypeLabel(g_searchCondition.searchType);
+    if (selectedTypeLabel && selectedTypeLabel[0] != '\0') {
+      list->jumpToItem(selectedTypeLabel, "", true);
+    }
+
     frame->setContent(list);
     return frame;
   }
@@ -11178,6 +11222,7 @@ public:
 
 class SearchModeSelectMenu : public tsl::Gui {
 private:
+  tsl::elm::List *m_list = nullptr;
   struct ModeItemInfo {
     tsl::elm::ListItem *item;
     searchMode_t mode;
@@ -11185,6 +11230,65 @@ private:
 
   std::vector<ModeItemInfo> m_items;
   static inline bool s_showModeHelpNotes = false;
+
+  const char *ModeMenuLabel(searchMode_t mode) const {
+    switch (mode) {
+    case SM_EQ:
+      return "Equal (==A)";
+    case SM_NE:
+      return "Not equal (!=A)";
+    case SM_GT:
+      return "Greater than (>A)";
+    case SM_GE:
+      return "Greater or equal (>=A)";
+    case SM_LT:
+      return "Less than (<A)";
+    case SM_LE:
+      return "Less or equal (<=A)";
+    case SM_RANGE_EQ:
+      return "Range [A..B]";
+    case SM_RANGE_LT:
+      return "Range exclusive <A..B>";
+    case SM_TWO_VALUE:
+      return "Two value [A,B]";
+    case SM_TWO_VALUE_PLUS:
+      return "Two value + [A,,B]";
+    case SM_THREE_VALUE:
+      return "Three value [A.B.C]";
+    case SM_STRING:
+      return "String";
+    case SM_MORE:
+      return "More (++)";
+    case SM_LESS:
+      return "Less (--)";
+    case SM_DIFF:
+      return "Different";
+    case SM_SAME:
+      return "Same";
+    case SM_INC_BY:
+      return "Increase by A";
+    case SM_DEC_BY:
+      return "Decrease by A";
+    case SM_EQ_plus:
+      return "==*A";
+    case SM_EQ_plus_plus:
+      return "==**A";
+    case SM_PTR:
+      return "Pointer";
+    case SM_NPTR:
+      return "Not pointer";
+    case SM_BMEQ:
+      return "Bitmask (&B=A)";
+    case SM_NoDecimal:
+      return "No decimal [A..B]f.0";
+    case SM_GETB:
+      return "GetB";
+    case SM_GETBZ:
+      return "GetB==A";
+    default:
+      return "";
+    }
+  }
 
   std::string ModeHelpText(searchMode_t mode) const {
     switch (mode) {
@@ -11224,6 +11328,10 @@ private:
       return "Value increased by exactly A from previous scan.";
     case SM_DEC_BY:
       return "Value decreased by exactly A from previous scan.";
+    case SM_EQ_plus:
+      return "Convert A from current search type to u32/flt/dbl and match all 3 exactly.";
+    case SM_EQ_plus_plus:
+      return "Convert A to u32/flt/dbl; u32 exact, flt/dbl in exclusive <A-1..A+1>.";
     case SM_PTR:
       return "Match values that look like valid pointers.";
     case SM_NPTR:
@@ -11252,6 +11360,9 @@ private:
       } else {
         entry.item->setNote("");
       }
+    }
+    if (m_list) {
+      m_list->recalculateLayout();
     }
   }
 
@@ -11292,6 +11403,11 @@ public:
     ult::FOOTER_Y_HINT = NOTES;
     auto *frame = new tsl::elm::OverlayFrame("Search Mode", "");
     auto *list = new tsl::elm::List();
+    m_list = list;
+
+    list->addItem(new tsl::elm::CategoryHeader("Eq* Multi-Type"));
+    AddModeItem(list, "==*A", SM_EQ_plus);
+    AddModeItem(list, "==**A", SM_EQ_plus_plus);
 
     list->addItem(new tsl::elm::CategoryHeader("Basic"));
     AddModeItem(list, "Equal (==A)", SM_EQ);
@@ -11326,6 +11442,10 @@ public:
     AddModeItem(list, "GetB==A", SM_GETBZ);
 
     RefreshModeNotes();
+    const char *selectedLabel = ModeMenuLabel(g_searchCondition.searchMode);
+    if (selectedLabel && selectedLabel[0] != '\0') {
+      list->jumpToItem(selectedLabel, "", true);
+    }
     frame->setContent(list);
     return frame;
   }
