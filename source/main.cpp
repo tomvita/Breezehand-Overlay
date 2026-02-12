@@ -11246,13 +11246,17 @@ std::string CandidateStatusFromHeader(const breeze::BreezeFileHeader_t &header) 
       modeText, 'B', SearchDataNote(header.search_condition, 1));
   modeText = replaceStandaloneToken(
       modeText, 'C', SearchDataNote(header.search_condition, 2));
-  char compact[256] = {};
+  const std::string previousFile =
+      (header.prefilename[0] != '\0')
+          ? (std::string(" p=") + std::string(header.prefilename))
+          : std::string();
+  char compact[512] = {};
   std::snprintf(compact, sizeof(compact), "%llu %s Search %s %s%s",
                 static_cast<unsigned long long>(entryCount),
                 stepCode(header.search_condition.search_step),
                 SearchTypeLabel(header.search_condition.searchType),
                 modeText.c_str(),
-                (header.prefilename[0] != '\0') ? " p=1" : "");
+                previousFile.c_str());
 
   if (header.search_condition.searchMode == SM_Target ||
       header.search_condition.searchMode == SM_Aborted_Target) {
@@ -11641,7 +11645,7 @@ bool IsSeriesStartStem(const std::string &stem) {
 
 class ContinueSearchFileMenu : public tsl::Gui {
 private:
-  static inline int s_filterMode = 0; // 0=all, 1=series starts, 2=focused series
+  static inline int s_filterMode = 1; // 1=series starts, 2=focused series
   static inline std::string s_filterAnchorStem;
   tsl::elm::List *m_list = nullptr;
 
@@ -11650,7 +11654,7 @@ public:
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
     if (keysDown & KEY_Y) {
-      s_filterMode = (s_filterMode + 1) % 3;
+      s_filterMode = (s_filterMode == 1) ? 2 : 1;
       if (s_filterMode == 2) {
         std::string anchor = CandidateStemFromPath(g_searchContinueSourcePath);
         if (m_list) {
@@ -11678,12 +11682,9 @@ public:
   }
 
   virtual tsl::elm::Element *createUI() override {
-    std::string subtitle = "All series";
-    if (s_filterMode == 1) {
-      subtitle = "Series starts only";
-    } else if (s_filterMode == 2) {
-      subtitle = "Filtered (focused series)";
-    }
+    std::string subtitle =
+        (s_filterMode == 2) ? "Filtered (focused series)"
+                            : "Series starts only";
     auto *frame = new tsl::elm::OverlayFrame("Continue Source", subtitle);
     auto *list = new tsl::elm::List();
     m_list = list;
