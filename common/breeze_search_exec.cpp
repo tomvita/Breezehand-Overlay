@@ -1,10 +1,12 @@
 #include "breeze_search_exec.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ultra.hpp>
@@ -205,6 +207,46 @@ bool FlushRecordArray(FILE *fp, CandidateRecord *records, size_t &count,
   stats.bytesWritten += static_cast<u64>(count * sizeof(CandidateRecord));
   count = 0;
   return true;
+}
+
+bool ControlWantsAbort(const SearchRunControl *control, SearchRunStats &stats) {
+  if (!control || !control->abortRequested) {
+    return false;
+  }
+  if (!control->abortRequested->load(std::memory_order_acquire)) {
+    return false;
+  }
+  stats.aborted = true;
+  return true;
+}
+
+bool PollRunControl(const SearchRunControl *control, SearchRunStats &stats) {
+  if (!control) {
+    return true;
+  }
+  if (ControlWantsAbort(control, stats)) {
+    if (control->isPaused) {
+      control->isPaused->store(false, std::memory_order_release);
+    }
+    return false;
+  }
+  if (control->pauseRequested &&
+      control->pauseRequested->load(std::memory_order_acquire)) {
+    if (control->isPaused) {
+      control->isPaused->store(true, std::memory_order_release);
+    }
+    while (control->pauseRequested->load(std::memory_order_acquire) &&
+           !ControlWantsAbort(control, stats)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (control->isPaused) {
+      control->isPaused->store(false, std::memory_order_release);
+    }
+    if (stats.aborted) {
+      return false;
+    }
+  }
+  return !ControlWantsAbort(control, stats);
 }
 
 template <typename T>
@@ -634,7 +676,7 @@ void FillHeaderBase(BreezeFileHeader_t &header, const Search_condition &conditio
 
 bool RunStartSearch(const Search_condition &condition,
                     const std::string &outputStem, SearchRunStats &stats,
-                    std::string *errorOut) {
+                    std::string *errorOut, const SearchRunControl *control) {
   stats = SearchRunStats{};
   if (!IsModeSupported(condition.searchMode, false)) {
     if (errorOut)
@@ -675,6 +717,15 @@ bool RunStartSearch(const Search_condition &condition,
   const size_t outCapacity = kOutputBuffer / sizeof(CandidateRecord);
   std::vector<CandidateRecord> outRecords(outCapacity);
   size_t outCount = 0;
+  if (control && control->progressCurrent) {
+    control->progressCurrent->store(0, std::memory_order_release);
+  }
+  if (control && control->progressTotal) {
+    control->progressTotal->store(0, std::memory_order_release);
+  }
+  if (control && control->isPaused) {
+    control->isPaused->store(false, std::memory_order_release);
+  }
 
   const u64 heapBase = metadata.heap_extents.base;
   const u64 heapEnd = metadata.heap_extents.base + metadata.heap_extents.size;
@@ -684,7 +735,13 @@ bool RunStartSearch(const Search_condition &condition,
   const u64 startTime = armGetSystemTick();
   MemoryInfo info{};
   u64 address = 0;
+  bool aborted = false;
+  u64 bytesSinceProgressUpdate = 0;
   while (true) {
+    if (!PollRunControl(control, stats)) {
+      aborted = true;
+      break;
+    }
     Result rc = dmntchtQueryCheatProcessMemory(&info, address);
     if (R_FAILED(rc) || info.addr < address || info.size == 0) {
       break;
@@ -696,6 +753,10 @@ bool RunStartSearch(const Search_condition &condition,
     if (readable) {
       u64 readAddr = segStart;
       while (readAddr < segEnd) {
+        if (!PollRunControl(control, stats)) {
+          aborted = true;
+          break;
+        }
         const size_t toRead =
             static_cast<size_t>(std::min<u64>(scanBuffer.size(), segEnd - readAddr));
         if (toRead < valueSize) {
@@ -713,7 +774,17 @@ bool RunStartSearch(const Search_condition &condition,
           return false;
         }
         stats.bytesScanned += toRead;
+        bytesSinceProgressUpdate += toRead;
+        if (control && control->progressCurrent &&
+            bytesSinceProgressUpdate >= (1ULL * 1024ULL * 1024ULL)) {
+          control->progressCurrent->store(stats.bytesScanned,
+                                          std::memory_order_release);
+          bytesSinceProgressUpdate = 0;
+        }
         readAddr += toRead;
+      }
+      if (aborted) {
+        break;
       }
     }
 
@@ -732,6 +803,13 @@ bool RunStartSearch(const Search_condition &condition,
   const u64 elapsedNs = armTicksToNs(armGetSystemTick() - startTime);
   header.timetaken = static_cast<u8>(std::min<u64>(255, elapsedNs / 1000000000ULL));
   stats.secondsTaken = header.timetaken;
+  stats.aborted = aborted;
+  if (control && control->progressCurrent) {
+    control->progressCurrent->store(stats.bytesScanned, std::memory_order_release);
+  }
+  if (control && control->isPaused) {
+    control->isPaused->store(false, std::memory_order_release);
+  }
 
   const bool headerOk = RewriteHeader(out, header, errorOut);
   std::fclose(out);
@@ -741,7 +819,7 @@ bool RunStartSearch(const Search_condition &condition,
 bool RunContinueSearch(const Search_condition &condition,
                        const std::string &sourceCandidatePath,
                        const std::string &outputStem, SearchRunStats &stats,
-                       std::string *errorOut) {
+                       std::string *errorOut, const SearchRunControl *control) {
   stats = SearchRunStats{};
   if (!IsModeSupported(condition.searchMode, true)) {
     if (errorOut)
@@ -807,6 +885,15 @@ bool RunContinueSearch(const Search_condition &condition,
   const u64 mainBase = metadata.main_nso_extents.base;
   const u64 mainEnd = metadata.main_nso_extents.base + metadata.main_nso_extents.size;
   const u64 startTime = armGetSystemTick();
+  if (control && control->progressCurrent) {
+    control->progressCurrent->store(0, std::memory_order_release);
+  }
+  if (control && control->progressTotal) {
+    control->progressTotal->store(sourceHeader.dataSize, std::memory_order_release);
+  }
+  if (control && control->isPaused) {
+    control->isPaused->store(false, std::memory_order_release);
+  }
 
   std::vector<CandidateRecord> inRecords(kContinueInputBuffer / sizeof(CandidateRecord));
   std::vector<u8> memoryBuffer(kContinueMemoryBuffer);
@@ -818,8 +905,15 @@ bool RunContinueSearch(const Search_condition &condition,
   const size_t outCapacity = kOutputBuffer / sizeof(CandidateRecord);
   std::vector<CandidateRecord> outRecords(outCapacity);
   size_t outCount = 0;
+  bool aborted = false;
+  u64 bytesSinceProgressUpdate = 0;
+  u32 controlPollCountdown = 0;
 
   while (true) {
+    if (!PollRunControl(control, stats)) {
+      aborted = true;
+      break;
+    }
     const size_t readCount =
         std::fread(inRecords.data(), sizeof(CandidateRecord), inRecords.size(), in);
     if (readCount == 0) {
@@ -828,10 +922,33 @@ bool RunContinueSearch(const Search_condition &condition,
 
     size_t i = 0;
     while (i < readCount) {
+      if (++controlPollCountdown >= 256) {
+        controlPollCountdown = 0;
+        if (!PollRunControl(control, stats)) {
+          aborted = true;
+          break;
+        }
+      }
+      const size_t batchStart = i;
       const u64 windowBase = inRecords[i].address;
-      const u64 maxWindowSpan =
+      u64 maxWindowSpan =
           std::min<u64>(static_cast<u64>(memoryBuffer.size()),
                         std::numeric_limits<u64>::max() - windowBase);
+      // Keep each batch inside one readable mapping to avoid crossing holes;
+      // crossing can cause full-window read failures and massive fallback cost.
+      MemoryInfo windowInfo{};
+      if (R_SUCCEEDED(dmntchtQueryCheatProcessMemory(&windowInfo, windowBase)) &&
+          windowInfo.addr <= windowBase &&
+          (windowInfo.perm & Perm_R) == Perm_R &&
+          windowInfo.size > 0) {
+        const u64 mapEnd = windowInfo.addr + windowInfo.size;
+        if (mapEnd > windowBase) {
+          maxWindowSpan = std::min<u64>(maxWindowSpan, mapEnd - windowBase);
+        }
+      }
+      if (maxWindowSpan < sizeof(u64)) {
+        maxWindowSpan = sizeof(u64);
+      }
 
       size_t end = i;
       while (end < readCount) {
@@ -857,6 +974,14 @@ bool RunContinueSearch(const Search_condition &condition,
                                                  bytesToRead))) {
         if (R_FAILED(dmntchtReadCheatProcessMemory(windowBase, memoryBuffer.data(),
                                                    sizeof(u64)))) {
+          stats.bytesScanned += sizeof(CandidateRecord);
+          bytesSinceProgressUpdate += sizeof(CandidateRecord);
+          if (control && control->progressCurrent &&
+              bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
+            control->progressCurrent->store(stats.bytesScanned,
+                                            std::memory_order_release);
+            bytesSinceProgressUpdate = 0;
+          }
           ++i;
           continue;
         }
@@ -868,6 +993,14 @@ bool RunContinueSearch(const Search_condition &condition,
           std::fclose(in);
           std::fclose(out);
           return false;
+        }
+        stats.bytesScanned += sizeof(CandidateRecord);
+        bytesSinceProgressUpdate += sizeof(CandidateRecord);
+        if (control && control->progressCurrent &&
+            bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
+          control->progressCurrent->store(stats.bytesScanned,
+                                          std::memory_order_release);
+          bytesSinceProgressUpdate = 0;
         }
         ++i;
         continue;
@@ -881,7 +1014,20 @@ bool RunContinueSearch(const Search_condition &condition,
         std::fclose(out);
         return false;
       }
+      stats.bytesScanned +=
+          static_cast<u64>((end - batchStart) * sizeof(CandidateRecord));
+      bytesSinceProgressUpdate +=
+          static_cast<u64>((end - batchStart) * sizeof(CandidateRecord));
+      if (control && control->progressCurrent &&
+          bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
+        control->progressCurrent->store(stats.bytesScanned,
+                                        std::memory_order_release);
+        bytesSinceProgressUpdate = 0;
+      }
       i = end;
+    }
+    if (aborted) {
+      break;
     }
 
     if (readCount < inRecords.size()) {
@@ -900,6 +1046,13 @@ bool RunContinueSearch(const Search_condition &condition,
   const u64 elapsedNs = armTicksToNs(armGetSystemTick() - startTime);
   header.timetaken = static_cast<u8>(std::min<u64>(255, elapsedNs / 1000000000ULL));
   stats.secondsTaken = header.timetaken;
+  stats.aborted = aborted;
+  if (control && control->progressCurrent) {
+    control->progressCurrent->store(stats.bytesScanned, std::memory_order_release);
+  }
+  if (control && control->isPaused) {
+    control->isPaused->store(false, std::memory_order_release);
+  }
   const bool headerOk = RewriteHeader(out, header, errorOut);
   std::fclose(out);
   return headerOk;

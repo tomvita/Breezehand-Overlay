@@ -40,6 +40,7 @@
 #include <dmntcht.h>
 #include <cctype>
 #include <cmath>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
 #include <utils.hpp>
 
 #ifndef USE_KEYSTONE_ASM
@@ -152,6 +154,19 @@ static u8 g_searchProgressBufferCount = 0;
 enum SearchQueuedAction : u8 { SEARCH_QUEUED_NONE = 0, SEARCH_QUEUED_START, SEARCH_QUEUED_CONTINUE };
 static SearchQueuedAction g_searchQueuedAction = SEARCH_QUEUED_NONE;
 static u8 g_searchQueuedDelayTicks = 0;
+static SearchQueuedAction g_searchActiveAction = SEARCH_QUEUED_NONE;
+static std::thread g_searchWorkerThread;
+static std::atomic<bool> g_searchWorkerRunning{false};
+static std::atomic<bool> g_searchWorkerDone{false};
+static std::atomic<bool> g_searchPauseRequested{false};
+static std::atomic<bool> g_searchAbortRequested{false};
+static std::atomic<bool> g_searchWorkerPaused{false};
+static std::atomic<u64> g_searchProgressCurrent{0};
+static std::atomic<u64> g_searchProgressTotal{0};
+static breeze::SearchRunStats g_searchWorkerStats{};
+static bool g_searchWorkerSuccess = false;
+static std::string g_searchWorkerError;
+static std::string g_searchWorkerOutputStem;
 
 #ifdef EDITCHEAT_OVL
 u32 g_cheatIdToEdit = 0;
@@ -11339,6 +11354,28 @@ std::string LastSearchBufferNote() {
 
 std::string LastSearchTimeNote() {
   if (g_searchInProgress) {
+    if (g_searchWorkerPaused.load(std::memory_order_acquire)) {
+      return "Paused (A=Resume B=Abort)";
+    }
+    if (g_searchActiveAction == SEARCH_QUEUED_START) {
+      const unsigned long long mb = static_cast<unsigned long long>(
+          g_searchProgressCurrent.load(std::memory_order_acquire) / 1024ULL / 1024ULL);
+      char buf[64] = {};
+      std::snprintf(buf, sizeof(buf), "%llu MB scanned", mb);
+      return buf;
+    }
+    if (g_searchActiveAction == SEARCH_QUEUED_CONTINUE) {
+      const u64 total = g_searchProgressTotal.load(std::memory_order_acquire);
+      const u64 current = g_searchProgressCurrent.load(std::memory_order_acquire);
+      if (total > 0) {
+        const unsigned pct = static_cast<unsigned>(
+            std::min<u64>(100, (current * 100ULL) / total));
+        char buf[64] = {};
+        std::snprintf(buf, sizeof(buf), "%u%% processed", pct);
+        return buf;
+      }
+      return "Processing...";
+    }
     return "Search in progress";
   }
   if (!g_lastSearchStatsValid) {
@@ -11396,73 +11433,129 @@ void SetSearchInProgressBufferPreview(SearchQueuedAction action) {
 void QueueSearchAction(SearchQueuedAction action) {
   ClearLastSearchStatsForUi();
   SetSearchInProgressBufferPreview(action);
+  g_searchProgressCurrent.store(0, std::memory_order_release);
+  g_searchProgressTotal.store(0, std::memory_order_release);
+  g_searchPauseRequested.store(false, std::memory_order_release);
+  g_searchAbortRequested.store(false, std::memory_order_release);
+  g_searchWorkerPaused.store(false, std::memory_order_release);
   g_searchQueuedAction = action;
   g_searchQueuedDelayTicks = 1;
 }
 
-bool RunStartSearchNow() {
-  const std::string runOutputStem = NormalizeSeriesStartStem(g_startSearchOutputName);
-  breeze::SearchRunStats stats{};
-  std::string err;
-  if (!breeze::RunStartSearch(g_searchCondition, runOutputStem, stats,
-                              &err)) {
-    g_searchInProgress = false;
-    if (tsl::notification) {
-      tsl::notification->show("Start failed: " + err);
+void StopSearchWorker() {
+  g_searchQueuedAction = SEARCH_QUEUED_NONE;
+  g_searchQueuedDelayTicks = 0;
+  if (g_searchWorkerRunning.load(std::memory_order_acquire)) {
+    g_searchAbortRequested.store(true, std::memory_order_release);
+    g_searchPauseRequested.store(false, std::memory_order_release);
+    while (g_searchWorkerRunning.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    return true;
   }
-  g_searchContinueSourcePath = CandidatePathFromStem(runOutputStem);
-  g_searchConditionSourcePath = g_searchContinueSourcePath;
-  g_lastSearchStatsValid = true;
-  g_lastSearchPrimaryBufferBytes = stats.primaryBufferBytes;
-  g_lastSearchSecondaryBufferBytes = stats.secondaryBufferBytes;
-  g_lastSearchOutputBufferBytes = stats.outputBufferBytes;
-  g_lastSearchBufferCount = stats.bufferCount;
-  g_lastSearchSeconds = stats.secondsTaken;
+  if (g_searchWorkerThread.joinable()) {
+    g_searchWorkerThread.join();
+  }
+  g_searchWorkerDone.store(false, std::memory_order_release);
   g_searchInProgress = false;
-  g_startSearchOutputName = AutoGenerateStartOutputName();
-  g_continueSearchOutputName =
-      AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-  if (tsl::notification) {
-    tsl::notification->show(
-        "Start done: " + std::to_string(stats.entriesWritten) +
-        " entries, buf=" +
-        std::to_string(static_cast<unsigned>(stats.scanBufferBytes / 1024 / 1024)) +
-        "MB");
-  }
-  return true;
+  g_searchActiveAction = SEARCH_QUEUED_NONE;
 }
 
-bool RunContinueSearchNow() {
-  breeze::SearchRunStats stats{};
-  std::string err;
-  if (!breeze::RunContinueSearch(g_searchCondition, g_searchContinueSourcePath,
-                                 g_continueSearchOutputName, stats, &err)) {
-    g_searchInProgress = false;
-    if (tsl::notification) {
-      tsl::notification->show("Continue failed: " + err);
-    }
-    return true;
+void BeginQueuedSearchWorker(SearchQueuedAction action) {
+  if (g_searchWorkerThread.joinable()) {
+    g_searchWorkerThread.join();
   }
-  g_searchContinueSourcePath = CandidatePathFromStem(g_continueSearchOutputName);
-  g_searchConditionSourcePath = g_searchContinueSourcePath;
-  g_lastSearchStatsValid = true;
-  g_lastSearchPrimaryBufferBytes = stats.primaryBufferBytes;
-  g_lastSearchSecondaryBufferBytes = stats.secondaryBufferBytes;
-  g_lastSearchOutputBufferBytes = stats.outputBufferBytes;
-  g_lastSearchBufferCount = stats.bufferCount;
-  g_lastSearchSeconds = stats.secondsTaken;
+
+  g_searchActiveAction = action;
+  g_searchWorkerStats = breeze::SearchRunStats{};
+  g_searchWorkerError.clear();
+  g_searchWorkerSuccess = false;
+
+  const Search_condition condition = g_searchCondition;
+  const std::string sourcePath = g_searchContinueSourcePath;
+  const std::string outputStem =
+      (action == SEARCH_QUEUED_START)
+          ? NormalizeSeriesStartStem(g_startSearchOutputName)
+          : g_continueSearchOutputName;
+  g_searchWorkerOutputStem = outputStem;
+
+  g_searchWorkerDone.store(false, std::memory_order_release);
+  g_searchWorkerRunning.store(true, std::memory_order_release);
+  g_searchWorkerThread = std::thread([condition, sourcePath, outputStem, action]() {
+    breeze::SearchRunStats stats{};
+    std::string err;
+    breeze::SearchRunControl control{};
+    control.pauseRequested = &g_searchPauseRequested;
+    control.abortRequested = &g_searchAbortRequested;
+    control.progressCurrent = &g_searchProgressCurrent;
+    control.progressTotal = &g_searchProgressTotal;
+    control.isPaused = &g_searchWorkerPaused;
+
+    bool ok = false;
+    if (action == SEARCH_QUEUED_START) {
+      ok = breeze::RunStartSearch(condition, outputStem, stats, &err, &control);
+    } else {
+      ok = breeze::RunContinueSearch(condition, sourcePath, outputStem, stats, &err,
+                                     &control);
+    }
+    g_searchWorkerStats = stats;
+    g_searchWorkerError = err;
+    g_searchWorkerSuccess = ok;
+    g_searchWorkerRunning.store(false, std::memory_order_release);
+    g_searchWorkerDone.store(true, std::memory_order_release);
+  });
+}
+
+void FinalizeCompletedSearchWorker() {
+  if (g_searchWorkerThread.joinable()) {
+    g_searchWorkerThread.join();
+  }
   g_searchInProgress = false;
-  // After a successful continue, always advance output to the next sequential
-  // file from the new result so custom rename can become a new series root.
+
+  if (!g_searchWorkerSuccess) {
+    if (tsl::notification) {
+      const std::string msg =
+          g_searchWorkerError.empty() ? "Search failed" : ("Search failed: " + g_searchWorkerError);
+      tsl::notification->show(msg);
+    }
+    return;
+  }
+
+  g_lastSearchStatsValid = true;
+  g_lastSearchPrimaryBufferBytes = g_searchWorkerStats.primaryBufferBytes;
+  g_lastSearchSecondaryBufferBytes = g_searchWorkerStats.secondaryBufferBytes;
+  g_lastSearchOutputBufferBytes = g_searchWorkerStats.outputBufferBytes;
+  g_lastSearchBufferCount = g_searchWorkerStats.bufferCount;
+  g_lastSearchSeconds = g_searchWorkerStats.secondsTaken;
+
+  if (g_searchActiveAction == SEARCH_QUEUED_START) {
+    g_searchContinueSourcePath = CandidatePathFromStem(g_searchWorkerOutputStem);
+    g_searchConditionSourcePath = g_searchContinueSourcePath;
+    g_startSearchOutputName = AutoGenerateStartOutputName();
+    g_continueSearchOutputName =
+        AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+    if (tsl::notification) {
+      const std::string status =
+          g_searchWorkerStats.aborted ? "Start aborted: " : "Start done: ";
+      tsl::notification->show(
+          status + std::to_string(g_searchWorkerStats.entriesWritten) +
+          " entries, buf=" +
+          std::to_string(static_cast<unsigned>(
+              g_searchWorkerStats.scanBufferBytes / 1024 / 1024)) +
+          "MB");
+    }
+    return;
+  }
+
+  g_searchContinueSourcePath = CandidatePathFromStem(g_searchWorkerOutputStem);
+  g_searchConditionSourcePath = g_searchContinueSourcePath;
   g_continueSearchOutputName =
       AutoGenerateContinueOutputName(g_searchContinueSourcePath);
   if (tsl::notification) {
+    const std::string status =
+        g_searchWorkerStats.aborted ? "Continue aborted: " : "Continue done: ";
     tsl::notification->show(
-        "Continue done: " + std::to_string(stats.entriesWritten) + " entries");
+        status + std::to_string(g_searchWorkerStats.entriesWritten) + " entries");
   }
-  return true;
 }
 
 bool GetLatestCandidatePath(std::string &outPath) {
@@ -13807,6 +13900,25 @@ public:
         dropdownSection.empty();
     setFooterBackLabel(shouldShowRestartLabel);
 
+    if (menuMode == SEARCH_MANAGER_MENU_MODE &&
+        g_searchWorkerRunning.load(std::memory_order_acquire)) {
+      if (keysHeld & KEY_ZL) {
+        g_searchPauseRequested.store(true, std::memory_order_release);
+      }
+      if (g_searchWorkerPaused.load(std::memory_order_acquire)) {
+        if (keysDown & KEY_A) {
+          g_searchPauseRequested.store(false, std::memory_order_release);
+          return true;
+        }
+        if (keysDown & KEY_B) {
+          g_searchAbortRequested.store(true, std::memory_order_release);
+          g_searchPauseRequested.store(false, std::memory_order_release);
+          return true;
+        }
+      }
+      return true;
+    }
+
     if (menuMode == SEARCH_MANAGER_MENU_MODE && m_setupSearchItem) {
       const std::string summary = SearchConditionSummary(g_searchCondition);
       if (m_setupSearchItem->getNote() != summary) {
@@ -14511,8 +14623,18 @@ public:
       }
     }
 
-    if (menuMode != SEARCH_MANAGER_MENU_MODE ||
-        g_searchQueuedAction == SEARCH_QUEUED_NONE) {
+    if (menuMode != SEARCH_MANAGER_MENU_MODE) {
+      return;
+    }
+    if (g_searchWorkerDone.load(std::memory_order_acquire)) {
+      FinalizeCompletedSearchWorker();
+      g_searchWorkerDone.store(false, std::memory_order_release);
+      g_searchActiveAction = SEARCH_QUEUED_NONE;
+    }
+    if (g_searchWorkerRunning.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (g_searchQueuedAction == SEARCH_QUEUED_NONE) {
       return;
     }
     if (g_searchQueuedDelayTicks > 0) {
@@ -14522,11 +14644,7 @@ public:
 
     const SearchQueuedAction action = g_searchQueuedAction;
     g_searchQueuedAction = SEARCH_QUEUED_NONE;
-    if (action == SEARCH_QUEUED_START) {
-      RunStartSearchNow();
-    } else if (action == SEARCH_QUEUED_CONTINUE) {
-      RunContinueSearchNow();
-    }
+    BeginQueuedSearchWorker(action);
   }
 };
 
@@ -14954,6 +15072,7 @@ public:
   }
 
   virtual void exitServices() override {
+    StopSearchWorker();
     dmntchtExit();
     nsExit();
 
@@ -15014,6 +15133,7 @@ public:
   }
 
   virtual void exitServices() override {
+    StopSearchWorker();
     dmntchtExit();
     nsExit();
 
