@@ -12489,6 +12489,12 @@ private:
   tsl::elm::ListItem *m_continueSearchItem = nullptr;
   tsl::elm::ListItem *m_lastBufferItem = nullptr;
   tsl::elm::ListItem *m_lastTimeItem = nullptr;
+
+  void focusSearchProgressItem() {
+    if (menuMode == SEARCH_MANAGER_MENU_MODE && m_lastTimeItem) {
+      tsl::shiftItemFocus(m_lastTimeItem);
+    }
+  }
   // bool initializingSpawn = false;
   // std::string defaultLang = "en";
 
@@ -12669,7 +12675,7 @@ public:
     inPackagesPage.store(false, std::memory_order_release);
 
     addHeader(list, "Search Manager",
-              std::string("\uE0E2 ") + "X=Edit -=Pause A=Resume");
+              std::string("\uE0E2 ") + "Edit \uE0F0 Pause");
 
     const size_t purgedCandidates = PurgeInvalidCandidatesForCurrentProcess();
     if (!g_searchContinueSourcePath.empty()) {
@@ -13882,6 +13888,7 @@ public:
 
     if (menuMode == SEARCH_MANAGER_MENU_MODE &&
         g_searchWorkerRunning.load(std::memory_order_acquire)) {
+      focusSearchProgressItem();
       if (keysHeld & KEY_MINUS) {
         g_searchPauseRequested.store(true, std::memory_order_release);
       }
@@ -14569,6 +14576,12 @@ public:
   }
 
   virtual void update() override {
+    if (menuMode == SEARCH_MANAGER_MENU_MODE &&
+        (g_searchWorkerRunning.load(std::memory_order_acquire) ||
+         g_searchInProgress || g_searchQueuedAction != SEARCH_QUEUED_NONE)) {
+      focusSearchProgressItem();
+    }
+
     if (menuMode == SEARCH_MANAGER_MENU_MODE && m_setupSearchItem) {
       const std::string summary = SearchConditionSummary(g_searchCondition);
       if (m_setupSearchItem->getNote() != summary) {
