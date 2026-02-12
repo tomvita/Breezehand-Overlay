@@ -11719,6 +11719,725 @@ bool IsSeriesStartStem(const std::string &stem) {
   return parsedIndex == 0;
 }
 
+struct CandidateRecordView {
+  u64 address = 0;
+  u64 value = 0;
+};
+
+size_t CandidateValueWidth(searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_8BIT:
+    return 1;
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_16BIT:
+    return 2;
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_FLOAT_32BIT:
+    return 4;
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+  case SEARCH_TYPE_POINTER:
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return 8;
+  default:
+    return 4;
+  }
+}
+
+searchValue_t SearchValueFromRaw(u64 raw, searchType_t type) {
+  searchValue_t out{};
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_8BIT: {
+    const u8 v = static_cast<u8>(raw & 0xFFULL);
+    std::memcpy(&out, &v, sizeof(v));
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_16BIT: {
+    const u16 v = static_cast<u16>(raw & 0xFFFFULL);
+    std::memcpy(&out, &v, sizeof(v));
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_FLOAT_32BIT: {
+    const u32 v = static_cast<u32>(raw & 0xFFFFFFFFULL);
+    std::memcpy(&out, &v, sizeof(v));
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+  case SEARCH_TYPE_POINTER: {
+    const u64 v = raw;
+    std::memcpy(&out, &v, sizeof(v));
+    break;
+  }
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    out._u64 = raw & 0xFFFFFFFFFFULL;
+    break;
+  default:
+    break;
+  }
+  return out;
+}
+
+std::string FormatCandidateRegionAddress(u64 address,
+                                         const DmntCheatProcessMetadata &metadata) {
+  auto tryRegion = [&](u64 base, u64 size, const char *label) -> std::string {
+    if (size == 0 || address < base || address >= base + size) {
+      return "";
+    }
+    const u64 offset = address - base;
+    char buf[64] = {};
+    std::snprintf(buf, sizeof(buf), "[%s+%llX]", label,
+                  static_cast<unsigned long long>(offset));
+    return buf;
+  };
+
+  std::string out = tryRegion(metadata.alias_extents.base, metadata.alias_extents.size, "A");
+  if (!out.empty()) {
+    return out;
+  }
+  out = tryRegion(metadata.heap_extents.base, metadata.heap_extents.size, "H");
+  if (!out.empty()) {
+    return out;
+  }
+  out = tryRegion(metadata.main_nso_extents.base, metadata.main_nso_extents.size, "M");
+  if (!out.empty()) {
+    return out;
+  }
+  out = tryRegion(metadata.address_space_extents.base, metadata.address_space_extents.size, "AS");
+  if (!out.empty()) {
+    return out;
+  }
+
+  char absBuf[64] = {};
+  std::snprintf(absBuf, sizeof(absBuf), "[0x%llX]",
+                static_cast<unsigned long long>(address));
+  return absBuf;
+}
+
+std::string FormatCandidateValueFromRaw(u64 raw, searchType_t type) {
+  return ValueToDisplay(SearchValueFromRaw(raw, type), type);
+}
+
+bool ReadCandidateEntriesPage(const std::string &path, size_t entryOffset,
+                              size_t maxEntries,
+                              std::vector<CandidateRecordView> &outEntries,
+                              std::string *errorOut = nullptr) {
+  outEntries.clear();
+  if (maxEntries == 0) {
+    return true;
+  }
+
+  FILE *fp = std::fopen(path.c_str(), "rb");
+  if (!fp) {
+    if (errorOut) {
+      *errorOut = "failed to open candidate file";
+    }
+    return false;
+  }
+
+  const long dataOffset =
+      static_cast<long>(sizeof(breeze::BreezeFileHeader_t) +
+                        entryOffset * sizeof(CandidateRecordView));
+  if (std::fseek(fp, dataOffset, SEEK_SET) != 0) {
+    std::fclose(fp);
+    if (errorOut) {
+      *errorOut = "failed to seek candidate data";
+    }
+    return false;
+  }
+
+  outEntries.resize(maxEntries);
+  const size_t readCount =
+      std::fread(outEntries.data(), sizeof(CandidateRecordView), maxEntries, fp);
+  std::fclose(fp);
+  outEntries.resize(readCount);
+  return true;
+}
+
+bool ReadCandidateEntryAt(const std::string &path, size_t entryIndex,
+                          CandidateRecordView &outEntry,
+                          std::string *errorOut = nullptr) {
+  std::vector<CandidateRecordView> page;
+  if (!ReadCandidateEntriesPage(path, entryIndex, 1, page, errorOut)) {
+    return false;
+  }
+  if (page.empty()) {
+    if (errorOut) {
+      *errorOut = "candidate entry index out of range";
+    }
+    return false;
+  }
+  outEntry = page[0];
+  return true;
+}
+
+bool WriteCandidateValueToMemory(u64 address, u64 rawValue, searchType_t type) {
+  char bytes[8] = {};
+  const size_t width = std::min<size_t>(8, CandidateValueWidth(type));
+  std::memcpy(bytes, &rawValue, width);
+  return R_SUCCEEDED(dmntchtWriteCheatProcessMemory(address, bytes, width));
+}
+
+searchType_t KeyboardTypeForCandidateValue(searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_FLOAT_32BIT:
+  case SEARCH_TYPE_FLOAT_64BIT:
+    return SEARCH_TYPE_DOUBLE;
+  case SEARCH_TYPE_SIGNED_8BIT:
+  case SEARCH_TYPE_SIGNED_16BIT:
+  case SEARCH_TYPE_SIGNED_32BIT:
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return SEARCH_TYPE_SIGNED_64BIT;
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER:
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+  default:
+    return SEARCH_TYPE_UNSIGNED_64BIT;
+  }
+}
+
+u64 AddDeltaToStoredRaw(u64 storedRaw, searchValue_t delta, searchType_t type,
+                        u64 multiplier) {
+  const auto clampUnsigned = [](long double value, long double maxValue) -> u64 {
+    if (value < 0.0L) {
+      value = 0.0L;
+    }
+    if (value > maxValue) {
+      value = maxValue;
+    }
+    return static_cast<u64>(value);
+  };
+  const auto clampSigned = [](long double value, long double minValue,
+                              long double maxValue) -> s64 {
+    if (value < minValue) {
+      value = minValue;
+    }
+    if (value > maxValue) {
+      value = maxValue;
+    }
+    return static_cast<s64>(value);
+  };
+
+  const searchValue_t base = SearchValueFromRaw(storedRaw, type);
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT: {
+    const long double next = static_cast<long double>(base._u8) +
+                             static_cast<long double>(delta._u8) * multiplier;
+    return clampUnsigned(next, 255.0L) & 0xFFULL;
+  }
+  case SEARCH_TYPE_SIGNED_8BIT: {
+    const long double next = static_cast<long double>(base._s8) +
+                             static_cast<long double>(delta._s8) * multiplier;
+    const s64 v = clampSigned(next, -128.0L, 127.0L);
+    return static_cast<u64>(static_cast<u8>(static_cast<s8>(v)));
+  }
+  case SEARCH_TYPE_UNSIGNED_16BIT: {
+    const long double next = static_cast<long double>(base._u16) +
+                             static_cast<long double>(delta._u16) * multiplier;
+    return clampUnsigned(next, 65535.0L) & 0xFFFFULL;
+  }
+  case SEARCH_TYPE_SIGNED_16BIT: {
+    const long double next = static_cast<long double>(base._s16) +
+                             static_cast<long double>(delta._s16) * multiplier;
+    const s64 v = clampSigned(next, -32768.0L, 32767.0L);
+    return static_cast<u64>(static_cast<u16>(static_cast<s16>(v)));
+  }
+  case SEARCH_TYPE_UNSIGNED_32BIT: {
+    const long double next = static_cast<long double>(base._u32) +
+                             static_cast<long double>(delta._u32) * multiplier;
+    return clampUnsigned(next, 4294967295.0L) & 0xFFFFFFFFULL;
+  }
+  case SEARCH_TYPE_SIGNED_32BIT: {
+    const long double next = static_cast<long double>(base._s32) +
+                             static_cast<long double>(delta._s32) * multiplier;
+    const s64 v = clampSigned(next, -2147483648.0L, 2147483647.0L);
+    return static_cast<u64>(static_cast<u32>(static_cast<s32>(v)));
+  }
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER: {
+    const long double maxU64 =
+        static_cast<long double>(std::numeric_limits<u64>::max());
+    const long double next = static_cast<long double>(base._u64) +
+                             static_cast<long double>(delta._u64) * multiplier;
+    return clampUnsigned(next, maxU64);
+  }
+  case SEARCH_TYPE_SIGNED_64BIT: {
+    const long double minS64 =
+        static_cast<long double>(std::numeric_limits<s64>::min());
+    const long double maxS64 =
+        static_cast<long double>(std::numeric_limits<s64>::max());
+    const long double next = static_cast<long double>(base._s64) +
+                             static_cast<long double>(delta._s64) * multiplier;
+    const s64 v = clampSigned(next, minS64, maxS64);
+    return static_cast<u64>(v);
+  }
+  case SEARCH_TYPE_FLOAT_32BIT: {
+    const long double next = static_cast<long double>(base._f32) +
+                             static_cast<long double>(delta._f32) * multiplier;
+    const float v = static_cast<float>(next);
+    u32 raw = 0;
+    std::memcpy(&raw, &v, sizeof(v));
+    return raw;
+  }
+  case SEARCH_TYPE_FLOAT_64BIT: {
+    const long double next = static_cast<long double>(base._f64) +
+                             static_cast<long double>(delta._f64) * multiplier;
+    const double v = static_cast<double>(next);
+    u64 raw = 0;
+    std::memcpy(&raw, &v, sizeof(v));
+    return raw;
+  }
+  case SEARCH_TYPE_UNSIGNED_40BIT: {
+    const long double next =
+        static_cast<long double>(base._u64 & 0xFFFFFFFFFFULL) +
+        static_cast<long double>(delta._u64 & 0xFFFFFFFFFFULL) * multiplier;
+    return clampUnsigned(next, static_cast<long double>(0xFFFFFFFFFFULL)) &
+           0xFFFFFFFFFFULL;
+  }
+  default:
+    return storedRaw;
+  }
+}
+
+bool ApplyRevertAllCandidates(const std::string &path, searchType_t type, size_t startIndex,
+                              size_t totalEntries) {
+  if (startIndex >= totalEntries) {
+    return true;
+  }
+  const size_t chunkSize = 128;
+  for (size_t idx = startIndex; idx < totalEntries; idx += chunkSize) {
+    const size_t count = std::min(chunkSize, totalEntries - idx);
+    std::vector<CandidateRecordView> records;
+    if (!ReadCandidateEntriesPage(path, idx, count, records, nullptr)) {
+      return false;
+    }
+    for (const auto &rec : records) {
+      if (!WriteCandidateValueToMemory(rec.address, rec.value, type)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool ApplyIncrementCandidates(const std::string &path, searchType_t type, searchValue_t delta,
+                              size_t startIndex, size_t totalEntries) {
+  if (startIndex >= totalEntries) {
+    return true;
+  }
+  const size_t chunkSize = 128;
+  u64 multiplier = 1;
+  for (size_t idx = startIndex; idx < totalEntries; idx += chunkSize) {
+    const size_t count = std::min(chunkSize, totalEntries - idx);
+    std::vector<CandidateRecordView> records;
+    if (!ReadCandidateEntriesPage(path, idx, count, records, nullptr)) {
+      return false;
+    }
+    for (const auto &rec : records) {
+      const u64 nextRaw = AddDeltaToStoredRaw(rec.value, delta, type, multiplier);
+      if (!WriteCandidateValueToMemory(rec.address, nextRaw, type)) {
+        return false;
+      }
+      ++multiplier;
+    }
+  }
+  return true;
+}
+
+u64 RawFromSearchValue(searchValue_t value, searchType_t type) {
+  switch (type) {
+  case SEARCH_TYPE_UNSIGNED_8BIT:
+    return static_cast<u64>(value._u8);
+  case SEARCH_TYPE_SIGNED_8BIT:
+    return static_cast<u64>(static_cast<u8>(value._s8));
+  case SEARCH_TYPE_UNSIGNED_16BIT:
+    return static_cast<u64>(value._u16);
+  case SEARCH_TYPE_SIGNED_16BIT:
+    return static_cast<u64>(static_cast<u16>(value._s16));
+  case SEARCH_TYPE_UNSIGNED_32BIT:
+    return static_cast<u64>(value._u32);
+  case SEARCH_TYPE_SIGNED_32BIT:
+    return static_cast<u64>(static_cast<u32>(value._s32));
+  case SEARCH_TYPE_FLOAT_32BIT: {
+    u32 raw = 0;
+    std::memcpy(&raw, &value._f32, sizeof(raw));
+    return raw;
+  }
+  case SEARCH_TYPE_UNSIGNED_64BIT:
+  case SEARCH_TYPE_POINTER:
+    return value._u64;
+  case SEARCH_TYPE_SIGNED_64BIT:
+    return static_cast<u64>(value._s64);
+  case SEARCH_TYPE_FLOAT_64BIT: {
+    u64 raw = 0;
+    std::memcpy(&raw, &value._f64, sizeof(raw));
+    return raw;
+  }
+  case SEARCH_TYPE_UNSIGNED_40BIT:
+    return value._u64 & 0xFFFFFFFFFFULL;
+  default:
+    return value._u64;
+  }
+}
+
+class CandidateEntriesMenu;
+
+class CandidateEntryOptionsMenu : public tsl::Gui {
+private:
+  std::string m_path;
+  size_t m_pageIndex = 0;
+  size_t m_globalIndex = 0;
+  size_t m_totalEntries = 0;
+  searchType_t m_type = SEARCH_TYPE_UNSIGNED_32BIT;
+  CandidateRecordView m_entry{};
+
+  u64 readCurrentRawValue() const {
+    char bytes[8] = {};
+    const size_t width = std::min<size_t>(8, CandidateValueWidth(m_type));
+    if (R_SUCCEEDED(
+            dmntchtReadCheatProcessMemory(m_entry.address, bytes, width))) {
+      u64 raw = 0;
+      std::memcpy(&raw, bytes, width);
+      return raw;
+    }
+    return m_entry.value;
+  }
+
+public:
+  CandidateEntryOptionsMenu(const std::string &path, size_t pageIndex,
+                            size_t globalIndex, size_t totalEntries,
+                            searchType_t type, CandidateRecordView entry)
+      : m_path(path), m_pageIndex(pageIndex), m_globalIndex(globalIndex),
+        m_totalEntries(totalEntries), m_type(type), m_entry(entry) {}
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex);
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame =
+        new tsl::elm::OverlayFrame("Candidate Options",
+                                   CandidateStemFromPath(m_path) + " #" +
+                                       std::to_string(m_globalIndex + 1));
+    auto *list = new tsl::elm::List();
+
+    auto *editItem = new tsl::elm::ListItem("Edit value");
+    editItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      const std::string initial = ValueToEditable(
+          SearchValueFromRaw(readCurrentRawValue(), m_type), m_type);
+      tsl::changeTo<tsl::KeyboardGui>(
+          KeyboardTypeForCandidateValue(m_type), initial, "Edit value",
+          [this](std::string result) {
+            searchValue_t parsed{};
+            if (!ParseValueFromText(TrimCopy(result), m_type, parsed)) {
+              return;
+            }
+            const u64 raw = RawFromSearchValue(parsed, m_type);
+            if (!WriteCandidateValueToMemory(m_entry.address, raw, m_type)) {
+              return;
+            }
+            tsl::goBack();
+            tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex);
+          },
+          nullptr, false);
+      return true;
+    });
+    list->addItem(editItem);
+
+    auto *incrementItem = new tsl::elm::ListItem("Increment");
+    incrementItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      const std::string initial = "1";
+      tsl::changeTo<tsl::KeyboardGui>(
+          KeyboardTypeForCandidateValue(m_type), initial, "Delta",
+          [this](std::string result) {
+            searchValue_t delta{};
+            if (!ParseValueFromText(TrimCopy(result), m_type, delta)) {
+              return;
+            }
+            if (!ApplyIncrementCandidates(m_path, m_type, delta, m_globalIndex,
+                                          m_totalEntries)) {
+              return;
+            }
+            tsl::goBack();
+            tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex);
+          },
+          nullptr, false);
+      return true;
+    });
+    list->addItem(incrementItem);
+
+    auto *revertItem = new tsl::elm::ListItem("Revert");
+    revertItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      if (!WriteCandidateValueToMemory(m_entry.address, m_entry.value, m_type)) {
+        return true;
+      }
+      tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex);
+      return true;
+    });
+    list->addItem(revertItem);
+
+    auto *revertAllItem = new tsl::elm::ListItem("Revert all");
+    revertAllItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      if (!ApplyRevertAllCandidates(m_path, m_type, 0, m_totalEntries)) {
+        return true;
+      }
+      tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex);
+      return true;
+    });
+    list->addItem(revertAllItem);
+
+    frame->setContent(list);
+    return frame;
+  }
+};
+
+class CandidateEntriesMenu : public tsl::Gui {
+private:
+  struct CandidateLiveRow {
+    tsl::elm::ListItem *item = nullptr;
+    CandidateRecordView rec{};
+    std::string prefix;
+    std::string lastLiveText;
+  };
+
+  std::string m_path;
+  size_t m_pageIndex = 0;
+  size_t m_totalEntries = 0;
+  size_t m_pageCount = 1;
+  static constexpr size_t kPageSize = 64;
+  std::vector<CandidateLiveRow> m_liveRows;
+  searchType_t m_type = SEARCH_TYPE_UNSIGNED_32BIT;
+  size_t m_valueWidth = 4;
+  u32 m_liveRefreshTick = 0;
+  static constexpr u32 kLiveRefreshIntervalTicks = 18;
+
+  std::string ReadLiveValueText(u64 address) const {
+    u64 liveRaw = 0;
+    char rawBuffer[8] = {};
+    if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(
+            address, rawBuffer, std::min<size_t>(m_valueWidth, sizeof(rawBuffer))))) {
+      std::memcpy(&liveRaw, rawBuffer, std::min<size_t>(m_valueWidth, sizeof(rawBuffer)));
+      return FormatCandidateValueFromRaw(liveRaw, m_type);
+    }
+    return "N/A";
+  }
+
+public:
+  CandidateEntriesMenu(const std::string &path, size_t pageIndex = 0)
+      : m_path(path), m_pageIndex(pageIndex) {}
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    if ((keysDown & KEY_L) && m_pageIndex > 0) {
+      tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex - 1);
+      return true;
+    }
+    if ((keysDown & KEY_R) && (m_pageIndex + 1) < m_pageCount) {
+      tsl::swapTo<CandidateEntriesMenu>(m_path, m_pageIndex + 1);
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    breeze::BreezeFileHeader_t header{};
+    std::string err;
+    if (!breeze::ReadCandidateHeader(m_path, header, &err)) {
+      auto *frame = new tsl::elm::OverlayFrame("Candidates", "Invalid file");
+      auto *list = new tsl::elm::List();
+      list->addItem(new tsl::elm::ListItem("Failed to load candidate file"));
+      frame->setContent(list);
+      return frame;
+    }
+
+    m_totalEntries =
+        static_cast<size_t>(header.dataSize / sizeof(CandidateRecordView));
+    m_pageCount = std::max<size_t>(1, (m_totalEntries + kPageSize - 1) / kPageSize);
+    if (m_pageIndex >= m_pageCount) {
+      m_pageIndex = m_pageCount - 1;
+    }
+
+    std::string title = "Candidates " + std::to_string(m_pageIndex + 1) + "/" +
+                        std::to_string(m_pageCount);
+    const size_t firstIndex = (m_totalEntries == 0)
+                                  ? 0
+                                  : (m_pageIndex * kPageSize + 1);
+    const size_t lastIndex =
+        std::min(m_totalEntries, (m_pageIndex + 1) * kPageSize);
+    std::string subtitle =
+        "Index = " + std::to_string(firstIndex) + "-" + std::to_string(lastIndex) +
+        " / " + std::to_string(m_totalEntries);
+
+    auto *frame = new tsl::elm::OverlayFrame(title, subtitle);
+    auto *list = new tsl::elm::List();
+    addHeader(list, CandidateStemFromPath(m_path),
+              std::string("\uE0E2 ") + "Options  \uE0E4/\uE0E5 Page");
+
+    if (m_totalEntries == 0) {
+      list->addItem(new tsl::elm::ListItem("No entries"));
+      frame->setContent(list);
+      return frame;
+    }
+
+    DmntCheatProcessMetadata metadata = header.Metadata;
+    DmntCheatProcessMetadata liveMetadata{};
+    if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&liveMetadata))) {
+      metadata = liveMetadata;
+    }
+
+    const size_t offset = m_pageIndex * kPageSize;
+    const size_t count = std::min(kPageSize, m_totalEntries - offset);
+    std::vector<CandidateRecordView> records;
+    if (!ReadCandidateEntriesPage(m_path, offset, count, records, &err)) {
+      list->addItem(new tsl::elm::ListItem("Failed to read entries"));
+      frame->setContent(list);
+      return frame;
+    }
+
+    m_type = header.search_condition.searchType;
+    m_valueWidth = CandidateValueWidth(m_type);
+    m_liveRows.clear();
+    m_liveRefreshTick = 0;
+
+    for (size_t i = 0; i < records.size(); ++i) {
+      const auto &rec = records[i];
+      const std::string addrText = FormatCandidateRegionAddress(rec.address, metadata);
+      const std::string fileValueText = FormatCandidateValueFromRaw(rec.value, m_type);
+      const std::string liveValueText = ReadLiveValueText(rec.address);
+
+      const std::string prefix =
+          addrText + SearchTypeLabel(m_type) + " " + fileValueText + " ";
+      const std::string line = prefix + liveValueText;
+      auto *item = new tsl::elm::ListItem(line);
+      const size_t globalIndex = offset + i;
+      item->setClickListener([this, globalIndex, rec](u64 keys) {
+        if (!(keys & KEY_X)) {
+          return false;
+        }
+        tsl::swapTo<CandidateEntryOptionsMenu>(m_path, m_pageIndex, globalIndex,
+                                               m_totalEntries, m_type, rec);
+        return true;
+      });
+      list->addItem(item);
+      m_liveRows.push_back(CandidateLiveRow{item, rec, prefix, liveValueText});
+    }
+
+    frame->setContent(list);
+    return frame;
+  }
+
+  virtual void update() override {
+    if (m_liveRows.empty()) {
+      return;
+    }
+    if (++m_liveRefreshTick < kLiveRefreshIntervalTicks) {
+      return;
+    }
+    m_liveRefreshTick = 0;
+
+    for (auto &row : m_liveRows) {
+      if (!row.item) {
+        continue;
+      }
+      const std::string liveValueText = ReadLiveValueText(row.rec.address);
+      if (liveValueText == row.lastLiveText) {
+        continue;
+      }
+      row.lastLiveText = liveValueText;
+      row.item->setText(row.prefix + liveValueText);
+    }
+  }
+};
+
+class ContinueSourceOptionsMenu : public tsl::Gui {
+private:
+  std::string m_path;
+
+public:
+  explicit ContinueSourceOptionsMenu(const std::string &path) : m_path(path) {}
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame =
+        new tsl::elm::OverlayFrame("Continue Source Options", CandidateStemFromPath(m_path));
+    auto *list = new tsl::elm::List();
+
+    auto *copyConditionItem = new tsl::elm::ListItem("Copy condition");
+    copyConditionItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      breeze::BreezeFileHeader_t header{};
+      std::string err;
+      if (!breeze::ReadCandidateHeader(m_path, header, &err)) {
+        return true;
+      }
+      g_searchCondition = header.search_condition;
+      g_searchConditionReady = true;
+      g_searchConditionSourcePath = m_path;
+      tsl::goBack();
+      return true;
+    });
+    list->addItem(copyConditionItem);
+
+    auto *viewCandidatesItem = new tsl::elm::ListItem("View candidates");
+    viewCandidatesItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      tsl::changeTo<CandidateEntriesMenu>(m_path, 0);
+      return true;
+    });
+    list->addItem(viewCandidatesItem);
+
+    frame->setContent(list);
+    return frame;
+  }
+};
+
 class ContinueSearchFileMenu : public tsl::Gui {
 private:
   static inline int s_filterMode = 1; // 1=series starts, 2=focused series
@@ -11764,7 +12483,8 @@ public:
     auto *frame = new tsl::elm::OverlayFrame("Continue Source", subtitle);
     auto *list = new tsl::elm::List();
     m_list = list;
-    addHeader(list, "Candidate Files", std::string("\uE0E2 ") + "Copy condition");
+    addHeader(list, "Candidate Files",
+              std::string("\uE0E2 ") + "Options  \uE0E3 Filter");
 
     const auto files = breeze::ListCandidateFiles();
     if (files.empty()) {
@@ -11807,21 +12527,7 @@ public:
           return true;
         }
         if (keys & KEY_X) {
-          breeze::BreezeFileHeader_t header{};
-          std::string err;
-          if (!breeze::ReadCandidateHeader(path, header, &err)) {
-            if (tsl::notification) {
-              tsl::notification->show("Load condition failed");
-            }
-            return true;
-          }
-          g_searchCondition = header.search_condition;
-          g_searchConditionReady = true;
-          g_searchConditionSourcePath = path;
-          if (tsl::notification) {
-            tsl::notification->show("Condition copied from " +
-                                    CandidateStemFromPath(path));
-          }
+          tsl::changeTo<ContinueSourceOptionsMenu>(path);
           return true;
         }
         return false;
