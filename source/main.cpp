@@ -12689,7 +12689,8 @@ public:
     inOverlaysPage.store(false, std::memory_order_release);
     inPackagesPage.store(false, std::memory_order_release);
 
-    addHeader(list, "Search Manager", std::string("\uE0E2 ") + "Option");
+    addHeader(list, "Search Manager",
+              std::string("\uE0E2 ") + "X=Edit -=Pause A=Resume");
 
     const size_t purgedCandidates = PurgeInvalidCandidatesForCurrentProcess();
     if (!g_searchContinueSourcePath.empty()) {
@@ -13902,7 +13903,7 @@ public:
 
     if (menuMode == SEARCH_MANAGER_MENU_MODE &&
         g_searchWorkerRunning.load(std::memory_order_acquire)) {
-      if (keysHeld & KEY_ZL) {
+      if (keysHeld & KEY_MINUS) {
         g_searchPauseRequested.store(true, std::memory_order_release);
       }
       if (g_searchWorkerPaused.load(std::memory_order_acquire)) {
