@@ -11215,16 +11215,43 @@ std::string CandidateStatusFromHeader(const breeze::BreezeFileHeader_t &header) 
     }
   };
 
+  auto isTokenBoundary = [](char c) -> bool {
+    return !std::isalnum(static_cast<unsigned char>(c)) && c != '_';
+  };
+  auto replaceStandaloneToken = [&](std::string text, char token,
+                                    const std::string &value) -> std::string {
+    size_t i = 0;
+    while (i < text.size()) {
+      if (text[i] != token) {
+        ++i;
+        continue;
+      }
+      const bool leftOk = (i == 0) || isTokenBoundary(text[i - 1]);
+      const bool rightOk = (i + 1 >= text.size()) || isTokenBoundary(text[i + 1]);
+      if (!leftOk || !rightOk) {
+        ++i;
+        continue;
+      }
+      text.replace(i, 1, value);
+      i += value.size();
+    }
+    return text;
+  };
+
   const u64 entryCount = header.dataSize / 16;
-  const std::string aValue =
-      ValueToDisplay(header.search_condition.searchValue_1,
-                     header.search_condition.searchType);
+  std::string modeText = modeCode(header.search_condition.searchMode);
+  modeText = replaceStandaloneToken(
+      modeText, 'A', SearchDataNote(header.search_condition, 0));
+  modeText = replaceStandaloneToken(
+      modeText, 'B', SearchDataNote(header.search_condition, 1));
+  modeText = replaceStandaloneToken(
+      modeText, 'C', SearchDataNote(header.search_condition, 2));
   char compact[256] = {};
-  std::snprintf(compact, sizeof(compact), "%llu %s Search %s %s %s%s",
+  std::snprintf(compact, sizeof(compact), "%llu %s Search %s %s%s",
                 static_cast<unsigned long long>(entryCount),
                 stepCode(header.search_condition.search_step),
                 SearchTypeLabel(header.search_condition.searchType),
-                modeCode(header.search_condition.searchMode), aValue.c_str(),
+                modeText.c_str(),
                 (header.prefilename[0] != '\0') ? " p=1" : "");
 
   if (header.search_condition.searchMode == SM_Target ||
@@ -11456,6 +11483,30 @@ bool GetLatestCandidatePath(std::string &outPath) {
   }
   outPath = best;
   return true;
+}
+
+size_t PurgeInvalidCandidatesForCurrentProcess() {
+  DmntCheatProcessMetadata currentMetadata{};
+  if (R_FAILED(dmntchtGetCheatProcessMetadata(&currentMetadata))) {
+    return 0;
+  }
+
+  const u64 currentMainBase = currentMetadata.main_nso_extents.base;
+  size_t removedCount = 0;
+  for (const auto &path : breeze::ListCandidateFiles()) {
+    breeze::BreezeFileHeader_t header{};
+    std::string err;
+    const bool valid = breeze::ReadCandidateHeader(path, header, &err);
+    const bool mainBaseMatches =
+        valid && (header.Metadata.main_nso_extents.base == currentMainBase);
+    if (mainBaseMatches) {
+      continue;
+    }
+    if (std::remove(path.c_str()) == 0) {
+      ++removedCount;
+    }
+  }
+  return removedCount;
 }
 
 std::string AutoGenerateStartOutputName() {
@@ -12545,6 +12596,24 @@ public:
     inPackagesPage.store(false, std::memory_order_release);
 
     addHeader(list, "Search Manager", std::string("\uE0E2 ") + "Option");
+
+    const size_t purgedCandidates = PurgeInvalidCandidatesForCurrentProcess();
+    if (!g_searchContinueSourcePath.empty()) {
+      struct stat st {};
+      if (stat(g_searchContinueSourcePath.c_str(), &st) != 0) {
+        g_searchContinueSourcePath.clear();
+      }
+    }
+    if (!g_searchConditionSourcePath.empty()) {
+      struct stat st {};
+      if (stat(g_searchConditionSourcePath.c_str(), &st) != 0) {
+        g_searchConditionSourcePath.clear();
+      }
+    }
+    if (purgedCandidates > 0 && tsl::notification) {
+      tsl::notification->show("Removed " + std::to_string(purgedCandidates) +
+                              " stale candidate files");
+    }
 
     if (!TryLoadConditionFromLatestCandidate() && !g_searchConditionReady) {
       g_searchCondition = Search_condition{};
