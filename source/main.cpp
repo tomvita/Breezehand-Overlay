@@ -11386,6 +11386,10 @@ std::string LastSearchTimeNote() {
   return buf;
 }
 
+const char *SearchTimeItemTitle() {
+  return g_searchInProgress ? "Search in progress" : "Time taken";
+}
+
 std::string AutoGenerateContinueOutputName(const std::string &sourcePath);
 std::string AutoGenerateStartOutputName();
 std::string FormatSeriesStem(const std::string &base, int index);
@@ -12832,17 +12836,17 @@ public:
 
     list->addItem(new tsl::elm::CategoryHeader("Information"));
 
+    auto *lastTimeItem = new tsl::elm::ListItem(SearchTimeItemTitle());
+    lastTimeItem->setAlwaysShowNote(true);
+    lastTimeItem->setNote(LastSearchTimeNote());
+    list->addItem(lastTimeItem);
+    m_lastTimeItem = lastTimeItem;
+
     auto *lastBufferItem = new tsl::elm::ListItem("Buffer size");
     lastBufferItem->setAlwaysShowNote(true);
     lastBufferItem->setNote(LastSearchBufferNote());
     list->addItem(lastBufferItem);
     m_lastBufferItem = lastBufferItem;
-
-    auto *lastTimeItem = new tsl::elm::ListItem("Time taken");
-    lastTimeItem->setAlwaysShowNote(true);
-    lastTimeItem->setNote(LastSearchTimeNote());
-    list->addItem(lastTimeItem);
-    m_lastTimeItem = lastTimeItem;
   }
 
   void createCheatsMenu(tsl::elm::List *list) {
@@ -13933,6 +13937,10 @@ public:
         }
       }
       if (m_lastTimeItem) {
+        const std::string title = SearchTimeItemTitle();
+        if (m_lastTimeItem->getText() != title) {
+          m_lastTimeItem->setText(title);
+        }
         const std::string timeNote = LastSearchTimeNote();
         if (m_lastTimeItem->getNote() != timeNote) {
           m_lastTimeItem->setNote(timeNote);
@@ -14609,6 +14617,10 @@ public:
         }
       }
       if (m_lastTimeItem) {
+        const std::string title = SearchTimeItemTitle();
+        if (m_lastTimeItem->getText() != title) {
+          m_lastTimeItem->setText(title);
+        }
         const std::string timeNote = LastSearchTimeNote();
         if (m_lastTimeItem->getNote() != timeNote) {
           m_lastTimeItem->setNote(timeNote);
