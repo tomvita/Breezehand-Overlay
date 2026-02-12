@@ -13,6 +13,10 @@ struct SearchRunStats {
   u64 bytesScanned = 0;
   u32 secondsTaken = 0;
   size_t scanBufferBytes = 0;
+  size_t primaryBufferBytes = 0;
+  size_t secondaryBufferBytes = 0;
+  size_t outputBufferBytes = 0;
+  u8 bufferCount = 0;
 };
 
 bool RunStartSearch(const Search_condition &condition,

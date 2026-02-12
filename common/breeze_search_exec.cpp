@@ -668,6 +668,9 @@ bool RunStartSearch(const Search_condition &condition,
     return false;
   }
   stats.scanBufferBytes = SelectScanBufferBytes();
+  stats.primaryBufferBytes = stats.scanBufferBytes;
+  stats.outputBufferBytes = kOutputBuffer;
+  stats.bufferCount = 2;
   std::vector<u8> scanBuffer(stats.scanBufferBytes);
   const size_t outCapacity = kOutputBuffer / sizeof(CandidateRecord);
   std::vector<CandidateRecord> outRecords(outCapacity);
@@ -808,6 +811,10 @@ bool RunContinueSearch(const Search_condition &condition,
   std::vector<CandidateRecord> inRecords(kContinueInputBuffer / sizeof(CandidateRecord));
   std::vector<u8> memoryBuffer(kContinueMemoryBuffer);
   stats.scanBufferBytes = memoryBuffer.size();
+  stats.primaryBufferBytes = inRecords.size() * sizeof(CandidateRecord);
+  stats.secondaryBufferBytes = memoryBuffer.size();
+  stats.outputBufferBytes = kOutputBuffer;
+  stats.bufferCount = 3;
   const size_t outCapacity = kOutputBuffer / sizeof(CandidateRecord);
   std::vector<CandidateRecord> outRecords(outCapacity);
   size_t outCount = 0;

@@ -135,12 +135,23 @@ static int g_cheatFontSize = 17;
 static bool g_searchConditionReady = false;
 static Search_condition g_searchCondition{};
 static std::string g_searchConditionSourcePath;
-static std::string g_searchStartOutputName;
-static bool g_searchStartOutputEdited = false;
+static std::string g_startSearchOutputName;
 static std::string g_searchContinueSourcePath;
+static std::string g_continueSearchOutputName;
 static bool g_lastSearchStatsValid = false;
-static size_t g_lastSearchBufferBytes = 0;
+static size_t g_lastSearchPrimaryBufferBytes = 0;
+static size_t g_lastSearchSecondaryBufferBytes = 0;
+static size_t g_lastSearchOutputBufferBytes = 0;
+static u8 g_lastSearchBufferCount = 0;
 static u32 g_lastSearchSeconds = 0;
+static bool g_searchInProgress = false;
+static size_t g_searchProgressPrimaryBufferBytes = 0;
+static size_t g_searchProgressSecondaryBufferBytes = 0;
+static size_t g_searchProgressOutputBufferBytes = 0;
+static u8 g_searchProgressBufferCount = 0;
+enum SearchQueuedAction : u8 { SEARCH_QUEUED_NONE = 0, SEARCH_QUEUED_START, SEARCH_QUEUED_CONTINUE };
+static SearchQueuedAction g_searchQueuedAction = SEARCH_QUEUED_NONE;
+static u8 g_searchQueuedDelayTicks = 0;
 
 #ifdef EDITCHEAT_OVL
 u32 g_cheatIdToEdit = 0;
@@ -11021,10 +11032,34 @@ bool ParseValueFromText(const std::string &text, searchType_t type,
 }
 
 std::string SearchConditionSummary(const Search_condition &condition) {
-  return std::string(SearchTypeLabel(condition.searchType)) + " " +
-         SearchModeLabel(condition.searchMode) + " A=" +
-         SearchDataNote(condition, 0) + " B=" + SearchDataNote(condition, 1) +
-         " C=" + SearchDataNote(condition, 2);
+  auto isTokenBoundary = [](char c) -> bool {
+    return !std::isalnum(static_cast<unsigned char>(c)) && c != '_';
+  };
+  auto replaceStandaloneToken = [&](std::string text, char token,
+                                    const std::string &value) -> std::string {
+    size_t i = 0;
+    while (i < text.size()) {
+      if (text[i] != token) {
+        ++i;
+        continue;
+      }
+      const bool leftOk = (i == 0) || isTokenBoundary(text[i - 1]);
+      const bool rightOk = (i + 1 >= text.size()) || isTokenBoundary(text[i + 1]);
+      if (!leftOk || !rightOk) {
+        ++i;
+        continue;
+      }
+      text.replace(i, 1, value);
+      i += value.size();
+    }
+    return text;
+  };
+
+  std::string modeText = SearchModeLabel(condition.searchMode);
+  modeText = replaceStandaloneToken(modeText, 'A', SearchDataNote(condition, 0));
+  modeText = replaceStandaloneToken(modeText, 'B', SearchDataNote(condition, 1));
+  modeText = replaceStandaloneToken(modeText, 'C', SearchDataNote(condition, 2));
+  return std::string(SearchTypeLabel(condition.searchType)) + " " + modeText;
 }
 
 std::string CandidateStemFromPath(const std::string &path) {
@@ -11044,6 +11079,15 @@ std::string CandidatePathFromStem(std::string stem) {
     stem = "1";
   }
   return std::string("sdmc:/switch/Breeze/") + stem + ".dat";
+}
+
+bool CandidateFileExistsForStem(const std::string &stem) {
+  if (stem.empty()) {
+    return false;
+  }
+  const std::string path = CandidatePathFromStem(stem);
+  struct stat st {};
+  return stat(path.c_str(), &st) == 0;
 }
 
 std::string CandidateStatusFromHeader(const breeze::BreezeFileHeader_t &header) {
@@ -11228,29 +11272,166 @@ std::string ContinueSearchNoteFromPath(const std::string &path) {
 }
 
 std::string LastSearchBufferNote() {
-  if (!g_lastSearchStatsValid || g_lastSearchBufferBytes == 0) {
+  auto formatBytes = [](size_t bytes) -> std::string {
+    const unsigned long long kb = static_cast<unsigned long long>(bytes / 1024ULL);
+    char part[64] = {};
+    std::snprintf(part, sizeof(part), "%llu KB", kb);
+    return part;
+  };
+
+  const bool inProgress = g_searchInProgress;
+  const u8 bufferCount = inProgress ? g_searchProgressBufferCount
+                                    : g_lastSearchBufferCount;
+  const size_t primaryBytes = inProgress ? g_searchProgressPrimaryBufferBytes
+                                         : g_lastSearchPrimaryBufferBytes;
+  const size_t secondaryBytes = inProgress ? g_searchProgressSecondaryBufferBytes
+                                           : g_lastSearchSecondaryBufferBytes;
+  const size_t outputBytes = inProgress ? g_searchProgressOutputBufferBytes
+                                        : g_lastSearchOutputBufferBytes;
+
+  if (!inProgress && !g_lastSearchStatsValid) {
     return "N/A";
   }
-  const unsigned long long kb =
-      static_cast<unsigned long long>(g_lastSearchBufferBytes / 1024ULL);
-  const unsigned long long mb =
-      static_cast<unsigned long long>(g_lastSearchBufferBytes / 1024ULL / 1024ULL);
-  char buf[64] = {};
-  if (mb > 0) {
-    std::snprintf(buf, sizeof(buf), "%llu MB (%llu KB)", mb, kb);
-  } else {
-    std::snprintf(buf, sizeof(buf), "%llu KB", kb);
+
+  if (bufferCount >= 3 && primaryBytes > 0 && secondaryBytes > 0 && outputBytes > 0) {
+    return "In=" + formatBytes(primaryBytes) + " Mem=" + formatBytes(secondaryBytes) +
+           " Out=" + formatBytes(outputBytes);
   }
-  return buf;
+  if (bufferCount >= 2 && primaryBytes > 0 && outputBytes > 0) {
+    return "Scan=" + formatBytes(primaryBytes) + " Out=" + formatBytes(outputBytes);
+  }
+  if (primaryBytes > 0) {
+    return formatBytes(primaryBytes);
+  }
+  return "N/A";
 }
 
 std::string LastSearchTimeNote() {
+  if (g_searchInProgress) {
+    return "Search in progress";
+  }
   if (!g_lastSearchStatsValid) {
     return "N/A";
   }
   char buf[64] = {};
   std::snprintf(buf, sizeof(buf), "%u s", static_cast<unsigned>(g_lastSearchSeconds));
   return buf;
+}
+
+std::string AutoGenerateContinueOutputName(const std::string &sourcePath);
+std::string AutoGenerateStartOutputName();
+std::string FormatSeriesStem(const std::string &base, int index);
+std::string NormalizeSeriesStartStem(const std::string &stem);
+bool ParseSeriesSuffix(const std::string &stem, std::string &baseOut,
+                       int &indexOut);
+
+void ClearLastSearchStatsForUi() {
+  g_lastSearchStatsValid = false;
+  g_lastSearchPrimaryBufferBytes = 0;
+  g_lastSearchSecondaryBufferBytes = 0;
+  g_lastSearchOutputBufferBytes = 0;
+  g_lastSearchBufferCount = 0;
+  g_lastSearchSeconds = 0;
+}
+
+void SetSearchInProgressBufferPreview(SearchQueuedAction action) {
+  // Keep in sync with common/breeze_search_exec.cpp constants.
+  static constexpr size_t kFixedScanBuffer = 2 * 1024 * 1024;
+  static constexpr size_t kOutputBuffer = 512 * 1024;
+  static constexpr size_t kContinueInputBuffer = kFixedScanBuffer / 2;
+  static constexpr size_t kContinueMemoryBuffer = kFixedScanBuffer / 2;
+
+  g_searchInProgress = true;
+  if (action == SEARCH_QUEUED_START) {
+    g_searchProgressPrimaryBufferBytes = kFixedScanBuffer;
+    g_searchProgressSecondaryBufferBytes = 0;
+    g_searchProgressOutputBufferBytes = kOutputBuffer;
+    g_searchProgressBufferCount = 2;
+    return;
+  }
+  if (action == SEARCH_QUEUED_CONTINUE) {
+    g_searchProgressPrimaryBufferBytes = kContinueInputBuffer;
+    g_searchProgressSecondaryBufferBytes = kContinueMemoryBuffer;
+    g_searchProgressOutputBufferBytes = kOutputBuffer;
+    g_searchProgressBufferCount = 3;
+    return;
+  }
+  g_searchProgressPrimaryBufferBytes = 0;
+  g_searchProgressSecondaryBufferBytes = 0;
+  g_searchProgressOutputBufferBytes = 0;
+  g_searchProgressBufferCount = 0;
+}
+
+void QueueSearchAction(SearchQueuedAction action) {
+  ClearLastSearchStatsForUi();
+  SetSearchInProgressBufferPreview(action);
+  g_searchQueuedAction = action;
+  g_searchQueuedDelayTicks = 1;
+}
+
+bool RunStartSearchNow() {
+  const std::string runOutputStem = NormalizeSeriesStartStem(g_startSearchOutputName);
+  breeze::SearchRunStats stats{};
+  std::string err;
+  if (!breeze::RunStartSearch(g_searchCondition, runOutputStem, stats,
+                              &err)) {
+    g_searchInProgress = false;
+    if (tsl::notification) {
+      tsl::notification->show("Start failed: " + err);
+    }
+    return true;
+  }
+  g_searchContinueSourcePath = CandidatePathFromStem(runOutputStem);
+  g_searchConditionSourcePath = g_searchContinueSourcePath;
+  g_lastSearchStatsValid = true;
+  g_lastSearchPrimaryBufferBytes = stats.primaryBufferBytes;
+  g_lastSearchSecondaryBufferBytes = stats.secondaryBufferBytes;
+  g_lastSearchOutputBufferBytes = stats.outputBufferBytes;
+  g_lastSearchBufferCount = stats.bufferCount;
+  g_lastSearchSeconds = stats.secondsTaken;
+  g_searchInProgress = false;
+  g_startSearchOutputName = AutoGenerateStartOutputName();
+  g_continueSearchOutputName =
+      AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+  if (tsl::notification) {
+    tsl::notification->show(
+        "Start done: " + std::to_string(stats.entriesWritten) +
+        " entries, buf=" +
+        std::to_string(static_cast<unsigned>(stats.scanBufferBytes / 1024 / 1024)) +
+        "MB");
+  }
+  return true;
+}
+
+bool RunContinueSearchNow() {
+  breeze::SearchRunStats stats{};
+  std::string err;
+  if (!breeze::RunContinueSearch(g_searchCondition, g_searchContinueSourcePath,
+                                 g_continueSearchOutputName, stats, &err)) {
+    g_searchInProgress = false;
+    if (tsl::notification) {
+      tsl::notification->show("Continue failed: " + err);
+    }
+    return true;
+  }
+  g_searchContinueSourcePath = CandidatePathFromStem(g_continueSearchOutputName);
+  g_searchConditionSourcePath = g_searchContinueSourcePath;
+  g_lastSearchStatsValid = true;
+  g_lastSearchPrimaryBufferBytes = stats.primaryBufferBytes;
+  g_lastSearchSecondaryBufferBytes = stats.secondaryBufferBytes;
+  g_lastSearchOutputBufferBytes = stats.outputBufferBytes;
+  g_lastSearchBufferCount = stats.bufferCount;
+  g_lastSearchSeconds = stats.secondsTaken;
+  g_searchInProgress = false;
+  // After a successful continue, always advance output to the next sequential
+  // file from the new result so custom rename can become a new series root.
+  g_continueSearchOutputName =
+      AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+  if (tsl::notification) {
+    tsl::notification->show(
+        "Continue done: " + std::to_string(stats.entriesWritten) + " entries");
+  }
+  return true;
 }
 
 bool GetLatestCandidatePath(std::string &outPath) {
@@ -11278,18 +11459,49 @@ bool GetLatestCandidatePath(std::string &outPath) {
 }
 
 std::string AutoGenerateStartOutputName() {
-  std::set<std::string> existing;
+  std::set<int> usedNumericBases;
   for (const auto &p : breeze::ListCandidateFiles()) {
-    existing.insert(CandidateStemFromPath(p));
+    const std::string stem = CandidateStemFromPath(p);
+    if (stem.empty()) {
+      continue;
+    }
+
+    size_t pos = 0;
+    while (pos < stem.size() && std::isdigit(static_cast<unsigned char>(stem[pos]))) {
+      ++pos;
+    }
+    if (pos == 0) {
+      continue;
+    }
+    if (pos == stem.size()) {
+      usedNumericBases.insert(std::atoi(stem.c_str()));
+      continue;
+    }
+
+    // Accept only strict numeric-series form: "<digits>(<digits>)".
+    if (stem[pos] != '(' || stem.back() != ')') {
+      continue;
+    }
+    bool suffixDigitsOnly = true;
+    for (size_t i = pos + 1; i + 1 < stem.size(); ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(stem[i]))) {
+        suffixDigitsOnly = false;
+        break;
+      }
+    }
+    if (!suffixDigitsOnly || pos + 2 >= stem.size()) {
+      continue;
+    }
+    usedNumericBases.insert(std::atoi(stem.substr(0, pos).c_str()));
   }
-  // Match Breeze auto-name behavior: first free numeric file (1,2,3...).
+
+  // First free numeric series base (1,2,3...) and always start at (00).
   for (int i = 1; i < 10000; ++i) {
-    const std::string candidate = std::to_string(i);
-    if (!existing.count(candidate)) {
-      return candidate;
+    if (!usedNumericBases.count(i)) {
+      return FormatSeriesStem(std::to_string(i), 0);
     }
   }
-  return "1";
+  return "1(00)";
 }
 
 bool ParseSeriesSuffix(const std::string &stem, std::string &baseOut,
@@ -11318,39 +11530,95 @@ std::string FormatSeriesStem(const std::string &base, int index) {
   return base + suffix;
 }
 
+std::string NormalizeSeriesStartStem(const std::string &stem) {
+  if (stem.empty()) {
+    return stem;
+  }
+  std::string parsedBase;
+  int parsedIndex = 0;
+  if (ParseSeriesSuffix(stem, parsedBase, parsedIndex)) {
+    return stem;
+  }
+  return FormatSeriesStem(stem, 0);
+}
+
+std::string DisplayStartOutputStem(const std::string &stem) {
+  std::string base;
+  int parsedIndex = 0;
+  if (ParseSeriesSuffix(stem, base, parsedIndex) && parsedIndex == 0) {
+    return base;
+  }
+  return stem;
+}
+
 std::string AutoGenerateContinueOutputName(const std::string &sourcePath) {
   const std::string sourceStem = CandidateStemFromPath(sourcePath);
   std::string base = sourceStem;
-  int startIndex = 0;
+  int nextIndex = 0;
 
   std::string parsedBase;
   int parsedIndex = 0;
   if (ParseSeriesSuffix(sourceStem, parsedBase, parsedIndex)) {
     base = parsedBase;
-    startIndex = parsedIndex + 1;
+    nextIndex = parsedIndex + 1;
   } else {
-    startIndex = 0;
+    nextIndex = 0;
   }
 
-  std::set<std::string> existing;
-  for (const auto &p : breeze::ListCandidateFiles()) {
-    existing.insert(CandidateStemFromPath(p));
-  }
+  return FormatSeriesStem(base, nextIndex);
+}
 
-  for (int i = startIndex; i < 10000; ++i) {
-    const std::string candidate = FormatSeriesStem(base, i);
-    if (!existing.count(candidate)) {
-      return candidate;
-    }
+std::string SeriesBaseFromStem(const std::string &stem) {
+  std::string base;
+  int parsedIndex = 0;
+  if (ParseSeriesSuffix(stem, base, parsedIndex)) {
+    return base;
   }
-  return FormatSeriesStem(base, startIndex);
+  return stem;
+}
+
+bool IsSeriesStartStem(const std::string &stem) {
+  std::string base;
+  int parsedIndex = 0;
+  if (!ParseSeriesSuffix(stem, base, parsedIndex)) {
+    // Legacy/no-suffix file names are treated as series starts.
+    return true;
+  }
+  // With current naming, "(00)" is the first item of a series.
+  return parsedIndex == 0;
 }
 
 class ContinueSearchFileMenu : public tsl::Gui {
+private:
+  static inline int s_filterMode = 0; // 0=all, 1=series starts, 2=focused series
+  static inline std::string s_filterAnchorStem;
+  tsl::elm::List *m_list = nullptr;
+
 public:
   virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
+    if (keysDown & KEY_Y) {
+      s_filterMode = (s_filterMode + 1) % 3;
+      if (s_filterMode == 2) {
+        std::string anchor = CandidateStemFromPath(g_searchContinueSourcePath);
+        if (m_list) {
+          struct ListProxy : public tsl::elm::List {
+            using tsl::elm::List::m_items;
+          };
+          for (auto *item : static_cast<ListProxy *>(m_list)->m_items) {
+            if (item && item->m_isItem && item->hasFocus()) {
+              auto *listItem = static_cast<tsl::elm::ListItem *>(item);
+              anchor = listItem->getText();
+              break;
+            }
+          }
+        }
+        s_filterAnchorStem = anchor;
+      }
+      tsl::swapTo<ContinueSearchFileMenu>();
+      return true;
+    }
     if (keysDown & KEY_B) {
       tsl::goBack();
       return true;
@@ -11359,8 +11627,15 @@ public:
   }
 
   virtual tsl::elm::Element *createUI() override {
-    auto *frame = new tsl::elm::OverlayFrame("Continue Source", "");
+    std::string subtitle = "All series";
+    if (s_filterMode == 1) {
+      subtitle = "Series starts only";
+    } else if (s_filterMode == 2) {
+      subtitle = "Filtered (focused series)";
+    }
+    auto *frame = new tsl::elm::OverlayFrame("Continue Source", subtitle);
     auto *list = new tsl::elm::List();
+    m_list = list;
     addHeader(list, "Candidate Files", std::string("\uE0E2 ") + "Copy condition");
 
     const auto files = breeze::ListCandidateFiles();
@@ -11370,8 +11645,25 @@ public:
       return frame;
     }
 
+    const std::string focusedStem =
+        s_filterMode == 2 && !s_filterAnchorStem.empty()
+            ? s_filterAnchorStem
+            : CandidateStemFromPath(g_searchContinueSourcePath);
+    const std::string focusedSeriesBase = SeriesBaseFromStem(focusedStem);
+
+    bool anyShown = false;
     for (const auto &path : files) {
       const std::string stem = CandidateStemFromPath(path);
+      const std::string stemSeriesBase = SeriesBaseFromStem(stem);
+      if (s_filterMode == 1 && !IsSeriesStartStem(stem)) {
+        continue;
+      }
+      if (s_filterMode == 2 && !focusedSeriesBase.empty()) {
+        if (stemSeriesBase != focusedSeriesBase) {
+          continue;
+        }
+      }
+      anyShown = true;
       auto *item = new tsl::elm::ListItem(stem);
       const std::string status = CandidateStatusFromPath(path);
       item->setNote(status);
@@ -11379,8 +11671,8 @@ public:
       item->setClickListener([path](u64 keys) {
         if (keys & KEY_A) {
           g_searchContinueSourcePath = path;
-          if (!g_searchStartOutputEdited || g_searchStartOutputName.empty()) {
-            g_searchStartOutputName =
+          if (g_continueSearchOutputName.empty()) {
+            g_continueSearchOutputName =
                 AutoGenerateContinueOutputName(g_searchContinueSourcePath);
           }
           tsl::goBack();
@@ -11407,6 +11699,16 @@ public:
         return false;
       });
       list->addItem(item);
+    }
+
+    if (!anyShown) {
+      const char *emptyText = "No candidate files found";
+      if (s_filterMode == 1) {
+        emptyText = "No series starts found";
+      } else if (s_filterMode == 2) {
+        emptyText = "No candidates in focused series";
+      }
+      list->addItem(new tsl::elm::ListItem(emptyText));
     }
 
     std::string jumpStem = CandidateStemFromPath(g_searchContinueSourcePath);
@@ -11974,9 +12276,9 @@ private:
       m_typeItem->setNote(SearchTypeLabel(g_searchCondition.searchType));
     }
     if (m_dataItem) {
-      m_dataItem->setNote("A=" + SearchDataNote(g_searchCondition, 0) +
-                          " B=" + SearchDataNote(g_searchCondition, 1) +
-                          " C=" + SearchDataNote(g_searchCondition, 2));
+      m_dataItem->setNote(SearchDataNote(g_searchCondition, 0) + " " +
+                          SearchDataNote(g_searchCondition, 1) + " " +
+                          SearchDataNote(g_searchCondition, 2));
     }
   }
 
@@ -12254,9 +12556,12 @@ public:
         g_searchContinueSourcePath = latest;
       }
     }
-    if (g_searchStartOutputName.empty()) {
-      g_searchStartOutputName = AutoGenerateStartOutputName();
-      g_searchStartOutputEdited = false;
+    if (g_startSearchOutputName.empty()) {
+      g_startSearchOutputName = AutoGenerateStartOutputName();
+    }
+    if (g_continueSearchOutputName.empty()) {
+      g_continueSearchOutputName =
+          AutoGenerateContinueOutputName(g_searchContinueSourcePath);
     }
 
     auto *setupSearchItem = new tsl::elm::ListItem("Setup search");
@@ -12274,11 +12579,12 @@ public:
 
     auto *startSearchItem = new tsl::elm::ListItem("Start search");
     startSearchItem->setAlwaysShowNote(true);
-    startSearchItem->setNote(g_searchStartOutputName + ".dat");
+    startSearchItem->setNote(DisplayStartOutputStem(g_startSearchOutputName));
     startSearchItem->setClickListener([](u64 keys) {
       if (keys & KEY_X) {
         tsl::changeTo<tsl::KeyboardGui>(
-            SEARCH_TYPE_TEXT, g_searchStartOutputName, "Output file",
+            SEARCH_TYPE_TEXT, DisplayStartOutputStem(g_startSearchOutputName),
+            "Output file",
             [](std::string result) {
               const std::string trimmed = TrimCopy(result);
               if (trimmed.empty()) {
@@ -12287,13 +12593,12 @@ public:
                 }
                 return;
               }
-              g_searchStartOutputName = trimmed;
-              if (g_searchStartOutputName.size() > 4 &&
-                  g_searchStartOutputName.substr(g_searchStartOutputName.size() - 4) ==
+              g_startSearchOutputName = trimmed;
+              if (g_startSearchOutputName.size() > 4 &&
+                  g_startSearchOutputName.substr(g_startSearchOutputName.size() - 4) ==
                       ".dat") {
-                g_searchStartOutputName.erase(g_searchStartOutputName.size() - 4);
+                g_startSearchOutputName.erase(g_startSearchOutputName.size() - 4);
               }
-              g_searchStartOutputEdited = true;
               tsl::goBack();
             },
             nullptr, false);
@@ -12304,35 +12609,11 @@ public:
           return true;
         }
         if (!g_searchContinueSourcePath.empty() &&
-            CandidatePathFromStem(g_searchStartOutputName) ==
-                g_searchContinueSourcePath &&
-            !g_searchStartOutputEdited) {
-          g_searchStartOutputName = AutoGenerateStartOutputName();
+            CandidatePathFromStem(g_startSearchOutputName) ==
+                g_searchContinueSourcePath) {
+          g_startSearchOutputName = AutoGenerateStartOutputName();
         }
-        breeze::SearchRunStats stats{};
-        std::string err;
-        if (!breeze::RunStartSearch(g_searchCondition, g_searchStartOutputName,
-                                    stats, &err)) {
-          if (tsl::notification) {
-            tsl::notification->show("Start failed: " + err);
-          }
-          return true;
-        }
-        g_searchContinueSourcePath = CandidatePathFromStem(g_searchStartOutputName);
-        g_searchConditionSourcePath = g_searchContinueSourcePath;
-        g_lastSearchStatsValid = true;
-        g_lastSearchBufferBytes = stats.scanBufferBytes;
-        g_lastSearchSeconds = stats.secondsTaken;
-        if (!g_searchStartOutputEdited || g_searchStartOutputName.empty()) {
-          g_searchStartOutputName = AutoGenerateStartOutputName();
-        }
-        if (tsl::notification) {
-          tsl::notification->show(
-              "Start done: " + std::to_string(stats.entriesWritten) +
-              " entries, buf=" +
-              std::to_string(static_cast<unsigned>(stats.scanBufferBytes / 1024 / 1024)) +
-              "MB");
-        }
+        QueueSearchAction(SEARCH_QUEUED_START);
         return true;
       }
       return false;
@@ -12359,33 +12640,40 @@ public:
           }
           return true;
         }
-        if (!g_searchStartOutputEdited) {
-          g_searchStartOutputName =
-              AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-        }
-        breeze::SearchRunStats stats{};
-        std::string err;
-        if (!breeze::RunContinueSearch(g_searchCondition, g_searchContinueSourcePath,
-                                       g_searchStartOutputName, stats, &err)) {
-          if (tsl::notification) {
-            tsl::notification->show("Continue failed: " + err);
-          }
+        g_continueSearchOutputName =
+            AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+        if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
+          tsl::changeTo<tsl::KeyboardGui>(
+              SEARCH_TYPE_TEXT, g_continueSearchOutputName, "Output exists, rename",
+              [](std::string result) {
+                const std::string trimmed = TrimCopy(result);
+                if (trimmed.empty()) {
+                  if (tsl::notification) {
+                    tsl::notification->show("File name cannot be empty");
+                  }
+                  return;
+                }
+                g_continueSearchOutputName = trimmed;
+                if (g_continueSearchOutputName.size() > 4 &&
+                    g_continueSearchOutputName.substr(g_continueSearchOutputName.size() - 4) ==
+                        ".dat") {
+                  g_continueSearchOutputName.erase(g_continueSearchOutputName.size() - 4);
+                }
+                g_continueSearchOutputName =
+                    NormalizeSeriesStartStem(g_continueSearchOutputName);
+                if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
+                  if (tsl::notification) {
+                    tsl::notification->show("Output file already exists");
+                  }
+                  return;
+                }
+                tsl::goBack();
+                QueueSearchAction(SEARCH_QUEUED_CONTINUE);
+              },
+              nullptr, false);
           return true;
         }
-        g_searchContinueSourcePath = CandidatePathFromStem(g_searchStartOutputName);
-        g_searchConditionSourcePath = g_searchContinueSourcePath;
-        g_lastSearchStatsValid = true;
-        g_lastSearchBufferBytes = stats.scanBufferBytes;
-        g_lastSearchSeconds = stats.secondsTaken;
-        if (!g_searchStartOutputEdited) {
-          g_searchStartOutputName =
-              AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-        }
-        if (tsl::notification) {
-          tsl::notification->show(
-              "Continue done: " + std::to_string(stats.entriesWritten) +
-              " entries");
-        }
+        QueueSearchAction(SEARCH_QUEUED_CONTINUE);
         return true;
       }
       return false;
@@ -13455,9 +13743,9 @@ public:
         m_setupSearchItem->setNote(summary);
       }
       if (m_startSearchItem) {
-        const std::string startNote = g_searchStartOutputName.empty()
-                                          ? std::string("output.dat")
-                                          : (g_searchStartOutputName + ".dat");
+        const std::string startNote = g_startSearchOutputName.empty()
+                                          ? std::string("output")
+                                          : DisplayStartOutputStem(g_startSearchOutputName);
         if (m_startSearchItem->getNote() != startNote) {
           m_startSearchItem->setNote(startNote);
         }
@@ -14116,6 +14404,59 @@ public:
 
     // svcSleepThread(10'000'000);
     return false;
+  }
+
+  virtual void update() override {
+    if (menuMode == SEARCH_MANAGER_MENU_MODE && m_setupSearchItem) {
+      const std::string summary = SearchConditionSummary(g_searchCondition);
+      if (m_setupSearchItem->getNote() != summary) {
+        m_setupSearchItem->setNote(summary);
+      }
+      if (m_startSearchItem) {
+        const std::string startNote = g_startSearchOutputName.empty()
+                                          ? std::string("output")
+                                          : DisplayStartOutputStem(g_startSearchOutputName);
+        if (m_startSearchItem->getNote() != startNote) {
+          m_startSearchItem->setNote(startNote);
+        }
+      }
+      if (m_continueSearchItem) {
+        const std::string continueNote =
+            ContinueSearchNoteFromPath(g_searchContinueSourcePath);
+        if (m_continueSearchItem->getNote() != continueNote) {
+          m_continueSearchItem->setNote(continueNote);
+        }
+      }
+      if (m_lastBufferItem) {
+        const std::string bufferNote = LastSearchBufferNote();
+        if (m_lastBufferItem->getNote() != bufferNote) {
+          m_lastBufferItem->setNote(bufferNote);
+        }
+      }
+      if (m_lastTimeItem) {
+        const std::string timeNote = LastSearchTimeNote();
+        if (m_lastTimeItem->getNote() != timeNote) {
+          m_lastTimeItem->setNote(timeNote);
+        }
+      }
+    }
+
+    if (menuMode != SEARCH_MANAGER_MENU_MODE ||
+        g_searchQueuedAction == SEARCH_QUEUED_NONE) {
+      return;
+    }
+    if (g_searchQueuedDelayTicks > 0) {
+      --g_searchQueuedDelayTicks;
+      return;
+    }
+
+    const SearchQueuedAction action = g_searchQueuedAction;
+    g_searchQueuedAction = SEARCH_QUEUED_NONE;
+    if (action == SEARCH_QUEUED_START) {
+      RunStartSearchNow();
+    } else if (action == SEARCH_QUEUED_CONTINUE) {
+      RunContinueSearchNow();
+    }
   }
 };
 
