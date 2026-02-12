@@ -11512,11 +11512,6 @@ void FinalizeCompletedSearchWorker() {
   g_searchInProgress = false;
 
   if (!g_searchWorkerSuccess) {
-    if (tsl::notification) {
-      const std::string msg =
-          g_searchWorkerError.empty() ? "Search failed" : ("Search failed: " + g_searchWorkerError);
-      tsl::notification->show(msg);
-    }
     return;
   }
 
@@ -11533,16 +11528,6 @@ void FinalizeCompletedSearchWorker() {
     g_startSearchOutputName = AutoGenerateStartOutputName();
     g_continueSearchOutputName =
         AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-    if (tsl::notification) {
-      const std::string status =
-          g_searchWorkerStats.aborted ? "Start aborted: " : "Start done: ";
-      tsl::notification->show(
-          status + std::to_string(g_searchWorkerStats.entriesWritten) +
-          " entries, buf=" +
-          std::to_string(static_cast<unsigned>(
-              g_searchWorkerStats.scanBufferBytes / 1024 / 1024)) +
-          "MB");
-    }
     return;
   }
 
@@ -11550,12 +11535,6 @@ void FinalizeCompletedSearchWorker() {
   g_searchConditionSourcePath = g_searchContinueSourcePath;
   g_continueSearchOutputName =
       AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-  if (tsl::notification) {
-    const std::string status =
-        g_searchWorkerStats.aborted ? "Continue aborted: " : "Continue done: ";
-    tsl::notification->show(
-        status + std::to_string(g_searchWorkerStats.entriesWritten) + " entries");
-  }
 }
 
 bool GetLatestCandidatePath(std::string &outPath) {
