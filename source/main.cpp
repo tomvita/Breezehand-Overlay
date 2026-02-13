@@ -9958,7 +9958,12 @@ public:
   std::string getStoredValueAsmText(std::string &hex, size_t &cursor) {
     processEdit(hex, cursor);
     if (vWidth != 4) return "";
-    return DisassembleARM64(static_cast<u32>(m_storedValue), m_storedAddress);
+    const u32 opcode = static_cast<u32>(m_storedValue);
+    std::string dis = DisassembleARM64(opcode, m_storedAddress);
+    if (!dis.empty()) return dis;
+    char raw[11];
+    std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+    return std::string(raw);
   }
 
   bool setStoredValueFromIntegerText(std::string &hex, size_t &cursor, const std::string &input) {
