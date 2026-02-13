@@ -23,7 +23,11 @@ namespace tsl {
                     std::function<bool(std::string&, size_t&, const std::string&)> onApplyFloatEdit = nullptr,
                     std::function<std::string(std::string&, size_t&)> onGetAsmEditValue = nullptr,
                     std::function<bool(std::string&, size_t&, const std::string&)> onApplyAsmEdit = nullptr,
-                    std::function<bool(std::string&, size_t&)> onClearStoredValue = nullptr);
+                    std::function<bool(std::string&, size_t&)> onClearStoredValue = nullptr,
+                    std::function<u32(std::string&, size_t&)> onGetCodeType = nullptr,
+                    std::function<bool(std::string&, size_t&, u32, u64)> onApplyComboType = nullptr,
+                    std::function<bool(std::string&, size_t&, u32)> onSetComboCodeType = nullptr,
+                    std::function<bool(std::string&, size_t&)> onToggleC4AutoRepeat = nullptr);
         virtual ~KeyboardGui();
 
         // Gui overrides
@@ -54,6 +58,10 @@ namespace tsl {
         std::function<std::string(std::string&, size_t&)> m_onGetAsmEditValue;
         std::function<bool(std::string&, size_t&, const std::string&)> m_onApplyAsmEdit;
         std::function<bool(std::string&, size_t&)> m_onClearStoredValue;
+        std::function<u32(std::string&, size_t&)> m_onGetCodeType;
+        std::function<bool(std::string&, size_t&, u32, u64)> m_onApplyComboType;
+        std::function<bool(std::string&, size_t&, u32)> m_onSetComboCodeType;
+        std::function<bool(std::string&, size_t&)> m_onToggleC4AutoRepeat;
         size_t m_cursorPos = 0;
         bool m_isNumpad;
         elm::Element* m_valueDisplay = nullptr;
@@ -71,6 +79,11 @@ namespace tsl {
         bool m_isConstrained = true;
         bool m_capsMode = true;
         std::function<void()> m_onToggleCapsVisual;
+        bool m_comboCaptureActive = false;
+        u32 m_comboCaptureTargetType = 0;
+        u64 m_comboCaptureArmedTick = 0;
+        u64 m_comboCaptureStartTick = 0;
+        u64 m_comboCapturedKeys = 0;
     };
 
 }

@@ -8558,7 +8558,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     if (!any) {
       keys += "none";
     }
-    keys += ")";
+    keys += ") Auto-repeat";
     snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
     break;
   }
@@ -8734,8 +8734,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
       keys += "none";
     }
     keys += ")";
-    if (autoRepeat)
-      keys += " Auto-repeat";
+    keys += autoRepeat ? " Auto-repeat" : " do once";
     snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
     break;
   }
@@ -10006,6 +10005,84 @@ public:
     return std::string(raw);
   }
 
+  u32 getCurrentCodeType(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    std::vector<u32> dwords = parseDwords(hex);
+    if (dwords.empty()) return 0xFFFFFFFF;
+    return decodeType(dwords[0]);
+  }
+
+  bool setComboKeyForCodeType(std::string &hex, size_t &cursor, u32 targetType,
+                              u64 keyMask) {
+    processEdit(hex, cursor);
+    std::vector<u32> dwords = parseDwords(hex);
+    if (dwords.empty()) return false;
+
+    const u32 type = decodeType(dwords[0]);
+    if (type != 0x8 && type != 0xC4) return false;
+
+    syncVariables(dwords[0], type);
+    if (targetType == 0x8) {
+      vBitMask = keyMask & 0x0FFFFFFFULL;
+      dwords[0] = 0x80000000;
+      applyVariables(dwords[0], 0x8);
+      dwords.resize(1);
+    } else if (targetType == 0xC4) {
+      vBitMask = keyMask;
+      dwords[0] = 0xC4000000;
+      applyVariables(dwords[0], 0xC4);
+      if (dwords.size() < 3) dwords.resize(3, 0);
+      dwords[1] = static_cast<u32>(vBitMask >> 32);
+      dwords[2] = static_cast<u32>(vBitMask & 0xFFFFFFFFULL);
+    } else {
+      return false;
+    }
+
+    rebuildHex(hex, cursor, dwords);
+    processEdit(hex, cursor);
+    return true;
+  }
+
+  bool setComboCodeType(std::string &hex, size_t &cursor, u32 targetType) {
+    processEdit(hex, cursor);
+    std::vector<u32> dwords = parseDwords(hex);
+    if (dwords.empty()) return false;
+
+    const u32 type = decodeType(dwords[0]);
+    if (type != 0x8 && type != 0xC4) return false;
+
+    u64 existingMask = 0;
+    if (type == 0x8) {
+      existingMask = static_cast<u64>(dwords[0] & 0x0FFFFFFF);
+    } else {
+      if (dwords.size() < 3) dwords.resize(3, 0);
+      existingMask = (static_cast<u64>(dwords[1]) << 32) |
+                     static_cast<u64>(dwords[2]);
+    }
+    return setComboKeyForCodeType(hex, cursor, targetType, existingMask);
+  }
+
+  bool toggleC4AutoRepeat(std::string &hex, size_t &cursor) {
+    processEdit(hex, cursor);
+    std::vector<u32> dwords = parseDwords(hex);
+    if (dwords.empty()) return false;
+    if (decodeType(dwords[0]) != 0xC4) return false;
+
+    if (dwords.size() < 3) dwords.resize(3, 0);
+    const u64 mask = (static_cast<u64>(dwords[1]) << 32) |
+                     static_cast<u64>(dwords[2]);
+
+    syncVariables(dwords[0], 0xC4);
+    vOpType = (vOpType == 0) ? 1 : 0;
+    vBitMask = mask;
+    applyVariables(dwords[0], 0xC4);
+    dwords[1] = static_cast<u32>(mask >> 32);
+    dwords[2] = static_cast<u32>(mask & 0xFFFFFFFFULL);
+    rebuildHex(hex, cursor, dwords);
+    processEdit(hex, cursor);
+    return true;
+  }
+
   bool setStoredValueFromIntegerText(std::string &hex, size_t &cursor, const std::string &input) {
     processEdit(hex, cursor);
     std::string t = trimCopy(input);
@@ -10614,6 +10691,18 @@ public:
                 },
                 [fmtMgr](std::string &currentVal, size_t &cursor) -> bool {
                   return fmtMgr->clearStoredValue(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> u32 {
+                  return fmtMgr->getCurrentCodeType(currentVal, cursor);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, u32 targetType, u64 keyMask) -> bool {
+                  return fmtMgr->setComboKeyForCodeType(currentVal, cursor, targetType, keyMask);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor, u32 targetType) -> bool {
+                  return fmtMgr->setComboCodeType(currentVal, cursor, targetType);
+                },
+                [fmtMgr](std::string &currentVal, size_t &cursor) -> bool {
+                  return fmtMgr->toggleC4AutoRepeat(currentVal, cursor);
                 });
             return true;
           }
@@ -17811,7 +17900,11 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
                          std::function<bool(std::string&, size_t&, const std::string&)> onApplyFloatEdit,
                          std::function<std::string(std::string&, size_t&)> onGetAsmEditValue,
                          std::function<bool(std::string&, size_t&, const std::string&)> onApplyAsmEdit,
-                         std::function<bool(std::string&, size_t&)> onClearStoredValue)
+                         std::function<bool(std::string&, size_t&)> onClearStoredValue,
+                         std::function<u32(std::string&, size_t&)> onGetCodeType,
+                         std::function<bool(std::string&, size_t&, u32, u64)> onApplyComboType,
+                         std::function<bool(std::string&, size_t&, u32)> onSetComboCodeType,
+                         std::function<bool(std::string&, size_t&)> onToggleC4AutoRepeat)
     : m_type(type), m_value(initialValue), m_title(title),
       m_onComplete(onComplete), m_onNoteUpdate(onNoteUpdate),
       m_onGetSignedEditValue(onGetSignedEditValue),
@@ -17823,6 +17916,10 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
       m_onGetAsmEditValue(onGetAsmEditValue),
       m_onApplyAsmEdit(onApplyAsmEdit),
       m_onClearStoredValue(onClearStoredValue),
+      m_onGetCodeType(onGetCodeType),
+      m_onApplyComboType(onApplyComboType),
+      m_onSetComboCodeType(onSetComboCodeType),
+      m_onToggleC4AutoRepeat(onToggleC4AutoRepeat),
       m_isConstrained(constrained) {
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
   m_cursorPos = m_value.length();
@@ -17861,7 +17958,50 @@ elm::Element *KeyboardGui::createUI() {
   }
 
   if (m_type == SEARCH_TYPE_HEX) {
-    if (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onGetAsmEditValue || m_onClearStoredValue) {
+    u32 currentCodeType = 0xFFFFFFFF;
+    if (m_onGetCodeType) {
+      std::lock_guard<std::recursive_mutex> lock(m_mutex);
+      currentCodeType = m_onGetCodeType(m_value, m_cursorPos);
+    }
+    const bool isType8OrC4 = (currentCodeType == 0x8 || currentCodeType == 0xC4);
+
+    if (isType8OrC4) {
+      m_comboCaptureTargetType = currentCodeType;
+      auto *comboRow = new KeyboardRow();
+      comboRow->addButton(new KeyboardButton("type 8", [this] {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_comboCaptureTargetType = 0x8;
+        if (m_onSetComboCodeType &&
+            m_onSetComboCodeType(m_value, m_cursorPos, 0x8) &&
+            m_onNoteUpdate && m_frame) {
+          m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+        }
+      }));
+      comboRow->addButton(new KeyboardButton("type C4", [this] {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_comboCaptureTargetType = 0xC4;
+        if (m_onSetComboCodeType &&
+            m_onSetComboCodeType(m_value, m_cursorPos, 0xC4) &&
+            m_onNoteUpdate && m_frame) {
+          m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+        }
+      }));
+      comboRow->addButton(new KeyboardButton("repeat", [this] {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        if (m_comboCaptureTargetType != 0xC4) {
+          return;
+        }
+        if (m_onToggleC4AutoRepeat &&
+            m_onToggleC4AutoRepeat(m_value, m_cursorPos) &&
+            m_onNoteUpdate && m_frame) {
+          m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+        }
+      }));
+      list->addItem(comboRow);
+    }
+
+    if (!isType8OrC4 &&
+        (m_onGetSignedEditValue || m_onGetUnsignedEditValue || m_onGetFloatEditValue || m_onGetAsmEditValue || m_onClearStoredValue)) {
       auto *topRow = new KeyboardRow();
       topRow->addButton(new KeyboardButton("[s]", [this] {
         if (!m_onGetSignedEditValue || !m_onApplySignedEdit) return;
@@ -18041,6 +18181,25 @@ elm::Element *KeyboardGui::createUI() {
     row5->addButton(
         new KeyboardButton("OK \uE0F1", [this] { this->handleConfirm(); }));
     list->addItem(row5);
+
+    if (isType8OrC4) {
+      auto *comboBox = new tsl::elm::ListItem("Combo key programming");
+      comboBox->setUseWrapping(true);
+      comboBox->setAlwaysShowNote(true);
+      comboBox->setNote("Press A then hold combo keys for 0.5s");
+      comboBox->setClickListener([this](u64 keys) {
+        if (keys & KEY_A) {
+          m_comboCaptureActive = true;
+          m_comboCaptureArmedTick = armGetSystemTick();
+          m_comboCaptureStartTick = 0;
+          m_comboCapturedKeys = 0;
+          tsl::notification->show("Hold combo for 0.5s");
+          return true;
+        }
+        return false;
+      });
+      list->addItem(comboBox);
+    }
   } else if (m_type == SEARCH_TYPE_TEXT) {
     const bool isAsmKeyboard = (m_title == "Edit ASM");
     // Row 1: Numbers
@@ -18233,6 +18392,68 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
                               const HidTouchState &touchPos,
                               HidAnalogStickState leftJoyStick,
                               HidAnalogStickState rightJoyStick) {
+  if (m_comboCaptureActive) {
+    constexpr u64 captureMask =
+        KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R | KEY_ZL | KEY_ZR |
+        KEY_PLUS | KEY_MINUS | KEY_DLEFT | KEY_DUP | KEY_DRIGHT | KEY_DDOWN |
+        KEY_LSTICK | KEY_RSTICK;
+    const u64 comboKeys = keysHeld & captureMask;
+
+    if (comboKeys != 0) {
+      if (m_comboCaptureStartTick == 0 || comboKeys != m_comboCapturedKeys) {
+        m_comboCaptureStartTick = armGetSystemTick();
+        m_comboCapturedKeys = comboKeys;
+      } else {
+        const u64 diff = armGetSystemTick() - m_comboCaptureStartTick;
+        if (armTicksToNs(diff) >= 500000000ULL) {
+          bool applied = false;
+          {
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_onApplyComboType) {
+              applied = m_onApplyComboType(m_value, m_cursorPos,
+                                           m_comboCaptureTargetType,
+                                           m_comboCapturedKeys);
+            }
+            if (applied && m_onNoteUpdate && m_frame) {
+              if (m_isConstrained) {
+                m_frame->setSubtitle(m_onNoteUpdate(m_value, m_cursorPos));
+              } else {
+                std::string valCopy = m_value;
+                size_t cursorCopy = m_cursorPos;
+                m_frame->setSubtitle(m_onNoteUpdate(valCopy, cursorCopy));
+              }
+            }
+          }
+          if (applied) {
+            if (m_valueDisplay) m_valueDisplay->invalidate();
+          } else {
+            tsl::notification->show("Combo apply failed");
+          }
+          m_comboCaptureActive = false;
+          m_comboCaptureArmedTick = 0;
+          m_comboCaptureStartTick = 0;
+          m_comboCapturedKeys = 0;
+        }
+      }
+    } else {
+      const u64 idleElapsed =
+          (m_comboCaptureArmedTick == 0)
+              ? 0
+              : armTicksToNs(armGetSystemTick() - m_comboCaptureArmedTick);
+      if (idleElapsed >= 1500000000ULL) {
+        m_comboCaptureActive = false;
+        m_comboCaptureArmedTick = 0;
+        m_comboCaptureStartTick = 0;
+        m_comboCapturedKeys = 0;
+      } else {
+        // Keep capture mode active; B is intentionally ignored here.
+        m_comboCaptureStartTick = 0;
+        m_comboCapturedKeys = 0;
+      }
+    }
+    return true;
+  }
+
   if (keysDown & KEY_R) {
     if (keysHeld & KEY_ZL) {
       if (m_valueDisplay)
@@ -18391,7 +18612,9 @@ void KeyboardGui::switchType(searchType_t newType) {
                            m_onGetSignedEditValue, m_onGetUnsignedEditValue, m_onGetFloatEditValue,
                            m_onApplySignedEdit, m_onApplyUnsignedEdit, m_onApplyFloatEdit,
                            m_onGetAsmEditValue, m_onApplyAsmEdit,
-                           m_onClearStoredValue);
+                           m_onClearStoredValue, m_onGetCodeType,
+                           m_onApplyComboType, m_onSetComboCodeType,
+                           m_onToggleC4AutoRepeat);
 }
 
 // Implement helper
