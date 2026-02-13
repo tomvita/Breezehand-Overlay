@@ -7936,6 +7936,46 @@ bool TryDownloadCheats(bool notify = true) {
   return false;
 }
 
+u32 ConvertTripleZeroCheatsToFolders() {
+  u64 count = 0;
+  if (!R_SUCCEEDED(dmntchtGetCheatCount(&count)) || count == 0) {
+    return 0;
+  }
+
+  std::vector<DmntCheatEntry> cheats(count);
+  if (!R_SUCCEEDED(dmntchtGetCheats(cheats.data(), count, 0, &count))) {
+    return 0;
+  }
+  cheats.resize(count);
+
+  u32 converted = 0;
+  bool useFolderStart = true;
+  for (auto &cheat : cheats) {
+    if (cheat.definition.num_opcodes == 3 &&
+        cheat.definition.opcodes[0] == 0x00000000 &&
+        cheat.definition.opcodes[1] == 0x00000000 &&
+        cheat.definition.opcodes[2] == 0x00000000) {
+      cheat.definition.opcodes[0] = useFolderStart ? 0x20000000 : 0x20000001;
+      cheat.definition.num_opcodes = 1;
+      useFolderStart = !useFolderStart;
+      converted++;
+    }
+  }
+
+  if (converted == 0) {
+    return 0;
+  }
+
+  ClearCheats();
+  for (auto &cheat : cheats) {
+    u32 outId = 0;
+    dmntchtAddCheat(&cheat.definition, cheat.enabled, &outId);
+  }
+
+  SaveCheatsToFile();
+  return converted;
+}
+
 void AddComboKeyToCheat(u32 cheat_id, u32 key_mask) {
   if (key_mask == 0)
     return; // No key?
@@ -17050,6 +17090,24 @@ tsl::elm::Element *CheatMenu::createUI() {
     return false;
   });
   list->addItem(downloadItem);
+
+  auto *convertToFolderItem = new tsl::elm::ListItem("Convert to folder");
+  convertToFolderItem->setClickListener([](u64 keys) {
+    if (keys & KEY_A) {
+      const u32 converted = CheatUtils::ConvertTripleZeroCheatsToFolders();
+      if (converted > 0) {
+        tsl::notification->show("Converted " + std::to_string(converted) +
+                                " marker cheats");
+        refreshPage.store(true, std::memory_order_release);
+        tsl::goBack();
+      } else {
+        tsl::notification->show("No 00000000 marker cheats found");
+      }
+      return true;
+    }
+    return false;
+  });
+  list->addItem(convertToFolderItem);
 
   list->addItem(new tsl::elm::CategoryHeader("Combo Keys"));
 
