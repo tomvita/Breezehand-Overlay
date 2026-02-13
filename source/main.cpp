@@ -8502,11 +8502,22 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
   }
   case 8: // Begin Keypress Conditional Block
   {
-    u32 mask = first_dword;
+    const u32 keyMask = first_dword & 0x0FFFFFFF;
     std::string keys = "If keys(";
-    for (size_t i = 0; i < buttonCodes.size(); i++)
-      if (mask & buttonCodes[i])
+    bool any = false;
+    for (size_t i = 0; i < buttonCodes.size(); i++) {
+      const u32 code = buttonCodes[i] & 0x0FFFFFFF;
+      if ((keyMask & code) != 0) {
+        if (any) {
+          keys += "+";
+        }
         keys += buttonNames[i];
+        any = true;
+      }
+    }
+    if (!any) {
+      keys += "none";
+    }
     keys += ")";
     snprintf(buffer, sizeof(buffer), "%s", keys.c_str());
     break;
@@ -8668,9 +8679,20 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     bool autoRepeat = (first_dword >> 20) & 0xF;
     u64 mask = (((u64)GetNextDword()) << 32) | GetNextDword();
     std::string keys = "If keys(";
-    for (size_t i = 0; i < buttonCodes.size(); i++)
-      if (mask & buttonCodes[i])
+    bool any = false;
+    for (size_t i = 0; i < buttonCodes.size(); i++) {
+      const u64 code = static_cast<u64>(buttonCodes[i] & 0x0FFFFFFF);
+      if ((mask & code) != 0) {
+        if (any) {
+          keys += "+";
+        }
         keys += buttonNames[i];
+        any = true;
+      }
+    }
+    if (!any) {
+      keys += "none";
+    }
     keys += ")";
     if (autoRepeat)
       keys += " Auto-repeat";
@@ -8723,7 +8745,7 @@ std::string GetOpcodeNote(const std::vector<u32> &opcodes, size_t &index) {
     break;
   }
 
-  if (s_noteMinimalMode && type != 0) {
+  if (s_noteMinimalMode && type != 0 && type != 8 && type != 0xC4) {
     return "";
   }
   return buffer;
