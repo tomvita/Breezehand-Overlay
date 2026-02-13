@@ -8775,7 +8775,7 @@ private:
   u8 vIncFlag = 0;      // I (6, A)
   u8 vLogID = 0;        // I (FFF)
   u8 vImmFlag = 0;      // X (bit for 9)
-  u32 vBitMask = 0;     // XXXX / kkkk (8, C2, C4)
+  u64 vBitMask = 0;     // key mask (8, C2, C4)
   u8 vStaticIdx = 0;    // XX (C3)
   u8 vCode5Type = 0;    // type 5 sub (5)
   u8 vOffsetEnable = 0; // o (6)
@@ -8913,7 +8913,7 @@ private:
       }
       else if (type == 0x6) { vWidth = n(1); vRegBase = n(3); vIncFlag = n(4); vOffsetEnable = n(5); vRegOffset = n(6); }
       else if (type == 0x7) { vWidth = n(1); vRegDest = n(3); vArithOp = n(4); }
-      else if (type == 0x8) { vBitMask = dword & 0x0FFFFFFF; }
+      else if (type == 0x8) { vBitMask = static_cast<u64>(dword & 0x0FFFFFFF); }
       else if (type == 0x9) { vWidth = n(1); vArithOp = n(2); vRegDest = n(3); vRegSource = n(4); vImmFlag = n(5); vRegOffset = n(6); }
       else if (type == 0xA) { vWidth = n(1); vRegSource = n(2); vRegBase = n(3); vIncFlag = n(4); vOpType = n(5); vRegOffset = n(6); vOffsetNib = n(7); }
     } else if (type == 0xC0) {
@@ -8923,7 +8923,9 @@ private:
     } else if (type == 0xC1) {
       vRegDest = n(3); vRegSource = n(5); vOpType = n(6);
     } else if (type == 0xC2) {
-      vOpType = n(1); vBitMask = (u16)(dword & 0xFFFF);
+      vOpType = n(1); vBitMask = static_cast<u64>(dword & 0xFFFF);
+    } else if (type == 0xC4) {
+      vOpType = n(2);
     } else if (type == 0xC3) {
       vStaticIdx = (u8)((dword >> 4) & 0xFF); vRegSource = n(7);
     } else if (type == 0xFFF) {
@@ -8950,7 +8952,9 @@ private:
       }
       else if (type == 0x6) { set(2, 0); set(3, vRegBase); set(4, vIncFlag); set(5, vOffsetEnable); set(6, vRegOffset); set(7, 0); }
       else if (type == 0x7) { set(2, 0); set(3, vRegDest); set(4, vArithOp); set(5, 0); set(6, 0); set(7, 0); }
-      else if (type == 0x8) { dword = (0x80000000 | (vBitMask & 0x0FFFFFFF)); }
+      else if (type == 0x8) {
+        dword = (0x80000000 | static_cast<u32>(vBitMask & 0x0FFFFFFF));
+      }
       else if (type == 0x9) { set(2, vArithOp); set(3, vRegDest); set(4, vRegSource); set(5, vImmFlag); set(6, vRegOffset); set(7, 0); }
       else if (type == 0xA) { set(2, vRegSource); set(3, vRegBase); set(4, vIncFlag); set(5, vOpType); set(6, vRegOffset); set(7, vOffsetNib); }
     } else if (type == 0xC0) {
@@ -8960,7 +8964,10 @@ private:
     } else if (type == 0xC1) {
       set(2, 0); set(3, vRegDest); set(4, 0); set(5, vRegSource); set(6, vOpType); set(7, 0);
     } else if (type == 0xC2) {
-      dword = (0xC2000000 | ((u32)(vOpType & 0xF) << 20) | (vBitMask & 0xFFFF));
+      dword = (0xC2000000 | ((u32)(vOpType & 0xF) << 20) |
+               static_cast<u32>(vBitMask & 0xFFFF));
+    } else if (type == 0xC4) {
+      dword = (0xC4000000 | ((u32)(vOpType & 0xF) << 20));
     } else if (type == 0xC3) {
       dword = (0xC3000000 | ((u32)vStaticIdx << 4) | (vRegSource & 0xF));
     } else if (type == 0xFFF) {
@@ -10089,6 +10096,7 @@ public:
     if (type == 0xC0 && vOpType > 5) vOpType = 0;
     if (type == 0xC1 && vOpType > 3) vOpType = 0;
     if (type == 0xC2 && vOpType > 3) vOpType = 0;
+    if (type == 0xC4 && vOpType > 1) vOpType = 0;
     if (type == 0xFFF && vOpType > 4) vOpType = 0;
 
     // Reg limits (already 4-bit via applying, but for logic safety)
@@ -10115,6 +10123,7 @@ public:
     else if (type == 0x8) targetCount = 1;
     else if (type == 0x9) targetCount = ((vImmFlag == 1) ? ((vWidth == 8) ? 3 : 2) : 1);
     else if (type == 0xA) targetCount = (vOpType == 2 || vOpType == 4 || vOpType == 5) ? 2 : 1;
+    else if (type == 0xC4) targetCount = 3;
     else if (type == 0xC0) {
         if (vOpType == 1 || vOpType == 3 || vOpType == 5) targetCount = 1;
         else if (vOpType == 4) targetCount = (vWidth == 8) ? 3 : 2;
@@ -10122,8 +10131,18 @@ public:
     }
     else if (type == 0xFFF) targetCount = (vOpType == 1 || vOpType == 3 || vOpType == 4) ? 1 : 2;
 
+    if (type == 0xC4 && dwords.size() >= 3) {
+        vBitMask = (static_cast<u64>(dwords[1]) << 32) |
+                   static_cast<u64>(dwords[2]);
+    }
+
     if (dwords.size() > targetCount) dwords.resize(targetCount);
     while (dwords.size() < targetCount) dwords.push_back(0);
+
+    if (type == 0xC4 && dwords.size() >= 3) {
+        dwords[1] = static_cast<u32>(vBitMask >> 32);
+        dwords[2] = static_cast<u32>(vBitMask & 0xFFFFFFFFULL);
+    }
 
 
     // 8. Finalize hex string and update cursor if needed
