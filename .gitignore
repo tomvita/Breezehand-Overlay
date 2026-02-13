@@ -7,3 +7,6 @@ breezehand.zip
 build_editcheat
 out/switch/.overlays/editcheat.ovl
 editcheat.lst
+out/switch/.overlays/edittasmk.ovl
+build_editcheatk
+out/switch/.overlays/editcheatk.ovl

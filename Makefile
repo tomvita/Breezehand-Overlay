@@ -300,8 +300,27 @@ editcheat:
 		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
 		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
 		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
+	@mkdir -p build_editcheatk
+	@rm -f editcheatk.nacp
+	@$(MAKE) --no-print-directory -C build_editcheatk -f $(CURDIR)/Makefile \
+		TARGET=editcheat \
+		BUILD=build_editcheatk \
+		APP_TITLE="Edit Cheat" \
+		APP_VERSION="1.0.0" \
+		APP_JSON= \
+		OUTPUT=editcheatk \
+		DEPSDIR=$(CURDIR)/build_editcheatk \
+		NROFLAGS= \
+		TOPDIR=$(CURDIR) \
+		USE_KEYSTONE_ASM=1 \
+		KEYSTONE_ROOT=$(CURDIR)/../keystone \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
+		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
 	@mkdir -p out/switch/.overlays/
+	@rm -f out/switch/.overlays/editasm.ovl out/switch/.overlays/edittasmk.ovl
 	@cp build_editcheat/editcheat.ovl out/switch/.overlays/editcheat.ovl
+	@cp build_editcheatk/editcheatk.ovl out/switch/.overlays/editcheatk.ovl
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
@@ -317,7 +336,7 @@ $(BUILD):
 #---------------------------------------------------------------------------------
 clean:
 	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
-	@rm -fr build_editcheat editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf
+	@rm -fr build_editcheat build_editcheatk editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf editcheatk.ovl editcheatk.nro editcheatk.nacp editcheatk.elf
 
 	@rm -rf out/
 	@rm -f $(TARGET).zip

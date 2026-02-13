@@ -14554,6 +14554,22 @@ public:
                 // tsl::changeTo<CheatEditMenu>(cheat.cheat_id,
                 // cheat.definition.readable_name, cheat.enabled);
                 std::string path = "sdmc:/switch/.overlays/editcheat.ovl";
+                const u32 currentMB = bytesToMB(static_cast<u64>(currentHeapSize));
+                if (currentMB >= 6) {
+                  path = "sdmc:/switch/.overlays/editcheatk.ovl";
+                }
+                if (!ult::isFile(path)) {
+                  const std::string fallbackPath = "sdmc:/switch/.overlays/editcheat.ovl";
+                  if (ult::isFile(fallbackPath)) {
+                    path = fallbackPath;
+                  }
+                }
+                if (!ult::isFile(path)) {
+                  if (tsl::notification) {
+                    tsl::notification->show("Missing editcheat.ovl/editcheatk.ovl");
+                  }
+                  return true;
+                }
                 std::string args =
                     "--cheat_id " + std::to_string(cheat.cheat_id) +
                     " --cheat_name " + cheat.definition.readable_name +
@@ -17864,6 +17880,11 @@ elm::Element *KeyboardGui::createUI() {
       }));
       topRow->addButton(new KeyboardButton("ASM", [this] {
         if (!m_onGetAsmEditValue || !m_onApplyAsmEdit) return;
+#if HAVE_KEYSTONE_ASM
+        if (!checkOverlayMemory(6)) {
+          return;
+        }
+#endif
         std::string initial;
         {
           std::lock_guard<std::recursive_mutex> lock(m_mutex);
