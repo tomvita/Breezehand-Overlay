@@ -140,6 +140,13 @@ static std::string g_searchConditionSourcePath;
 static std::string g_startSearchOutputName;
 static std::string g_searchContinueSourcePath;
 static std::string g_continueSearchOutputName;
+static std::string g_continueSourceJumpStem;
+static std::string g_pendingDeleteSeriesPath;
+static bool g_pendingDeleteSeriesWaitRelease = false;
+static std::string g_pendingDeleteFilePath;
+static bool g_pendingDeleteFileWaitRelease = false;
+static int g_continueSourceFilterMode = 1; // 1=series ends, 2=focused series
+static std::string g_continueSourceFilterAnchorStem;
 static bool g_lastSearchStatsValid = false;
 static size_t g_lastSearchPrimaryBufferBytes = 0;
 static size_t g_lastSearchSecondaryBufferBytes = 0;
@@ -11317,6 +11324,57 @@ std::string ContinueSearchNoteFromPath(const std::string &path) {
   return status + " file=" + stem;
 }
 
+std::string AutoGenerateContinueOutputName(const std::string &sourcePath);
+std::string NormalizeSeriesStartStem(const std::string &stem);
+void QueueSearchAction(SearchQueuedAction action);
+
+bool TryQueueContinueSearchFromUi() {
+  if (!checkOverlayMemory(8)) {
+    return true;
+  }
+  if (g_searchContinueSourcePath.empty()) {
+    if (tsl::notification) {
+      tsl::notification->show("No source candidate selected");
+    }
+    return true;
+  }
+  g_continueSearchOutputName =
+      AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+  if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
+    tsl::changeTo<tsl::KeyboardGui>(
+        SEARCH_TYPE_TEXT, g_continueSearchOutputName, "Output exists, rename",
+        [](std::string result) {
+          const std::string trimmed = TrimCopy(result);
+          if (trimmed.empty()) {
+            if (tsl::notification) {
+              tsl::notification->show("File name cannot be empty");
+            }
+            return;
+          }
+          g_continueSearchOutputName = trimmed;
+          if (g_continueSearchOutputName.size() > 4 &&
+              g_continueSearchOutputName.substr(g_continueSearchOutputName.size() - 4) ==
+                  ".dat") {
+            g_continueSearchOutputName.erase(g_continueSearchOutputName.size() - 4);
+          }
+          g_continueSearchOutputName =
+              NormalizeSeriesStartStem(g_continueSearchOutputName);
+          if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
+            if (tsl::notification) {
+              tsl::notification->show("Output file already exists");
+            }
+            return;
+          }
+          tsl::goBack();
+          QueueSearchAction(SEARCH_QUEUED_CONTINUE);
+        },
+        nullptr, false);
+    return true;
+  }
+  QueueSearchAction(SEARCH_QUEUED_CONTINUE);
+  return true;
+}
+
 std::string LastSearchBufferNote() {
   auto formatBytes = [](size_t bytes) -> std::string {
     const unsigned long long kb = static_cast<unsigned long long>(bytes / 1024ULL);
@@ -11717,6 +11775,252 @@ bool IsSeriesStartStem(const std::string &stem) {
   }
   // With current naming, "(00)" is the first item of a series.
   return parsedIndex == 0;
+}
+
+int SeriesIndexFromStem(const std::string &stem) {
+  std::string parsedBase;
+  int parsedIndex = 0;
+  if (ParseSeriesSuffix(stem, parsedBase, parsedIndex)) {
+    return parsedIndex;
+  }
+  return 0;
+}
+
+std::string SeriesEndStemForBase(const std::string &base,
+                                 const std::vector<std::string> &files) {
+  std::string bestStem;
+  int bestIndex = std::numeric_limits<int>::min();
+  for (const auto &path : files) {
+    const std::string stem = CandidateStemFromPath(path);
+    if (SeriesBaseFromStem(stem) != base) {
+      continue;
+    }
+    const int index = SeriesIndexFromStem(stem);
+    if (bestStem.empty() || index > bestIndex ||
+        (index == bestIndex && stem > bestStem)) {
+      bestStem = stem;
+      bestIndex = index;
+    }
+  }
+  return bestStem;
+}
+
+std::string SeriesEndStemForBase(const std::string &base) {
+  return SeriesEndStemForBase(base, breeze::ListCandidateFiles());
+}
+
+std::string CandidatePathFromStemInSameFolder(const std::string &sourcePath,
+                                              const std::string &targetStem) {
+  const size_t slash = sourcePath.find_last_of("/\\");
+  const std::string folder =
+      (slash == std::string::npos) ? std::string() : sourcePath.substr(0, slash + 1);
+  return folder + targetStem + ".dat";
+}
+
+struct CandidateSeriesRenamePlanEntry {
+  std::string fromPath;
+  std::string toPath;
+};
+
+bool RenameCandidateSeries(const std::string &selectedPath,
+                           const std::string &newBaseInput,
+                           std::vector<CandidateSeriesRenamePlanEntry> &renamesOut,
+                           std::string &renamedSelectedPath,
+                           std::string *errorOut = nullptr) {
+  renamesOut.clear();
+  renamedSelectedPath = selectedPath;
+  if (selectedPath.empty()) {
+    if (errorOut) {
+      *errorOut = "No source candidate selected";
+    }
+    return false;
+  }
+
+  const std::string selectedStem = CandidateStemFromPath(selectedPath);
+  if (selectedStem.empty()) {
+    if (errorOut) {
+      *errorOut = "Invalid source candidate";
+    }
+    return false;
+  }
+  const std::string oldBase = SeriesBaseFromStem(selectedStem);
+
+  std::string newBase = TrimCopy(newBaseInput);
+  if (newBase.size() > 4 && newBase.substr(newBase.size() - 4) == ".dat") {
+    newBase.erase(newBase.size() - 4);
+  }
+  if (newBase.empty()) {
+    if (errorOut) {
+      *errorOut = "Series name cannot be empty";
+    }
+    return false;
+  }
+  if (newBase.find_first_of("/\\") != std::string::npos) {
+    if (errorOut) {
+      *errorOut = "Series name cannot contain / or \\";
+    }
+    return false;
+  }
+
+  // Parentheses break strict "<base>(<index>)" parsing for series suffixes.
+  if (newBase.find('(') != std::string::npos ||
+      newBase.find(')') != std::string::npos) {
+    if (errorOut) {
+      *errorOut = "Series name cannot contain parentheses";
+    }
+    return false;
+  }
+
+  if (newBase == oldBase) {
+    return true;
+  }
+
+  std::vector<CandidateSeriesRenamePlanEntry> plan;
+  std::set<std::string> sourcePaths;
+  std::set<std::string> targetPaths;
+
+  const auto files = breeze::ListCandidateFiles();
+  for (const auto &path : files) {
+    const std::string stem = CandidateStemFromPath(path);
+    if (SeriesBaseFromStem(stem) != oldBase) {
+      continue;
+    }
+
+    std::string parsedBase;
+    int parsedIndex = 0;
+    const bool hasSuffix = ParseSeriesSuffix(stem, parsedBase, parsedIndex);
+    const int targetIndex = hasSuffix ? parsedIndex : 0;
+    const std::string targetStem = FormatSeriesStem(newBase, targetIndex);
+    const std::string targetPath = CandidatePathFromStemInSameFolder(path, targetStem);
+
+    if (!targetPaths.insert(targetPath).second) {
+      if (errorOut) {
+        *errorOut = "Rename would create duplicate targets";
+      }
+      return false;
+    }
+    sourcePaths.insert(path);
+    plan.push_back({path, targetPath});
+  }
+
+  if (plan.empty()) {
+    if (errorOut) {
+      *errorOut = "No files found for this series";
+    }
+    return false;
+  }
+
+  for (const auto &entry : plan) {
+    if (entry.fromPath == entry.toPath) {
+      continue;
+    }
+    struct stat st {};
+    if (stat(entry.toPath.c_str(), &st) == 0 &&
+        !sourcePaths.count(entry.toPath)) {
+      if (errorOut) {
+        *errorOut = "Target file already exists: " + CandidateStemFromPath(entry.toPath);
+      }
+      return false;
+    }
+  }
+
+  std::vector<size_t> renamedIndices;
+  for (size_t i = 0; i < plan.size(); ++i) {
+    const auto &entry = plan[i];
+    if (entry.fromPath == entry.toPath) {
+      continue;
+    }
+    if (std::rename(entry.fromPath.c_str(), entry.toPath.c_str()) != 0) {
+      for (auto it = renamedIndices.rbegin(); it != renamedIndices.rend(); ++it) {
+        const auto &rollbackEntry = plan[*it];
+        std::rename(rollbackEntry.toPath.c_str(), rollbackEntry.fromPath.c_str());
+      }
+      if (errorOut) {
+        *errorOut = "Rename failed: " + std::string(std::strerror(errno));
+      }
+      return false;
+    }
+    renamedIndices.push_back(i);
+  }
+
+  renamesOut = plan;
+  for (const auto &entry : renamesOut) {
+    if (entry.fromPath == selectedPath) {
+      renamedSelectedPath = entry.toPath;
+      break;
+    }
+  }
+  return true;
+}
+
+void ApplyCandidateRenameToPath(std::string &path,
+                                const std::vector<CandidateSeriesRenamePlanEntry> &renames) {
+  for (const auto &entry : renames) {
+    if (path == entry.fromPath) {
+      path = entry.toPath;
+      return;
+    }
+  }
+}
+
+size_t DeleteCandidateSeries(const std::string &selectedPath,
+                             bool fromSelectedForwardOnly,
+                             std::vector<std::string> &deletedPathsOut,
+                             size_t &failedCountOut,
+                             std::string *errorOut = nullptr) {
+  deletedPathsOut.clear();
+  failedCountOut = 0;
+  if (selectedPath.empty()) {
+    if (errorOut) {
+      *errorOut = "No source candidate selected";
+    }
+    return 0;
+  }
+
+  const std::string selectedStem = CandidateStemFromPath(selectedPath);
+  if (selectedStem.empty()) {
+    if (errorOut) {
+      *errorOut = "Invalid source candidate";
+    }
+    return 0;
+  }
+  const std::string base = SeriesBaseFromStem(selectedStem);
+  const int selectedIndex = SeriesIndexFromStem(selectedStem);
+
+  std::vector<std::string> targets;
+  const auto files = breeze::ListCandidateFiles();
+  for (const auto &path : files) {
+    const std::string stem = CandidateStemFromPath(path);
+    if (SeriesBaseFromStem(stem) != base) {
+      continue;
+    }
+    if (fromSelectedForwardOnly && SeriesIndexFromStem(stem) < selectedIndex) {
+      continue;
+    }
+    targets.push_back(path);
+  }
+  if (targets.empty()) {
+    if (errorOut) {
+      *errorOut = fromSelectedForwardOnly ? "No files found from selected sequence"
+                                          : "No files found for this series";
+    }
+    return 0;
+  }
+
+  for (const auto &path : targets) {
+    if (std::remove(path.c_str()) == 0) {
+      deletedPathsOut.push_back(path);
+    } else {
+      ++failedCountOut;
+    }
+  }
+
+  if (deletedPathsOut.empty()) {
+    if (errorOut) {
+      *errorOut = "Failed to delete series files";
+    }
+  }
+  return deletedPathsOut.size();
 }
 
 struct CandidateRecordView {
@@ -12383,9 +12687,157 @@ public:
   }
 };
 
+void SwapToContinueSearchFileMenu();
+
 class ContinueSourceOptionsMenu : public tsl::Gui {
 private:
   std::string m_path;
+  tsl::elm::ListItem *m_deleteFileItem = nullptr;
+  tsl::elm::ListItem *m_deleteSeriesItem = nullptr;
+  bool IsDeleteFilePending() const { return g_pendingDeleteFilePath == m_path; }
+  bool IsDeleteSeriesPending() const { return g_pendingDeleteSeriesPath == m_path; }
+  bool HasPendingDelete() const { return IsDeleteFilePending() || IsDeleteSeriesPending(); }
+  void RefreshDeleteFileUi() {
+    if (!m_deleteFileItem) {
+      return;
+    }
+    m_deleteFileItem->setNote(IsDeleteFilePending() ? "A=Confirm B=Abort"
+                                                    : "Deletes selected file");
+  }
+  void RefreshDeleteSeriesUi() {
+    if (!m_deleteSeriesItem) {
+      return;
+    }
+    if (IsDeleteSeriesPending()) {
+      m_deleteSeriesItem->setNote("A=Confirm B=Abort");
+      return;
+    }
+    m_deleteSeriesItem->setNote(
+        (g_continueSourceFilterMode == 2) ? "Deletes selected and newer in series"
+                                          : "Deletes all in series");
+  }
+  void RefreshDeleteUi() {
+    RefreshDeleteFileUi();
+    RefreshDeleteSeriesUi();
+  }
+
+  bool ExecuteDeleteFile() {
+    g_pendingDeleteFilePath.clear();
+    g_pendingDeleteFileWaitRelease = false;
+
+    if (m_path.empty()) {
+      if (tsl::notification) {
+        tsl::notification->show("No source candidate selected");
+      }
+      RefreshDeleteUi();
+      return true;
+    }
+
+    const std::string selectedBase = SeriesBaseFromStem(CandidateStemFromPath(m_path));
+    if (std::remove(m_path.c_str()) != 0) {
+      if (tsl::notification) {
+        tsl::notification->show("Failed to delete file");
+      }
+      RefreshDeleteUi();
+      return true;
+    }
+
+    if (g_searchContinueSourcePath == m_path) {
+      g_searchContinueSourcePath.clear();
+    }
+    if (g_searchConditionSourcePath == m_path) {
+      g_searchConditionSourcePath.clear();
+    }
+
+    if (g_searchContinueSourcePath.empty()) {
+      std::string latest;
+      if (GetLatestCandidatePath(latest)) {
+        g_searchContinueSourcePath = latest;
+      }
+    }
+    if (!g_searchContinueSourcePath.empty()) {
+      g_continueSearchOutputName =
+          AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+    } else {
+      g_continueSearchOutputName = AutoGenerateStartOutputName();
+    }
+
+    if (!g_continueSourceFilterAnchorStem.empty() &&
+        SeriesBaseFromStem(g_continueSourceFilterAnchorStem) == selectedBase) {
+      g_continueSourceFilterAnchorStem =
+          CandidateStemFromPath(g_searchContinueSourcePath);
+    }
+
+    if (tsl::notification) {
+      tsl::notification->show("Deleted file");
+    }
+
+    tsl::goBack();
+    SwapToContinueSearchFileMenu();
+    return true;
+  }
+
+  bool ExecuteDeleteSeries() {
+    g_pendingDeleteSeriesPath.clear();
+    g_pendingDeleteSeriesWaitRelease = false;
+    const std::string selectedBase = SeriesBaseFromStem(CandidateStemFromPath(m_path));
+    std::vector<std::string> deletedPaths;
+    size_t failedCount = 0;
+    std::string err;
+    const size_t removedCount =
+        DeleteCandidateSeries(m_path, g_continueSourceFilterMode == 2,
+                              deletedPaths, failedCount, &err);
+    if (removedCount == 0) {
+      if (tsl::notification) {
+        tsl::notification->show(err.empty() ? "Failed to delete series" : err);
+      }
+      RefreshDeleteSeriesUi();
+      return true;
+    }
+
+    auto wasDeleted = [&deletedPaths](const std::string &path) -> bool {
+      return std::find(deletedPaths.begin(), deletedPaths.end(), path) !=
+             deletedPaths.end();
+    };
+
+    if (wasDeleted(g_searchContinueSourcePath)) {
+      g_searchContinueSourcePath.clear();
+    }
+    if (wasDeleted(g_searchConditionSourcePath)) {
+      g_searchConditionSourcePath.clear();
+    }
+
+    if (g_searchContinueSourcePath.empty()) {
+      std::string latest;
+      if (GetLatestCandidatePath(latest)) {
+        g_searchContinueSourcePath = latest;
+      }
+    }
+    if (!g_searchContinueSourcePath.empty()) {
+      g_continueSearchOutputName =
+          AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+    } else {
+      g_continueSearchOutputName = AutoGenerateStartOutputName();
+    }
+
+    if (!g_continueSourceFilterAnchorStem.empty() &&
+        SeriesBaseFromStem(g_continueSourceFilterAnchorStem) == selectedBase) {
+      g_continueSourceFilterAnchorStem =
+          CandidateStemFromPath(g_searchContinueSourcePath);
+    }
+
+    if (tsl::notification) {
+      std::string msg = "Deleted " + std::to_string(removedCount) + " file(s)";
+      if (failedCount > 0) {
+        msg += ", failed " + std::to_string(failedCount);
+      }
+      tsl::notification->show(msg);
+    }
+
+    tsl::goBack();
+    SwapToContinueSearchFileMenu();
+    return true;
+  }
 
 public:
   explicit ContinueSourceOptionsMenu(const std::string &path) : m_path(path) {}
@@ -12393,6 +12845,44 @@ public:
   virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
+    if (IsDeleteFilePending()) {
+      if (g_pendingDeleteFileWaitRelease) {
+        if (!(keysHeld & KEY_A)) {
+          g_pendingDeleteFileWaitRelease = false;
+        }
+      }
+      if (!g_pendingDeleteFileWaitRelease && (keysDown & KEY_A)) {
+        return ExecuteDeleteFile();
+      }
+      if (keysDown & KEY_A) {
+        return true;
+      }
+      if (keysDown & KEY_B) {
+        g_pendingDeleteFilePath.clear();
+        g_pendingDeleteFileWaitRelease = false;
+        RefreshDeleteUi();
+        return true;
+      }
+    }
+    if (IsDeleteSeriesPending()) {
+      if (g_pendingDeleteSeriesWaitRelease) {
+        if (!(keysHeld & KEY_A)) {
+          g_pendingDeleteSeriesWaitRelease = false;
+        }
+      }
+      if (!g_pendingDeleteSeriesWaitRelease && (keysDown & KEY_A)) {
+        return ExecuteDeleteSeries();
+      }
+      if (keysDown & KEY_A) {
+        return true;
+      }
+      if (keysDown & KEY_B) {
+        g_pendingDeleteSeriesPath.clear();
+        g_pendingDeleteSeriesWaitRelease = false;
+        RefreshDeleteUi();
+        return true;
+      }
+    }
     if (keysDown & KEY_B) {
       tsl::goBack();
       return true;
@@ -12409,6 +12899,9 @@ public:
     copyConditionItem->setClickListener([this](u64 keys) {
       if (!(keys & KEY_A)) {
         return false;
+      }
+      if (HasPendingDelete()) {
+        return true;
       }
       breeze::BreezeFileHeader_t header{};
       std::string err;
@@ -12428,10 +12921,104 @@ public:
       if (!(keys & KEY_A)) {
         return false;
       }
+      if (HasPendingDelete()) {
+        return true;
+      }
       tsl::changeTo<CandidateEntriesMenu>(m_path, 0);
       return true;
     });
     list->addItem(viewCandidatesItem);
+
+    auto *renameSeriesItem = new tsl::elm::ListItem("Rename series");
+    renameSeriesItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      if (HasPendingDelete()) {
+        return true;
+      }
+      const std::string currentStem = CandidateStemFromPath(m_path);
+      const std::string currentBase = SeriesBaseFromStem(currentStem);
+      tsl::changeTo<tsl::KeyboardGui>(
+          SEARCH_TYPE_TEXT, currentBase, "Rename series",
+          [this, currentBase](std::string result) {
+            std::vector<CandidateSeriesRenamePlanEntry> renames;
+            std::string renamedSelected = m_path;
+            std::string err;
+            if (!RenameCandidateSeries(m_path, result, renames, renamedSelected, &err)) {
+              if (tsl::notification) {
+                tsl::notification->show(err.empty() ? "Failed to rename series" : err);
+              }
+              return;
+            }
+
+            ApplyCandidateRenameToPath(g_searchContinueSourcePath, renames);
+            ApplyCandidateRenameToPath(g_searchConditionSourcePath, renames);
+            m_path = renamedSelected;
+
+            const std::string newBase = SeriesBaseFromStem(CandidateStemFromPath(m_path));
+            if (!g_searchContinueSourcePath.empty()) {
+              g_continueSearchOutputName =
+                  AutoGenerateContinueOutputName(g_searchContinueSourcePath);
+            }
+
+            if (!g_continueSourceFilterAnchorStem.empty() &&
+                SeriesBaseFromStem(g_continueSourceFilterAnchorStem) == currentBase) {
+              g_continueSourceFilterAnchorStem = FormatSeriesStem(newBase, 0);
+            }
+
+            if (tsl::notification) {
+              tsl::notification->show("Renamed " + std::to_string(renames.size()) +
+                                      " file(s)");
+            }
+
+            tsl::goBack();
+            SwapToContinueSearchFileMenu();
+          },
+          nullptr, false);
+      return true;
+    });
+    list->addItem(renameSeriesItem);
+
+    auto *deleteFileItem = new tsl::elm::ListItem("Delete file");
+    m_deleteFileItem = deleteFileItem;
+    deleteFileItem->setAlwaysShowNote(true);
+    RefreshDeleteFileUi();
+    deleteFileItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      if (HasPendingDelete()) {
+        return true;
+      }
+      g_pendingDeleteSeriesPath.clear();
+      g_pendingDeleteSeriesWaitRelease = false;
+      g_pendingDeleteFilePath = m_path;
+      g_pendingDeleteFileWaitRelease = true;
+      RefreshDeleteUi();
+      return true;
+    });
+    list->addItem(deleteFileItem);
+
+    auto *deleteSeriesItem = new tsl::elm::ListItem("Delete series");
+    m_deleteSeriesItem = deleteSeriesItem;
+    deleteSeriesItem->setAlwaysShowNote(true);
+    RefreshDeleteSeriesUi();
+    deleteSeriesItem->setClickListener([this](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      if (HasPendingDelete()) {
+        return true;
+      }
+      g_pendingDeleteFilePath.clear();
+      g_pendingDeleteFileWaitRelease = false;
+      g_pendingDeleteSeriesPath = m_path;
+      g_pendingDeleteSeriesWaitRelease = true;
+      RefreshDeleteUi();
+      return true;
+    });
+    list->addItem(deleteSeriesItem);
 
     frame->setContent(list);
     return frame;
@@ -12440,8 +13027,6 @@ public:
 
 class ContinueSearchFileMenu : public tsl::Gui {
 private:
-  static inline int s_filterMode = 1; // 1=series starts, 2=focused series
-  static inline std::string s_filterAnchorStem;
   tsl::elm::List *m_list = nullptr;
 
 public:
@@ -12449,23 +13034,33 @@ public:
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
     if (keysDown & KEY_Y) {
-      s_filterMode = (s_filterMode == 1) ? 2 : 1;
-      if (s_filterMode == 2) {
-        std::string anchor = CandidateStemFromPath(g_searchContinueSourcePath);
-        if (m_list) {
-          struct ListProxy : public tsl::elm::List {
-            using tsl::elm::List::m_items;
-          };
-          for (auto *item : static_cast<ListProxy *>(m_list)->m_items) {
-            if (item && item->m_isItem && item->hasFocus()) {
-              auto *listItem = static_cast<tsl::elm::ListItem *>(item);
-              anchor = listItem->getText();
-              break;
-            }
+      std::string focusedStem = CandidateStemFromPath(g_searchContinueSourcePath);
+      if (m_list) {
+        struct ListProxy : public tsl::elm::List {
+          using tsl::elm::List::m_items;
+        };
+        for (auto *item : static_cast<ListProxy *>(m_list)->m_items) {
+          if (item && item->m_isItem && item->hasFocus()) {
+            auto *listItem = static_cast<tsl::elm::ListItem *>(item);
+            focusedStem = listItem->getText();
+            break;
           }
         }
-        s_filterAnchorStem = anchor;
       }
+
+      const int nextMode = (g_continueSourceFilterMode == 1) ? 2 : 1;
+      if (nextMode == 2) {
+        g_continueSourceFilterAnchorStem = focusedStem;
+      } else {
+        const std::string base = SeriesBaseFromStem(focusedStem);
+        if (!base.empty()) {
+          const std::string endStem = SeriesEndStemForBase(base);
+          g_continueSourceJumpStem = endStem.empty() ? focusedStem : endStem;
+        } else {
+          g_continueSourceJumpStem = focusedStem;
+        }
+      }
+      g_continueSourceFilterMode = nextMode;
       tsl::swapTo<ContinueSearchFileMenu>();
       return true;
     }
@@ -12478,8 +13073,8 @@ public:
 
   virtual tsl::elm::Element *createUI() override {
     std::string subtitle =
-        (s_filterMode == 2) ? "Filtered (focused series)"
-                            : "Series starts only";
+        (g_continueSourceFilterMode == 2) ? "Filtered (focused series)"
+                                          : "Series ends only";
     auto *frame = new tsl::elm::OverlayFrame("Continue Source", subtitle);
     auto *list = new tsl::elm::List();
     m_list = list;
@@ -12494,19 +13089,50 @@ public:
     }
 
     const std::string focusedStem =
-        s_filterMode == 2 && !s_filterAnchorStem.empty()
-            ? s_filterAnchorStem
+        g_continueSourceFilterMode == 2 && !g_continueSourceFilterAnchorStem.empty()
+            ? g_continueSourceFilterAnchorStem
             : CandidateStemFromPath(g_searchContinueSourcePath);
     const std::string focusedSeriesBase = SeriesBaseFromStem(focusedStem);
+    std::set<std::string> seriesEndStems;
+    if (g_continueSourceFilterMode == 1) {
+      struct SeriesEndEntry {
+        std::string base;
+        std::string stem;
+        int index = 0;
+      };
+      std::vector<SeriesEndEntry> ends;
+      for (const auto &path : files) {
+        const std::string stem = CandidateStemFromPath(path);
+        const std::string base = SeriesBaseFromStem(stem);
+        const int index = SeriesIndexFromStem(stem);
+
+        auto it = std::find_if(ends.begin(), ends.end(),
+                               [&base](const SeriesEndEntry &entry) {
+                                 return entry.base == base;
+                               });
+        if (it == ends.end()) {
+          ends.push_back(SeriesEndEntry{base, stem, index});
+          continue;
+        }
+        if (index > it->index || (index == it->index && stem > it->stem)) {
+          it->stem = stem;
+          it->index = index;
+        }
+      }
+      for (const auto &entry : ends) {
+        seriesEndStems.insert(entry.stem);
+      }
+    }
 
     bool anyShown = false;
     for (const auto &path : files) {
       const std::string stem = CandidateStemFromPath(path);
       const std::string stemSeriesBase = SeriesBaseFromStem(stem);
-      if (s_filterMode == 1 && !IsSeriesStartStem(stem)) {
+      if (g_continueSourceFilterMode == 1 &&
+          !seriesEndStems.count(stem)) {
         continue;
       }
-      if (s_filterMode == 2 && !focusedSeriesBase.empty()) {
+      if (g_continueSourceFilterMode == 2 && !focusedSeriesBase.empty()) {
         if (stemSeriesBase != focusedSeriesBase) {
           continue;
         }
@@ -12537,15 +13163,18 @@ public:
 
     if (!anyShown) {
       const char *emptyText = "No candidate files found";
-      if (s_filterMode == 1) {
-        emptyText = "No series starts found";
-      } else if (s_filterMode == 2) {
+      if (g_continueSourceFilterMode == 1) {
+        emptyText = "No series ends found";
+      } else if (g_continueSourceFilterMode == 2) {
         emptyText = "No candidates in focused series";
       }
       list->addItem(new tsl::elm::ListItem(emptyText));
     }
 
-    std::string jumpStem = CandidateStemFromPath(g_searchContinueSourcePath);
+    std::string jumpStem = g_continueSourceJumpStem.empty()
+                               ? CandidateStemFromPath(g_searchContinueSourcePath)
+                               : g_continueSourceJumpStem;
+    g_continueSourceJumpStem.clear();
     if (!jumpStem.empty()) {
       list->jumpToItem(jumpStem, "", true);
     }
@@ -12554,6 +13183,8 @@ public:
     return frame;
   }
 };
+
+void SwapToContinueSearchFileMenu() { tsl::swapTo<ContinueSearchFileMenu>(); }
 
 std::string SearchDataNote(const Search_condition &condition, int slot,
                            bool hexMode) {
@@ -13486,59 +14117,46 @@ public:
         ContinueSearchNoteFromPath(g_searchContinueSourcePath));
     continueSearchItem->setClickListener([](u64 keys) {
       if (keys & KEY_X) {
+        const std::string sourceStem =
+            CandidateStemFromPath(g_searchContinueSourcePath);
+        g_continueSourceFilterMode = 2;
+        g_continueSourceFilterAnchorStem = sourceStem;
+        g_continueSourceJumpStem = sourceStem;
         tsl::changeTo<ContinueSearchFileMenu>();
         return true;
       }
       if (keys & KEY_A) {
-        if (!checkOverlayMemory(8)) {
-          return true;
-        }
-        if (g_searchContinueSourcePath.empty()) {
-          if (tsl::notification) {
-            tsl::notification->show("No source candidate selected");
-          }
-          return true;
-        }
-        g_continueSearchOutputName =
-            AutoGenerateContinueOutputName(g_searchContinueSourcePath);
-        if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
-          tsl::changeTo<tsl::KeyboardGui>(
-              SEARCH_TYPE_TEXT, g_continueSearchOutputName, "Output exists, rename",
-              [](std::string result) {
-                const std::string trimmed = TrimCopy(result);
-                if (trimmed.empty()) {
-                  if (tsl::notification) {
-                    tsl::notification->show("File name cannot be empty");
-                  }
-                  return;
-                }
-                g_continueSearchOutputName = trimmed;
-                if (g_continueSearchOutputName.size() > 4 &&
-                    g_continueSearchOutputName.substr(g_continueSearchOutputName.size() - 4) ==
-                        ".dat") {
-                  g_continueSearchOutputName.erase(g_continueSearchOutputName.size() - 4);
-                }
-                g_continueSearchOutputName =
-                    NormalizeSeriesStartStem(g_continueSearchOutputName);
-                if (CandidateFileExistsForStem(g_continueSearchOutputName)) {
-                  if (tsl::notification) {
-                    tsl::notification->show("Output file already exists");
-                  }
-                  return;
-                }
-                tsl::goBack();
-                QueueSearchAction(SEARCH_QUEUED_CONTINUE);
-              },
-              nullptr, false);
-          return true;
-        }
-        QueueSearchAction(SEARCH_QUEUED_CONTINUE);
-        return true;
+        return TryQueueContinueSearchFromUi();
       }
       return false;
     });
     list->addItem(continueSearchItem);
     m_continueSearchItem = continueSearchItem;
+
+    auto *editAAndContinueItem = new tsl::elm::ListItem("Edit A and continue");
+    editAAndContinueItem->setClickListener([](u64 keys) {
+      if (!(keys & KEY_A)) {
+        return false;
+      }
+      const searchType_t keyboardType =
+          KeyboardTypeForDataSlot(g_searchCondition, 0, false);
+      const std::string initial = EditableDataText(g_searchCondition, 0, false);
+      tsl::changeTo<tsl::KeyboardGui>(
+          keyboardType, initial, "Edit A and continue",
+          [](std::string result) {
+            if (!ApplyDataText(g_searchCondition, 0, result, false)) {
+              if (tsl::notification) {
+                tsl::notification->show("Invalid value");
+              }
+              return;
+            }
+            tsl::goBack();
+            TryQueueContinueSearchFromUi();
+          },
+          nullptr, false);
+      return true;
+    });
+    list->addItem(editAAndContinueItem);
 
     list->addItem(new tsl::elm::CategoryHeader("Information"));
 
