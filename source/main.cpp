@@ -11984,6 +11984,51 @@ std::string SeriesEndStemForBase(const std::string &base) {
   return SeriesEndStemForBase(base, breeze::ListCandidateFiles());
 }
 
+std::string FindCandidatePathByStem(const std::vector<std::string> &files,
+                                    const std::string &stem) {
+  if (stem.empty()) {
+    return std::string();
+  }
+  for (const auto &path : files) {
+    if (CandidateStemFromPath(path) == stem) {
+      return path;
+    }
+  }
+  return std::string();
+}
+
+bool SelectContinueSourceAfterDeletion(const std::string &preferredBase) {
+  const auto files = breeze::ListCandidateFiles();
+  if (files.empty()) {
+    g_searchContinueSourcePath.clear();
+    g_searchConditionSourcePath.clear();
+    g_continueSourceJumpStem.clear();
+    return false;
+  }
+
+  std::string targetPath;
+  const std::string sameSeriesEnd = SeriesEndStemForBase(preferredBase, files);
+  if (!sameSeriesEnd.empty()) {
+    targetPath = FindCandidatePathByStem(files, sameSeriesEnd);
+  }
+  if (targetPath.empty()) {
+    GetLatestCandidatePath(targetPath);
+  }
+  if (targetPath.empty()) {
+    g_searchContinueSourcePath.clear();
+    g_searchConditionSourcePath.clear();
+    g_continueSourceJumpStem.clear();
+    return false;
+  }
+
+  g_searchContinueSourcePath = targetPath;
+  if (g_searchConditionSourcePath.empty()) {
+    g_searchConditionSourcePath = targetPath;
+  }
+  g_continueSourceJumpStem = CandidateStemFromPath(targetPath);
+  return true;
+}
+
 std::string CandidatePathFromStemInSameFolder(const std::string &sourcePath,
                                               const std::string &targetStem) {
   const size_t slash = sourcePath.find_last_of("/\\");
@@ -13043,19 +13088,11 @@ private:
       return true;
     }
 
-    if (g_searchContinueSourcePath == m_path) {
-      g_searchContinueSourcePath.clear();
-    }
     if (g_searchConditionSourcePath == m_path) {
       g_searchConditionSourcePath.clear();
     }
 
-    if (g_searchContinueSourcePath.empty()) {
-      std::string latest;
-      if (GetLatestCandidatePath(latest)) {
-        g_searchContinueSourcePath = latest;
-      }
-    }
+    SelectContinueSourceAfterDeletion(selectedBase);
     if (!g_searchContinueSourcePath.empty()) {
       g_continueSearchOutputName =
           AutoGenerateContinueOutputName(g_searchContinueSourcePath);
@@ -13109,10 +13146,7 @@ private:
     }
 
     if (g_searchContinueSourcePath.empty()) {
-      std::string latest;
-      if (GetLatestCandidatePath(latest)) {
-        g_searchContinueSourcePath = latest;
-      }
+      SelectContinueSourceAfterDeletion(selectedBase);
     }
     if (!g_searchContinueSourcePath.empty()) {
       g_continueSearchOutputName =
