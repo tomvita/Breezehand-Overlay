@@ -158,6 +158,88 @@ bool OpenCandidateForWrite(const std::string &path,
   return true;
 }
 
+bool LoadReadableMappings(std::vector<MemoryInfo> &outMappings) {
+  outMappings.clear();
+  u64 mappingCount = 0;
+  if (R_FAILED(dmntchtGetCheatProcessMappingCount(&mappingCount)) ||
+      mappingCount == 0) {
+    return false;
+  }
+
+  outMappings.reserve(static_cast<size_t>(mappingCount));
+  u64 offset = 0;
+  while (offset < mappingCount) {
+    MemoryInfo chunk[128] = {};
+    u64 outCount = 0;
+    if (R_FAILED(dmntchtGetCheatProcessMappings(
+            chunk, static_cast<u64>(sizeof(chunk) / sizeof(chunk[0])), offset,
+            &outCount)) ||
+        outCount == 0) {
+      break;
+    }
+    for (u64 i = 0; i < outCount; ++i) {
+      if ((chunk[i].perm & Perm_R) == Perm_R && chunk[i].size > 0) {
+        outMappings.push_back(chunk[i]);
+      }
+    }
+    offset += outCount;
+  }
+
+  return !outMappings.empty();
+}
+
+bool ResolveReadableSpan(const std::vector<MemoryInfo> &mappings,
+                         size_t &mappingIndex, u64 address, u64 &spanOut) {
+  if (mappings.empty()) {
+    return false;
+  }
+  while (mappingIndex < mappings.size()) {
+    const MemoryInfo &map = mappings[mappingIndex];
+    const u64 mapEnd = (map.addr > (std::numeric_limits<u64>::max() - map.size))
+                           ? std::numeric_limits<u64>::max()
+                           : (map.addr + map.size);
+    if (address >= mapEnd) {
+      ++mappingIndex;
+      continue;
+    }
+    if (address >= map.addr && address < mapEnd) {
+      spanOut = mapEnd - address;
+      return true;
+    }
+    if (address < map.addr) {
+      break;
+    }
+    ++mappingIndex;
+  }
+
+  const auto it = std::lower_bound(
+      mappings.begin(), mappings.end(), address,
+      [](const MemoryInfo &m, u64 a) { return m.addr < a; });
+  if (it != mappings.begin()) {
+    const auto prev = it - 1;
+    const u64 prevEnd =
+        (prev->addr > (std::numeric_limits<u64>::max() - prev->size))
+            ? std::numeric_limits<u64>::max()
+            : (prev->addr + prev->size);
+    if (address >= prev->addr && address < prevEnd) {
+      mappingIndex = static_cast<size_t>(prev - mappings.begin());
+      spanOut = prevEnd - address;
+      return true;
+    }
+  }
+  if (it != mappings.end()) {
+    const u64 mapEnd = (it->addr > (std::numeric_limits<u64>::max() - it->size))
+                           ? std::numeric_limits<u64>::max()
+                           : (it->addr + it->size);
+    if (address >= it->addr && address < mapEnd) {
+      mappingIndex = static_cast<size_t>(it - mappings.begin());
+      spanOut = mapEnd - address;
+      return true;
+    }
+  }
+  return false;
+}
+
 bool RewriteHeader(FILE *fp, const BreezeFileHeader_t &header,
                    std::string *errorOut) {
   if (std::fseek(fp, 0, SEEK_SET) != 0) {
@@ -444,9 +526,9 @@ template <typename T, searchMode_t Mode>
 bool ScanSecondaryWindowTight(
     const Search_condition &condition, const CandidateRecord *inRecords,
     size_t beginIndex, size_t endIndex, u64 windowBase, const u8 *windowBytes,
-    size_t scanBytesPerRecord, u64 heapBase, u64 heapEnd, u64 mainBase, u64 mainEnd,
-    CandidateRecord *outRecords, const size_t outCapacity, size_t &outCount,
-    FILE *out, SearchRunStats &stats, std::string *errorOut) {
+    u64 heapBase, u64 heapEnd, u64 mainBase, u64 mainEnd, CandidateRecord *outRecords,
+    const size_t outCapacity, size_t &outCount, FILE *out, SearchRunStats &stats,
+    std::string *errorOut) {
   const T a = search_exec::SearchValueAs<T>(condition.searchValue_1);
   const T b = search_exec::SearchValueAs<T>(condition.searchValue_2);
   const u32 aEq = search_exec::ConditionValue1AsU32(condition);
@@ -551,7 +633,6 @@ bool ScanSecondaryWindowTight(
       }
     }
 
-    stats.bytesScanned += scanBytesPerRecord;
     if (!matched) {
       continue;
     }
@@ -578,9 +659,9 @@ bool ScanSecondaryWindowTight(
 using ScanSecondaryWindowFn = bool (*)(
     const Search_condition &condition, const CandidateRecord *inRecords,
     size_t beginIndex, size_t endIndex, u64 windowBase, const u8 *windowBytes,
-    size_t scanBytesPerRecord, u64 heapBase, u64 heapEnd, u64 mainBase, u64 mainEnd,
-    CandidateRecord *outRecords, size_t outCapacity, size_t &outCount, FILE *out,
-    SearchRunStats &stats, std::string *errorOut);
+    u64 heapBase, u64 heapEnd, u64 mainBase, u64 mainEnd, CandidateRecord *outRecords,
+    size_t outCapacity, size_t &outCount, FILE *out, SearchRunStats &stats,
+    std::string *errorOut);
 
 template <typename T>
 ScanSecondaryWindowFn ResolveSecondaryWindowScannerForType(searchMode_t mode) {
@@ -871,6 +952,17 @@ bool RunContinueSearch(const Search_condition &condition,
   }
 
   const size_t valueSize = TypeByteWidth(condition.searchType);
+  const size_t compareReadWidth =
+      (condition.searchMode == SM_EQ_plus || condition.searchMode == SM_EQ_plus_plus)
+          ? sizeof(u64)
+          : valueSize;
+  std::vector<MemoryInfo> readableMappings;
+  const bool haveMappings = LoadReadableMappings(readableMappings);
+  size_t mappingIndex = 0;
+  const u64 progressUpdateStep =
+      std::max<u64>(sizeof(CandidateRecord),
+                    std::min<u64>(256ULL * 1024ULL,
+                                  (sourceHeader.dataSize / 100ULL) + 1ULL));
   const ScanSecondaryWindowFn scanWindowFn =
       ResolveSecondaryWindowScanner(condition);
   if (!scanWindowFn) {
@@ -934,20 +1026,30 @@ bool RunContinueSearch(const Search_condition &condition,
       u64 maxWindowSpan =
           std::min<u64>(static_cast<u64>(memoryBuffer.size()),
                         std::numeric_limits<u64>::max() - windowBase);
-      // Keep each batch inside one readable mapping to avoid crossing holes;
-      // crossing can cause full-window read failures and massive fallback cost.
-      MemoryInfo windowInfo{};
-      if (R_SUCCEEDED(dmntchtQueryCheatProcessMemory(&windowInfo, windowBase)) &&
-          windowInfo.addr <= windowBase &&
-          (windowInfo.perm & Perm_R) == Perm_R &&
-          windowInfo.size > 0) {
-        const u64 mapEnd = windowInfo.addr + windowInfo.size;
-        if (mapEnd > windowBase) {
-          maxWindowSpan = std::min<u64>(maxWindowSpan, mapEnd - windowBase);
+      // Keep each batch inside one readable mapping.
+      if (haveMappings) {
+        u64 readableSpan = 0;
+        if (!ResolveReadableSpan(readableMappings, mappingIndex, windowBase,
+                                 readableSpan) ||
+            readableSpan < compareReadWidth) {
+          stats.bytesScanned += sizeof(CandidateRecord);
+          bytesSinceProgressUpdate += sizeof(CandidateRecord);
+          if (control && control->progressCurrent &&
+              bytesSinceProgressUpdate >= progressUpdateStep) {
+            control->progressCurrent->store(stats.bytesScanned,
+                                            std::memory_order_release);
+            bytesSinceProgressUpdate = 0;
+          }
+          ++i;
+          continue;
         }
+        maxWindowSpan = std::min<u64>(maxWindowSpan, readableSpan);
+      } else {
+        // Without mapping snapshot, avoid large speculative reads.
+        maxWindowSpan = compareReadWidth;
       }
-      if (maxWindowSpan < sizeof(u64)) {
-        maxWindowSpan = sizeof(u64);
+      if (maxWindowSpan < compareReadWidth) {
+        maxWindowSpan = compareReadWidth;
       }
 
       size_t end = i;
@@ -957,7 +1059,7 @@ bool RunContinueSearch(const Search_condition &condition,
           break;
         }
         const u64 delta = addr - windowBase;
-        if (delta + sizeof(u64) > maxWindowSpan) {
+        if (delta + compareReadWidth > maxWindowSpan) {
           break;
         }
         ++end;
@@ -968,36 +1070,36 @@ bool RunContinueSearch(const Search_condition &condition,
 
       const u64 lastAddr = inRecords[end - 1].address;
       const size_t bytesToRead =
-          static_cast<size_t>((lastAddr - windowBase) + sizeof(u64));
+          static_cast<size_t>((lastAddr - windowBase) + compareReadWidth);
 
-      if (R_FAILED(dmntchtReadCheatProcessMemory(windowBase, memoryBuffer.data(),
-                                                 bytesToRead))) {
-        if (R_FAILED(dmntchtReadCheatProcessMemory(windowBase, memoryBuffer.data(),
-                                                   sizeof(u64)))) {
-          stats.bytesScanned += sizeof(CandidateRecord);
-          bytesSinceProgressUpdate += sizeof(CandidateRecord);
-          if (control && control->progressCurrent &&
-              bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
-            control->progressCurrent->store(stats.bytesScanned,
-                                            std::memory_order_release);
-            bytesSinceProgressUpdate = 0;
-          }
-          ++i;
-          continue;
+      size_t readEnd = end;
+      size_t readBytes = bytesToRead;
+      while (true) {
+        if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(windowBase, memoryBuffer.data(),
+                                                      readBytes))) {
+          break;
         }
 
-        if (!scanWindowFn(condition, inRecords.data(), i, i + 1, windowBase,
-                          memoryBuffer.data(), valueSize, heapBase, heapEnd,
-                          mainBase, mainEnd, outRecords.data(), outCapacity, outCount,
-                          out, stats, errorOut)) {
-          std::fclose(in);
-          std::fclose(out);
-          return false;
+        if (readEnd == i + 1) {
+          readBytes = 0;
+          break;
         }
+
+        const size_t span = readEnd - i;
+        readEnd = i + (span / 2);
+        if (readEnd <= i) {
+          readEnd = i + 1;
+        }
+        const u64 retryLastAddr = inRecords[readEnd - 1].address;
+        readBytes = static_cast<size_t>((retryLastAddr - windowBase) +
+                                        compareReadWidth);
+      }
+
+      if (readBytes == 0) {
         stats.bytesScanned += sizeof(CandidateRecord);
         bytesSinceProgressUpdate += sizeof(CandidateRecord);
         if (control && control->progressCurrent &&
-            bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
+            bytesSinceProgressUpdate >= progressUpdateStep) {
           control->progressCurrent->store(stats.bytesScanned,
                                           std::memory_order_release);
           bytesSinceProgressUpdate = 0;
@@ -1006,25 +1108,25 @@ bool RunContinueSearch(const Search_condition &condition,
         continue;
       }
 
-      if (!scanWindowFn(condition, inRecords.data(), i, end, windowBase,
-                        memoryBuffer.data(), valueSize, heapBase, heapEnd,
-                        mainBase, mainEnd, outRecords.data(), outCapacity, outCount,
-                        out, stats, errorOut)) {
+      if (!scanWindowFn(condition, inRecords.data(), i, readEnd, windowBase,
+                        memoryBuffer.data(), heapBase, heapEnd, mainBase, mainEnd,
+                        outRecords.data(), outCapacity, outCount, out, stats,
+                        errorOut)) {
         std::fclose(in);
         std::fclose(out);
         return false;
       }
       stats.bytesScanned +=
-          static_cast<u64>((end - batchStart) * sizeof(CandidateRecord));
+          static_cast<u64>((readEnd - batchStart) * sizeof(CandidateRecord));
       bytesSinceProgressUpdate +=
-          static_cast<u64>((end - batchStart) * sizeof(CandidateRecord));
+          static_cast<u64>((readEnd - batchStart) * sizeof(CandidateRecord));
       if (control && control->progressCurrent &&
-          bytesSinceProgressUpdate >= (256ULL * 1024ULL)) {
+          bytesSinceProgressUpdate >= progressUpdateStep) {
         control->progressCurrent->store(stats.bytesScanned,
                                         std::memory_order_release);
         bytesSinceProgressUpdate = 0;
       }
-      i = end;
+      i = readEnd;
     }
     if (aborted) {
       break;
