@@ -13273,6 +13273,9 @@ public:
                                       " file(s)");
             }
 
+            // Rename is triggered from KeyboardGui -> Options -> File list.
+            // Unwind back to the old file list first, then replace it.
+            tsl::goBack();
             tsl::goBack();
             SwapToContinueSearchFileMenu();
           },
