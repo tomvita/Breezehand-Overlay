@@ -12701,23 +12701,75 @@ public:
 
 class CandidateEntriesMenu : public tsl::Gui {
 private:
+  class CandidateToggleItem : public tsl::elm::ToggleListItem {
+  public:
+    explicit CandidateToggleItem(const std::string &text, bool initialState)
+        : tsl::elm::ToggleListItem(text, initialState, "", "", false) {}
+
+    void setXClickListener(std::function<bool(u64)> listener) {
+      m_xClickListener = std::move(listener);
+    }
+
+    virtual bool onClick(u64 keys) override {
+      if ((keys & KEY_X) && m_xClickListener) {
+        return m_xClickListener(keys);
+      }
+      return tsl::elm::ToggleListItem::onClick(keys);
+    }
+
+  private:
+    std::function<bool(u64)> m_xClickListener;
+  };
+
   struct CandidateLiveRow {
-    tsl::elm::ListItem *item = nullptr;
+    CandidateToggleItem *item = nullptr;
     CandidateRecordView rec{};
     std::string prefix;
     std::string lastLiveText;
+    bool lastFrozen = false;
+    size_t globalIndex = 0;
   };
 
   std::string m_path;
   size_t m_pageIndex = 0;
   size_t m_totalEntries = 0;
   size_t m_pageCount = 1;
-  static constexpr size_t kPageSize = 64;
+  static constexpr size_t kPageSize = 10;
   std::vector<CandidateLiveRow> m_liveRows;
   searchType_t m_type = SEARCH_TYPE_UNSIGNED_32BIT;
   size_t m_valueWidth = 4;
   u32 m_liveRefreshTick = 0;
   static constexpr u32 kLiveRefreshIntervalTicks = 18;
+  int m_candidateFontSize = 20;
+  std::string m_notesPath;
+  bool m_fontLoaded = false;
+  tsl::elm::OverlayFrame *m_frame = nullptr;
+  tsl::elm::List *m_list = nullptr;
+
+  bool IsAddressFrozen(u64 address) const {
+    DmntFrozenAddressEntry frozen{};
+    return R_SUCCEEDED(dmntchtGetFrozenAddress(&frozen, address));
+  }
+
+  std::string BuildRowText(const CandidateLiveRow &row) const {
+    return row.prefix + row.lastLiveText;
+  }
+
+  void UpdateSubtitleFromFocus() {
+    if (!m_frame) {
+      return;
+    }
+    size_t currentIndex = (m_pageIndex * kPageSize) + 1;
+    for (const auto &row : m_liveRows) {
+      if (row.item && row.item->hasFocus()) {
+        currentIndex = row.globalIndex + 1;
+        break;
+      }
+    }
+    m_frame->setSubtitle("index = " + std::to_string(currentIndex) + " page " +
+                         std::to_string(m_pageIndex + 1) + " / " +
+                         std::to_string(m_pageCount));
+  }
 
   std::string ReadLiveValueText(u64 address) const {
     u64 liveRaw = 0;
@@ -12737,6 +12789,42 @@ public:
   virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput,
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
+    if (keysHeld & KEY_ZL) {
+      if (keysDown & KEY_R) {
+        m_candidateFontSize = std::min(m_candidateFontSize + 1, 30);
+        for (auto &row : m_liveRows) {
+          if (row.item) {
+            row.item->setFontSize(m_candidateFontSize);
+          }
+        }
+        if (m_list) {
+          m_list->layout(m_list->getX(), m_list->getY(), m_list->getWidth(),
+                         m_list->getHeight());
+        }
+        if (!m_notesPath.empty()) {
+          ult::setIniFileValue(m_notesPath, "Breeze", "candidate_font_size",
+                               std::to_string(m_candidateFontSize));
+        }
+        return true;
+      }
+      if (keysDown & KEY_L) {
+        m_candidateFontSize = std::max(m_candidateFontSize - 1, 10);
+        for (auto &row : m_liveRows) {
+          if (row.item) {
+            row.item->setFontSize(m_candidateFontSize);
+          }
+        }
+        if (m_list) {
+          m_list->layout(m_list->getX(), m_list->getY(), m_list->getWidth(),
+                         m_list->getHeight());
+        }
+        if (!m_notesPath.empty()) {
+          ult::setIniFileValue(m_notesPath, "Breeze", "candidate_font_size",
+                               std::to_string(m_candidateFontSize));
+        }
+        return true;
+      }
+    }
     if (keysDown & KEY_B) {
       tsl::goBack();
       return true;
@@ -12772,17 +12860,11 @@ public:
 
     std::string title = "Candidates " + std::to_string(m_pageIndex + 1) + "/" +
                         std::to_string(m_pageCount);
-    const size_t firstIndex = (m_totalEntries == 0)
-                                  ? 0
-                                  : (m_pageIndex * kPageSize + 1);
-    const size_t lastIndex =
-        std::min(m_totalEntries, (m_pageIndex + 1) * kPageSize);
-    std::string subtitle =
-        "Index = " + std::to_string(firstIndex) + "-" + std::to_string(lastIndex) +
-        " / " + std::to_string(m_totalEntries);
 
-    auto *frame = new tsl::elm::OverlayFrame(title, subtitle);
+    auto *frame = new tsl::elm::OverlayFrame(title, "");
+    m_frame = frame;
     auto *list = new tsl::elm::List();
+    m_list = list;
     addHeader(list, CandidateStemFromPath(m_path),
               std::string("\uE0E2 ") + "Options  \uE0E4/\uE0E5 Page");
 
@@ -12796,6 +12878,21 @@ public:
     DmntCheatProcessMetadata liveMetadata{};
     if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&liveMetadata))) {
       metadata = liveMetadata;
+    }
+    if (m_notesPath.empty()) {
+      std::stringstream ss;
+      ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16)
+         << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+      m_notesPath = ss.str();
+    }
+    if (!m_fontLoaded && !m_notesPath.empty()) {
+      const std::string fontSizeStr = ult::parseValueFromIniSection(
+          m_notesPath, "Breeze", "candidate_font_size");
+      if (!fontSizeStr.empty()) {
+        m_candidateFontSize =
+            std::clamp(static_cast<int>(ult::stoi(fontSizeStr)), 10, 30);
+      }
+      m_fontLoaded = true;
     }
 
     const size_t offset = m_pageIndex * kPageSize;
@@ -12817,13 +12914,35 @@ public:
       const std::string addrText = FormatCandidateRegionAddress(rec.address, metadata);
       const std::string fileValueText = FormatCandidateValueFromRaw(rec.value, m_type);
       const std::string liveValueText = ReadLiveValueText(rec.address);
+      const bool frozen = IsAddressFrozen(rec.address);
 
-      const std::string prefix =
-          addrText + SearchTypeLabel(m_type) + " " + fileValueText + " ";
-      const std::string line = prefix + liveValueText;
-      auto *item = new tsl::elm::ListItem(line);
+      const std::string prefix = addrText + SearchTypeLabel(m_type) + " ";
+      CandidateLiveRow row{};
+      row.rec = rec;
+      row.prefix = prefix;
+      row.lastLiveText = liveValueText;
+      row.lastFrozen = frozen;
+      const std::string line = BuildRowText(row);
+      auto *item = new CandidateToggleItem(line, frozen);
+      item->setUseLeftBox(true);
+      item->setFontSize(m_candidateFontSize);
+      item->setNote("previous = " + fileValueText);
       const size_t globalIndex = offset + i;
-      item->setClickListener([this, globalIndex, rec](u64 keys) {
+      item->setStateChangedListener([item, rec, this](bool state) {
+        bool ok = false;
+        if (state) {
+          u64 outValue = 0;
+          const u64 width =
+              static_cast<u64>(std::min<size_t>(8, CandidateValueWidth(m_type)));
+          ok = R_SUCCEEDED(dmntchtEnableFrozenAddress(rec.address, width, &outValue));
+        } else {
+          ok = R_SUCCEEDED(dmntchtDisableFrozenAddress(rec.address));
+        }
+        if (!ok) {
+          item->setState(!state);
+        }
+      });
+      item->setXClickListener([this, globalIndex, rec](u64 keys) {
         if (!(keys & KEY_X)) {
           return false;
         }
@@ -12832,9 +12951,12 @@ public:
         return true;
       });
       list->addItem(item);
-      m_liveRows.push_back(CandidateLiveRow{item, rec, prefix, liveValueText});
+      row.item = item;
+      row.globalIndex = globalIndex;
+      m_liveRows.push_back(row);
     }
 
+    UpdateSubtitleFromFocus();
     frame->setContent(list);
     return frame;
   }
@@ -12853,12 +12975,16 @@ public:
         continue;
       }
       const std::string liveValueText = ReadLiveValueText(row.rec.address);
-      if (liveValueText == row.lastLiveText) {
+      const bool frozen = IsAddressFrozen(row.rec.address);
+      if (liveValueText == row.lastLiveText && frozen == row.lastFrozen) {
         continue;
       }
       row.lastLiveText = liveValueText;
-      row.item->setText(row.prefix + liveValueText);
+      row.lastFrozen = frozen;
+      row.item->setText(BuildRowText(row));
+      row.item->setState(frozen);
     }
+    UpdateSubtitleFromFocus();
   }
 };
 
@@ -14191,7 +14317,7 @@ public:
     inPackagesPage.store(false, std::memory_order_release);
 
     addHeader(list, "Search Manager",
-              std::string("\uE0E2 ") + "Edit \uE0F0 Pause");
+              std::string("\uE0E2 ") + "Edit \uE0F0 Pause/View");
 
     const size_t purgedCandidates = PurgeInvalidCandidatesForCurrentProcess();
     if (!g_searchContinueSourcePath.empty()) {
@@ -15421,6 +15547,14 @@ public:
           g_searchPauseRequested.store(false, std::memory_order_release);
           return true;
         }
+      }
+      return true;
+    }
+    if (menuMode == SEARCH_MANAGER_MENU_MODE && (keysDown & KEY_MINUS)) {
+      if (!g_searchContinueSourcePath.empty()) {
+        tsl::changeTo<CandidateEntriesMenu>(g_searchContinueSourcePath, 0);
+      } else if (tsl::notification) {
+        tsl::notification->show("No candidate file selected");
       }
       return true;
     }
