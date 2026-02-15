@@ -8248,6 +8248,77 @@ static const std::vector<std::string> buttonNames = {
 static bool s_noteMinimalMode = false;
 
 namespace {
+std::map<std::string, std::map<std::string, std::string>>
+ParseCheatNotesFile(const std::string &notesPath) {
+  std::map<std::string, std::map<std::string, std::string>> parsedData;
+  if (notesPath.empty())
+    return parsedData;
+
+  std::ifstream file(notesPath);
+  if (!file)
+    return parsedData;
+
+  std::string currentSection;
+  std::vector<std::string> fallbackNoteLines;
+  bool hasExplicitNote = false;
+
+  auto commitFallbackNote = [&]() {
+    if (currentSection.empty() || hasExplicitNote || fallbackNoteLines.empty())
+      return;
+
+    std::string note;
+    for (size_t i = 0; i < fallbackNoteLines.size(); ++i) {
+      if (i > 0)
+        note += "\n";
+      note += fallbackNoteLines[i];
+    }
+    parsedData[currentSection]["note"] = note;
+  };
+
+  std::string line;
+  while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+
+    std::string trimmed = line;
+    ult::trim(trimmed);
+    if (trimmed.empty())
+      continue;
+    if (trimmed[0] == '#' || trimmed[0] == ';')
+      continue;
+
+    if (trimmed.front() == '[' && trimmed.back() == ']' && trimmed.size() > 2) {
+      commitFallbackNote();
+      currentSection = trimmed.substr(1, trimmed.size() - 2);
+      fallbackNoteLines.clear();
+      hasExplicitNote = false;
+      parsedData[currentSection];
+      continue;
+    }
+
+    if (currentSection.empty())
+      continue;
+
+    const size_t eqPos = trimmed.find('=');
+    if (eqPos != std::string::npos) {
+      std::string key = trimmed.substr(0, eqPos);
+      std::string value = trimmed.substr(eqPos + 1);
+      ult::trim(key);
+      ult::trim(value);
+      if (!key.empty()) {
+        parsedData[currentSection][key] = value;
+        if (key == "note")
+          hasExplicitNote = true;
+      }
+    } else if (!hasExplicitNote) {
+      fallbackNoteLines.push_back(trimmed);
+    }
+  }
+
+  commitFallbackNote();
+  return parsedData;
+}
+
 std::string WrapNote(const std::string &note, size_t limit = 60) {
   if (note.length() <= limit)
     return note;
@@ -14713,7 +14784,7 @@ public:
       m_notesLoaded = true;
     }
 
-    auto notesData = getParsedDataFromIniFile(m_notesPath);
+    auto notesData = ParseCheatNotesFile(m_notesPath);
 
     if (R_SUCCEEDED(dmntchtGetCheatCount(&cheatCount)) && cheatCount > 0) {
       std::vector<DmntCheatEntry> cheats(cheatCount);
