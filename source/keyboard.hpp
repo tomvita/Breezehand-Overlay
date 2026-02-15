@@ -68,7 +68,7 @@ namespace tsl {
         elm::OverlayFrame* m_frame = nullptr;
         std::recursive_mutex m_mutex;
         
-        void handleKeyPress(char c);
+        void handleKeyPress(char c, bool directPhysicalInput = false);
         void handleBackspace();
         void handleConfirm();
         void handleCancel();
@@ -84,6 +84,10 @@ namespace tsl {
         u64 m_comboCaptureArmedTick = 0;
         u64 m_comboCaptureStartTick = 0;
         u64 m_comboCapturedKeys = 0;
+        HidKeyboardState m_prevKeyboardState{};
+        bool m_hasPrevKeyboardState = false;
+
+        bool handlePhysicalKeyboardInput();
     };
 
 }

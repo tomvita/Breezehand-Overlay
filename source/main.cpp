@@ -17650,6 +17650,125 @@ int main(int argc, char *argv[]) {
 namespace {
 
 // Helper classes are internal to this compilation unit.
+std::once_flag g_keyboardInitOnce;
+
+void initializePhysicalKeyboardInput() {
+  std::call_once(g_keyboardInitOnce, []() {
+    hidInitializeKeyboard();
+    hidEnableUsbFullKeyController(true);
+  });
+}
+
+bool isKeyJustPressed(const HidKeyboardState &currentState,
+                      const HidKeyboardState &previousState,
+                      HidKeyboardKey key) {
+  return hidKeyboardStateGetKey(&currentState, key) &&
+         !hidKeyboardStateGetKey(&previousState, key);
+}
+
+bool isKeyboardShiftActive(const HidKeyboardState &state) {
+  return (state.modifiers & HidKeyboardModifier_Shift) != 0;
+}
+
+char mapPhysicalKeyToChar(const HidKeyboardState &state, HidKeyboardKey key) {
+  const bool shift = isKeyboardShiftActive(state);
+  if (key >= HidKeyboardKey_A && key <= HidKeyboardKey_Z) {
+    const char letter = static_cast<char>('A' + (key - HidKeyboardKey_A));
+    return shift ? letter
+                 : static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+  }
+
+  if (key >= HidKeyboardKey_D1 && key <= HidKeyboardKey_D0) {
+    static constexpr char digits[] = "1234567890";
+    static constexpr char shiftedDigits[] = "!@#$%^&*()";
+    const size_t idx = static_cast<size_t>(key - HidKeyboardKey_D1);
+    return shift ? shiftedDigits[idx] : digits[idx];
+  }
+
+  if (key >= HidKeyboardKey_NumPad1 && key <= HidKeyboardKey_NumPad0) {
+    static constexpr char digits[] = "1234567890";
+    return digits[key - HidKeyboardKey_NumPad1];
+  }
+
+  switch (key) {
+  case HidKeyboardKey_Space:
+    return ' ';
+  case HidKeyboardKey_Tab:
+    return '\t';
+  case HidKeyboardKey_Minus:
+    return shift ? '_' : '-';
+  case HidKeyboardKey_Plus:
+    return shift ? '+' : '=';
+  case HidKeyboardKey_Period:
+    return shift ? '>' : '.';
+  case HidKeyboardKey_Comma:
+    return shift ? '<' : ',';
+  case HidKeyboardKey_OpenBracket:
+    return shift ? '{' : '[';
+  case HidKeyboardKey_CloseBracket:
+    return shift ? '}' : ']';
+  case HidKeyboardKey_Backslash:
+  case HidKeyboardKey_Pipe:
+    return shift ? '|' : '\\';
+  case HidKeyboardKey_Semicolon:
+    return shift ? ':' : ';';
+  case HidKeyboardKey_Quote:
+    return shift ? '"' : '\'';
+  case HidKeyboardKey_Backquote:
+  case HidKeyboardKey_Tilde:
+    return shift ? '~' : '`';
+  case HidKeyboardKey_Slash:
+    return shift ? '?' : '/';
+  case HidKeyboardKey_NumPadDivide:
+    return '/';
+  case HidKeyboardKey_NumPadMultiply:
+    return '*';
+  case HidKeyboardKey_NumPadSubtract:
+    return '-';
+  case HidKeyboardKey_NumPadAdd:
+    return '+';
+  case HidKeyboardKey_NumPadDot:
+    return '.';
+  case HidKeyboardKey_NumPadComma:
+  case HidKeyboardKey_NumPadCommaPc98:
+    return ',';
+  default:
+    break;
+  }
+
+  return '\0';
+}
+
+bool allowsTextCharacter(searchType_t type, const std::string &title, char c) {
+  if (c == '\0')
+    return false;
+
+  if (type == SEARCH_TYPE_HEX) {
+    if (c >= 'a' && c <= 'f')
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || c == ' ';
+  }
+
+  if (type == SEARCH_TYPE_TEXT) {
+    (void)title;
+    // Accept direct physical keyboard text, including symbols not present on the virtual keyboard.
+    return (c >= 32 && c <= 126) || c == '\t';
+  }
+
+  const bool allowMinus =
+      (type == SEARCH_TYPE_SIGNED_8BIT || type == SEARCH_TYPE_SIGNED_16BIT ||
+       type == SEARCH_TYPE_SIGNED_32BIT || type == SEARCH_TYPE_SIGNED_64BIT ||
+       type == SEARCH_TYPE_FLOAT || type == SEARCH_TYPE_DOUBLE);
+  const bool allowDot = (type == SEARCH_TYPE_FLOAT || type == SEARCH_TYPE_DOUBLE);
+
+  if (c >= '0' && c <= '9')
+    return true;
+  if (allowMinus && c == '-')
+    return true;
+  if (allowDot && c == '.')
+    return true;
+  return false;
+}
 
 // --- KeyboardFrame ---
 class KeyboardFrame : public tsl::elm::OverlayFrame {
@@ -18092,6 +18211,7 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
       m_onSetComboCodeType(onSetComboCodeType),
       m_onToggleC4AutoRepeat(onToggleC4AutoRepeat),
       m_isConstrained(constrained) {
+  initializePhysicalKeyboardInput();
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
   m_cursorPos = m_value.length();
   tsl::disableJumpTo = true;
@@ -18563,6 +18683,28 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
                               const HidTouchState &touchPos,
                               HidAnalogStickState leftJoyStick,
                               HidAnalogStickState rightJoyStick) {
+  // Enter is globally mapped to KEY_A for menu navigation.
+  // In KeyboardGui:
+  // - plain Enter should keep acting as KEY_A
+  // - NumPadEnter and Shift+Enter should be reserved for "end edit"
+  {
+    HidKeyboardState currentKeyboardState{};
+    if (hidGetKeyboardStates(&currentKeyboardState, 1) > 0) {
+      const bool shiftHeld = (currentKeyboardState.modifiers & HidKeyboardModifier_Shift) != 0;
+      const bool mainEnterHeld =
+          hidKeyboardStateGetKey(&currentKeyboardState, HidKeyboardKey_Return);
+      const bool numpadEnterHeld =
+          hidKeyboardStateGetKey(&currentKeyboardState, HidKeyboardKey_NumPadEnter);
+      if (numpadEnterHeld || (mainEnterHeld && shiftHeld)) {
+        keysDown &= ~KEY_A;
+        keysHeld &= ~KEY_A;
+      }
+    }
+  }
+
+  if (handlePhysicalKeyboardInput())
+    return true;
+
   if (m_comboCaptureActive) {
     constexpr u64 captureMask =
         KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R | KEY_ZL | KEY_ZR |
@@ -18710,10 +18852,104 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
   return false;
 }
 
-void KeyboardGui::handleKeyPress(char c) {
+bool KeyboardGui::handlePhysicalKeyboardInput() {
+  HidKeyboardState currentKeyboardState{};
+  if (hidGetKeyboardStates(&currentKeyboardState, 1) <= 0) {
+    m_hasPrevKeyboardState = false;
+    return false;
+  }
+
+  if (!m_hasPrevKeyboardState) {
+    m_prevKeyboardState = currentKeyboardState;
+    m_hasPrevKeyboardState = true;
+    return false;
+  }
+
+  bool handled = false;
+  auto keyDown = [&](HidKeyboardKey key) {
+    return isKeyJustPressed(currentKeyboardState, m_prevKeyboardState, key);
+  };
+  auto acceptChar = [&](char c) {
+    if (!allowsTextCharacter(m_type, m_title, c))
+      return;
+    handleKeyPress(c, true);
+    handled = true;
+  };
+
+  if (keyDown(HidKeyboardKey_Backspace)) {
+    handleBackspace();
+    handled = true;
+  }
+  const bool shiftHeld =
+      (currentKeyboardState.modifiers & HidKeyboardModifier_Shift) != 0;
+  if (keyDown(HidKeyboardKey_NumPadEnter) ||
+      (keyDown(HidKeyboardKey_Return) && shiftHeld)) {
+    m_prevKeyboardState = currentKeyboardState;
+    handleConfirm();
+    return true;
+  }
+  if (keyDown(HidKeyboardKey_Escape)) {
+    m_prevKeyboardState = currentKeyboardState;
+    handleCancel();
+    return true;
+  }
+
+  if (keyDown(HidKeyboardKey_LeftArrow)) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_cursorPos > 0)
+      m_cursorPos--;
+    handled = true;
+  }
+  if (keyDown(HidKeyboardKey_RightArrow)) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_cursorPos < m_value.length())
+      m_cursorPos++;
+    handled = true;
+  }
+  if (keyDown(HidKeyboardKey_Insert)) {
+    toggleManualOvertype();
+    if (m_valueDisplay)
+      m_valueDisplay->invalidate();
+    handled = true;
+  }
+  if (m_type == SEARCH_TYPE_TEXT && keyDown(HidKeyboardKey_CapsLock)) {
+    if (m_onToggleCapsVisual) {
+      m_onToggleCapsVisual();
+    } else {
+      m_capsMode = !m_capsMode;
+    }
+    handled = true;
+  }
+
+  for (HidKeyboardKey key = HidKeyboardKey_A; key <= HidKeyboardKey_Z;
+       key = static_cast<HidKeyboardKey>(key + 1)) {
+    if (keyDown(key))
+      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
+  }
+
+  for (HidKeyboardKey key = HidKeyboardKey_D1; key <= HidKeyboardKey_D0;
+       key = static_cast<HidKeyboardKey>(key + 1)) {
+    if (keyDown(key))
+      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
+  }
+
+  constexpr HidKeyboardKey symbolKeys[] = {
+      HidKeyboardKey_Space, HidKeyboardKey_Minus,        HidKeyboardKey_Period,
+      HidKeyboardKey_Comma, HidKeyboardKey_OpenBracket,  HidKeyboardKey_CloseBracket,
+  };
+  for (HidKeyboardKey key : symbolKeys) {
+    if (keyDown(key))
+      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
+  }
+
+  m_prevKeyboardState = currentKeyboardState;
+  return handled;
+}
+
+void KeyboardGui::handleKeyPress(char c, bool directPhysicalInput) {
   std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-  if (m_type == SEARCH_TYPE_TEXT &&
+  if (!directPhysicalInput && m_type == SEARCH_TYPE_TEXT &&
       std::isalpha(static_cast<unsigned char>(c))) {
     c = m_capsMode
             ? static_cast<char>(std::toupper(static_cast<unsigned char>(c)))
