@@ -326,12 +326,20 @@ $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
 
-	@rm -rf out/
+	@mkdir -p out/
+	@rm -rf out/switch out/config out/atmosphere
 	@mkdir -p out/switch/.overlays/
 	@mkdir -p out/config/breezehand/lang/
 	@cp $(CURDIR)/$(TARGET).ovl out/switch/.overlays/$(TARGET).ovl
 	@cp $(CURDIR)/cheat_url_txt.template out/config/breezehand/cheat_url_txt.template
 	@cp $(CURDIR)/lang/*.json out/config/breezehand/lang/
+	@$(MAKE) --no-print-directory -C $(CURDIR)/sysmodules/aurora_kbd_bridge \
+		DEFINES=
+	@mkdir -p out/atmosphere/contents/010000000000BD01/
+	@cp $(CURDIR)/sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.nsp \
+		out/atmosphere/contents/010000000000BD01/exefs.nsp
+	@cp $(CURDIR)/sysmodules/aurora_kbd_bridge/toolbox.json \
+		out/atmosphere/contents/010000000000BD01/toolbox.json
 
 #---------------------------------------------------------------------------------
 clean:

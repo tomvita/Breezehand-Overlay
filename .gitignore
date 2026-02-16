@@ -10,3 +10,12 @@ editcheat.lst
 out/switch/.overlays/edittasmk.ovl
 build_editcheatk
 out/switch/.overlays/editcheatk.ovl
+release_notes_0.8.7.md
+sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.elf
+sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.log
+sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.npdm
+sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.nso
+sysmodules/aurora_kbd_bridge/exefs.nsp
+out/atmosphere/contents/010000000000BD01/exefs.nsp
+sysmodules/aurora_kbd_bridge/aurora_kbd_bridge.nsp
+out/atmosphere/contents/010000000000BD01/toolbox.json

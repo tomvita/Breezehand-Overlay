@@ -52,6 +52,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <utils.hpp>
+#include <cstdarg>
 
 #ifndef USE_KEYSTONE_ASM
 #define USE_KEYSTONE_ASM 0
@@ -17716,6 +17717,7 @@ int main(int argc, char *argv[]) {
 
 #include "keyboard.hpp"
 #include <algorithm>
+#include <malloc.h>
 #include <switch.h>
 
 namespace {
@@ -17808,6 +17810,718 @@ char mapPhysicalKeyToChar(const HidKeyboardState &state, HidKeyboardKey key) {
   }
 
   return '\0';
+}
+
+char mapKeyboardUsageToChar(u8 usage, bool shift) {
+  if (usage >= 0x04 && usage <= 0x1D) {
+    const char letter = static_cast<char>('A' + (usage - 0x04));
+    return shift ? letter
+                 : static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+  }
+
+  if (usage >= 0x1E && usage <= 0x27) {
+    static constexpr char digits[] = "1234567890";
+    static constexpr char shiftedDigits[] = "!@#$%^&*()";
+    const size_t idx = static_cast<size_t>(usage - 0x1E);
+    return shift ? shiftedDigits[idx] : digits[idx];
+  }
+
+  switch (usage) {
+  case 0x2C:
+    return ' ';
+  case 0x2B:
+    return '\t';
+  case 0x2D:
+    return shift ? '_' : '-';
+  case 0x2E:
+    return shift ? '+' : '=';
+  case 0x2F:
+    return shift ? '{' : '[';
+  case 0x30:
+    return shift ? '}' : ']';
+  case 0x31:
+    return shift ? '|' : '\\';
+  case 0x33:
+    return shift ? ':' : ';';
+  case 0x34:
+    return shift ? '"' : '\'';
+  case 0x35:
+    return shift ? '~' : '`';
+  case 0x36:
+    return shift ? '<' : ',';
+  case 0x37:
+    return shift ? '>' : '.';
+  case 0x38:
+    return shift ? '?' : '/';
+  case 0x54:
+    return '/';
+  case 0x55:
+    return '*';
+  case 0x56:
+    return '-';
+  case 0x57:
+    return '+';
+  case 0x63:
+    return '.';
+  case 0x85:
+    return ',';
+  default:
+    break;
+  }
+
+  return '\0';
+}
+
+constexpr u16 kAuroraVid = 0x1A2C;
+constexpr u16 kAuroraPid = 0x8FFF;
+constexpr size_t kMaxUsbLinks = 4;
+constexpr size_t kUsbEventQueueSize = 128;
+constexpr u8 kEventTypeUp = 0;
+constexpr u8 kEventTypeDown = 1;
+
+#ifndef DIRECT_USB_LOGGING
+#define DIRECT_USB_LOGGING 0
+#endif
+
+#if DIRECT_USB_LOGGING
+constexpr const char *kOverlayUsbLogPath = "sdmc:/config/breezehand/overlay_usb_kbd.log";
+#endif
+
+struct DirectUsbEvent {
+  u8 usage;
+  u8 modifiers;
+  u8 type;
+};
+
+struct DirectUsbLink {
+  bool active = false;
+  UsbHsClientIfSession ifSession{};
+  UsbHsClientEpSession epSession{};
+  u8 *ioBuf = nullptr;
+  u32 ioBufSize = 0;
+  u8 endpointAddress = 0;
+  u32 endpointPacketSize = 0;
+  bool pendingAsync = false;
+  u64 asyncToken = 0;
+  bool decodeBoot = false;
+  bool keyDown[256]{};
+  u8 prevModifiers = 0;
+  bool hasPrevModifiers = false;
+};
+
+struct DirectUsbInputState {
+  bool initAttempted = false;
+  bool usbReady = false;
+  Result lastResult = 0;
+  u64 lastInitTryTick = 0;
+  u64 lastAcquireTryTick = 0;
+#if DIRECT_USB_LOGGING
+  u64 lastNoInterfaceLogTick = 0;
+#endif
+  int activeLinks = 0;
+  bool sysmoduleKickAttempted = false;
+  bool sysmoduleKickDone = false;
+  u32 noInterfaceStreak = 0;
+  UsbHsInterface interfaces[32]{};
+  DirectUsbLink links[kMaxUsbLinks]{};
+  DirectUsbEvent events[kUsbEventQueueSize]{};
+  u32 writeSeq = 0;
+  u32 readSeq = 0;
+};
+
+DirectUsbInputState g_directUsbState{};
+u32 g_directUsbUserCount = 0;
+#if DIRECT_USB_LOGGING
+FILE *g_overlayUsbLog = nullptr;
+std::mutex g_overlayUsbLogMutex;
+
+const char *usageToName(u8 usage) {
+  static const char *letters[] = {
+      "key_a", "key_b", "key_c", "key_d", "key_e", "key_f", "key_g",
+      "key_h", "key_i", "key_j", "key_k", "key_l", "key_m", "key_n",
+      "key_o", "key_p", "key_q", "key_r", "key_s", "key_t", "key_u",
+      "key_v", "key_w", "key_x", "key_y", "key_z",
+  };
+  if (usage >= 0x04 && usage <= 0x1D)
+    return letters[usage - 0x04];
+
+  static const char *digits[] = {"key_1", "key_2", "key_3", "key_4", "key_5",
+                                 "key_6", "key_7", "key_8", "key_9", "key_0"};
+  if (usage >= 0x1E && usage <= 0x27)
+    return digits[usage - 0x1E];
+
+  switch (usage) {
+  case 0x28:
+    return "key_enter";
+  case 0x29:
+    return "key_escape";
+  case 0x2A:
+    return "key_backspace";
+  case 0x2B:
+    return "key_tab";
+  case 0x2C:
+    return "key_space";
+  case 0x39:
+    return "key_capslock";
+  case 0x49:
+    return "key_insert";
+  case 0x4F:
+    return "key_right";
+  case 0x50:
+    return "key_left";
+  case 0x58:
+    return "key_numpad_enter";
+  case 0xE0:
+    return "key_left_ctrl";
+  case 0xE1:
+    return "key_left_shift";
+  case 0xE2:
+    return "key_left_alt";
+  case 0xE3:
+    return "key_left_gui";
+  case 0xE4:
+    return "key_right_ctrl";
+  case 0xE5:
+    return "key_right_shift";
+  case 0xE6:
+    return "key_right_alt";
+  case 0xE7:
+    return "key_right_gui";
+  default:
+    return "key_unknown";
+  }
+}
+
+void initOverlayUsbLog() {
+  std::lock_guard<std::mutex> lock(g_overlayUsbLogMutex);
+  if (g_overlayUsbLog)
+    return;
+  ult::createDirectory("sdmc:/config");
+  ult::createDirectory("sdmc:/config/breezehand");
+  g_overlayUsbLog = fopen(kOverlayUsbLogPath, "a");
+  if (g_overlayUsbLog) {
+    fprintf(g_overlayUsbLog, "---- overlay_usb_kbd start ----\n");
+    fflush(g_overlayUsbLog);
+  }
+}
+
+void overlayUsbLog(const char *fmt, ...) {
+  std::lock_guard<std::mutex> lock(g_overlayUsbLogMutex);
+  if (!g_overlayUsbLog)
+    return;
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(g_overlayUsbLog, fmt, args);
+  va_end(args);
+  fputc('\n', g_overlayUsbLog);
+  fflush(g_overlayUsbLog);
+}
+#else
+#define initOverlayUsbLog() ((void)0)
+#define overlayUsbLog(...) ((void)0)
+#endif
+
+void closeDirectUsbLink(DirectUsbLink &link) {
+  if (link.active) {
+    overlayUsbLog("Close link ep=0x%02X packet=%u", link.endpointAddress,
+                  link.endpointPacketSize);
+  }
+  if (usbHsIfIsActive(&link.ifSession)) {
+    usbHsEpClose(&link.epSession);
+    usbHsIfClose(&link.ifSession);
+  }
+  if (link.ioBuf)
+    free(link.ioBuf);
+  link = {};
+}
+
+bool endpointIsInterruptIn(const struct usb_endpoint_descriptor *ep) {
+  if (!ep || ep->bLength == 0)
+    return false;
+  if ((ep->bEndpointAddress & USB_ENDPOINT_IN) == 0)
+    return false;
+  return (ep->bmAttributes & USB_TRANSFER_TYPE_MASK) ==
+         USB_TRANSFER_TYPE_INTERRUPT;
+}
+
+void configureDirectUsbHidInterface(UsbHsClientIfSession &ifSession) {
+  if (!usbHsIfIsActive(&ifSession))
+    return;
+
+  const u8 ifNum = ifSession.inf.inf.interface_desc.bInterfaceNumber;
+  const u8 bmRequestType = 0x21; // Host->Device | Class | Interface
+  u32 transferred = 0;
+
+  // Request boot protocol where supported. Some dongles ignore this.
+  const Result rcProtocol =
+      usbHsIfCtrlXfer(&ifSession, bmRequestType, 0x0B, 0x0000, ifNum, 0, nullptr,
+                      &transferred);
+  overlayUsbLog("SetProtocol(boot) if=%u rc=0x%x", ifNum, rcProtocol);
+  (void)rcProtocol;
+
+  // Request immediate report updates.
+  const Result rcIdle =
+      usbHsIfCtrlXfer(&ifSession, bmRequestType, 0x0A, 0x0000, ifNum, 0, nullptr,
+                      &transferred);
+  overlayUsbLog("SetIdle if=%u rc=0x%x", ifNum, rcIdle);
+  (void)rcIdle;
+}
+
+int scoreInterfaceEndpoint(const UsbHsInterface *inf) {
+  if (!inf)
+    return -1;
+
+  int best = -1;
+  for (int i = 0; i < 15; ++i) {
+    const struct usb_endpoint_descriptor *ep = &inf->inf.input_endpoint_descs[i];
+    if (!endpointIsInterruptIn(ep))
+      continue;
+
+    int score = 0;
+    if (ep->bEndpointAddress == (USB_ENDPOINT_IN | 0x01))
+      score += 100;
+    if (ep->wMaxPacketSize == 8)
+      score += 80;
+    else if (ep->wMaxPacketSize <= 16)
+      score += 40;
+    else if (ep->wMaxPacketSize <= 64)
+      score += 10;
+
+    if (inf->inf.interface_desc.bInterfaceProtocol == 1)
+      score += 20;
+    if (inf->inf.interface_desc.bInterfaceSubClass == 1)
+      score += 10;
+
+    if (score > best)
+      best = score;
+  }
+
+  return best;
+}
+
+void pushDirectUsbEvent(DirectUsbInputState &state, u8 usage, u8 modifiers,
+                        u8 type) {
+  if (usage == 0)
+    return;
+
+  const u32 seq = ++state.writeSeq;
+  state.events[seq % kUsbEventQueueSize] = {usage, modifiers, type};
+  overlayUsbLog("Event seq=%u %s %s usage=0x%02X mod=0x%02X", seq,
+                usageToName(usage), (type == kEventTypeDown) ? "down" : "up",
+                usage, modifiers);
+}
+
+bool decodeBootReport(DirectUsbInputState &state, DirectUsbLink &link,
+                      const u8 *buf, u32 size) {
+  if (!buf || size < 8)
+    return false;
+
+  bool changed = false;
+  const u8 currModifiers = buf[0];
+
+  if (!link.hasPrevModifiers) {
+    link.prevModifiers = currModifiers;
+    link.hasPrevModifiers = true;
+  } else {
+    const u8 diff = static_cast<u8>(link.prevModifiers ^ currModifiers);
+    if (diff != 0) {
+      for (int i = 0; i < 8; ++i) {
+        const u8 bit = static_cast<u8>(1u << i);
+        if ((diff & bit) == 0)
+          continue;
+        const u8 usage = static_cast<u8>(0xE0 + i);
+        const u8 type = (currModifiers & bit) ? kEventTypeDown : kEventTypeUp;
+        pushDirectUsbEvent(state, usage, currModifiers, type);
+        changed = true;
+      }
+      link.prevModifiers = currModifiers;
+    }
+  }
+
+  bool present[256]{};
+  const u8 *rawKeys = &buf[2];
+  for (size_t i = 0; i < 6; ++i) {
+    const u8 usage = rawKeys[i];
+    if (usage == 0 || present[usage])
+      continue;
+    present[usage] = true;
+    if (!link.keyDown[usage]) {
+      link.keyDown[usage] = true;
+      pushDirectUsbEvent(state, usage, currModifiers, kEventTypeDown);
+      changed = true;
+    }
+  }
+
+  for (int usage = 1; usage < 256; ++usage) {
+    if (present[usage])
+      continue;
+    if (!link.keyDown[usage])
+      continue;
+    link.keyDown[usage] = false;
+    pushDirectUsbEvent(state, static_cast<u8>(usage), currModifiers, kEventTypeUp);
+    changed = true;
+  }
+
+  return changed;
+}
+
+struct usb_endpoint_descriptor *pickInputEndpoint(UsbHsClientIfSession *ifSession) {
+  struct usb_endpoint_descriptor *best = nullptr;
+  for (int i = 0; i < 15; ++i) {
+    struct usb_endpoint_descriptor *cur = &ifSession->inf.inf.input_endpoint_descs[i];
+    if (!endpointIsInterruptIn(cur))
+      continue;
+    if (!best || cur->wMaxPacketSize < best->wMaxPacketSize ||
+        (cur->wMaxPacketSize == best->wMaxPacketSize &&
+         cur->bEndpointAddress == (USB_ENDPOINT_IN | 0x01))) {
+      best = cur;
+    }
+  }
+  return best;
+}
+
+void releaseAllDirectUsbLinks(DirectUsbInputState &state) {
+  for (auto &link : state.links)
+    closeDirectUsbLink(link);
+  state.activeLinks = 0;
+}
+
+void shutdownDirectUsbKeyboard() {
+  DirectUsbInputState &state = g_directUsbState;
+  releaseAllDirectUsbLinks(state);
+  if (state.usbReady) {
+    usbHsExit();
+  }
+  g_directUsbState = {};
+}
+
+void acquireDirectUsbUser() { g_directUsbUserCount++; }
+
+void releaseDirectUsbUser() {
+  if (g_directUsbUserCount == 0)
+    return;
+  g_directUsbUserCount--;
+  if (g_directUsbUserCount == 0) {
+    shutdownDirectUsbKeyboard();
+  }
+}
+
+constexpr u64 kAuroraBridgeTid = 0x010000000000BD01ULL;
+constexpr const char *kAuroraBridgeExefsPath =
+    "sdmc:/atmosphere/contents/010000000000BD01/exefs.nsp";
+
+bool ensureAuroraBridgeInstalled() {
+  const bool ok = isFile(kAuroraBridgeExefsPath);
+  if (!ok)
+    overlayUsbLog("kick install missing: %s", kAuroraBridgeExefsPath);
+  return ok;
+}
+
+void kickAuroraBridgeSysmoduleOnce(DirectUsbInputState &state) {
+  if (state.sysmoduleKickAttempted)
+    return;
+  state.sysmoduleKickAttempted = true;
+
+  if (!ensureAuroraBridgeInstalled()) {
+    overlayUsbLog("kick skipped: sysmodule not installed");
+    return;
+  }
+
+  Result rc = pmshellInitialize();
+  if (R_FAILED(rc)) {
+    overlayUsbLog("kick failed: pmshellInitialize rc=0x%x", rc);
+    return;
+  }
+  rc = pmdmntInitialize();
+  if (R_FAILED(rc)) {
+    overlayUsbLog("kick failed: pmdmntInitialize rc=0x%x", rc);
+    pmshellExit();
+    return;
+  }
+
+  u64 pid = 0;
+  pmdmntGetProcessId(&pid, kAuroraBridgeTid);
+  if (pid != 0) {
+    rc = pmshellTerminateProgram(kAuroraBridgeTid);
+    overlayUsbLog("kick terminate-existing rc=0x%x", rc);
+    svcSleepThread(250000000ULL);
+  }
+
+  NcmProgramLocation programLocation{
+      .program_id = kAuroraBridgeTid,
+      .storageID = NcmStorageId_None,
+  };
+  pid = 0;
+  rc = pmshellLaunchProgram(0, &programLocation, &pid);
+  overlayUsbLog("kick launch rc=0x%x pid=0x%lx", rc, pid);
+  if (R_SUCCEEDED(rc)) {
+    svcSleepThread(1200000000ULL);
+    rc = pmshellTerminateProgram(kAuroraBridgeTid);
+    overlayUsbLog("kick terminate-new rc=0x%x", rc);
+    state.sysmoduleKickDone = true;
+  }
+
+  pmdmntExit();
+  pmshellExit();
+}
+
+void tryAcquireDirectUsbLinks(DirectUsbInputState &state) {
+  const u64 now = armGetSystemTick();
+  if (state.activeLinks > 0)
+    return;
+  if (state.lastAcquireTryTick != 0 &&
+      armTicksToNs(now - state.lastAcquireTryTick) < 500000000ULL) {
+    return;
+  }
+  state.lastAcquireTryTick = now;
+
+  UsbHsInterfaceFilter filter{};
+  filter.Flags = UsbHsInterfaceFilterFlags_idVendor |
+                 UsbHsInterfaceFilterFlags_idProduct |
+                 UsbHsInterfaceFilterFlags_bInterfaceClass;
+  filter.idVendor = kAuroraVid;
+  filter.idProduct = kAuroraPid;
+  filter.bInterfaceClass = USB_CLASS_HID;
+
+  UsbHsInterfaceFilter fallbackFilter{};
+  fallbackFilter.Flags = UsbHsInterfaceFilterFlags_idVendor |
+                         UsbHsInterfaceFilterFlags_idProduct;
+  fallbackFilter.idVendor = kAuroraVid;
+  fallbackFilter.idProduct = kAuroraPid;
+
+  s32 totalEntries = 0;
+  memset(state.interfaces, 0, sizeof(state.interfaces));
+  Result rc = usbHsQueryAvailableInterfaces(&filter, state.interfaces,
+                                            sizeof(state.interfaces),
+                                            &totalEntries);
+  if (R_SUCCEEDED(rc) && totalEntries <= 0) {
+    overlayUsbLog("strict HID-class filter matched 0, retrying VID/PID-only");
+    rc = usbHsQueryAvailableInterfaces(&fallbackFilter, state.interfaces,
+                                       sizeof(state.interfaces), &totalEntries);
+  }
+  state.lastResult = rc;
+  if (R_FAILED(rc)) {
+#if DIRECT_USB_LOGGING
+    if (state.lastNoInterfaceLogTick == 0 ||
+        armTicksToNs(now - state.lastNoInterfaceLogTick) >= 2000000000ULL) {
+      overlayUsbLog("usbHsQueryAvailableInterfaces failed rc=0x%x", rc);
+      state.lastNoInterfaceLogTick = now;
+    }
+#endif
+    state.noInterfaceStreak++;
+    return;
+  }
+  if (totalEntries <= 0) {
+#if DIRECT_USB_LOGGING
+    if (state.lastNoInterfaceLogTick == 0 ||
+        armTicksToNs(now - state.lastNoInterfaceLogTick) >= 2000000000ULL) {
+      overlayUsbLog("usbHsQueryAvailableInterfaces no matching interfaces");
+      state.lastNoInterfaceLogTick = now;
+    }
+#endif
+    state.noInterfaceStreak++;
+    return;
+  }
+#if DIRECT_USB_LOGGING
+  state.lastNoInterfaceLogTick = 0;
+#endif
+  state.noInterfaceStreak = 0;
+
+  int used = std::min(totalEntries, static_cast<s32>(32));
+  int order[32]{};
+  for (int i = 0; i < used; ++i)
+    order[i] = i;
+  for (int i = 0; i < used; ++i) {
+    int bestPos = i;
+    int bestScore = scoreInterfaceEndpoint(&state.interfaces[order[i]]);
+    for (int j = i + 1; j < used; ++j) {
+      const int score = scoreInterfaceEndpoint(&state.interfaces[order[j]]);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPos = j;
+      }
+    }
+    if (bestPos != i)
+      std::swap(order[i], order[bestPos]);
+  }
+
+  int acquired = 0;
+  for (int oi = 0; oi < used && acquired < static_cast<int>(kMaxUsbLinks); ++oi) {
+    UsbHsClientIfSession ifSession{};
+    UsbHsClientEpSession epSession{};
+    DirectUsbLink link{};
+
+    rc = usbHsAcquireUsbIf(&ifSession, &state.interfaces[order[oi]]);
+    if (R_FAILED(rc)) {
+      overlayUsbLog("usbHsAcquireUsbIf failed rc=0x%x", rc);
+      continue;
+    }
+
+    // Some receivers expose keyboard data on interfaces not tagged as
+    // protocol=1. Always send HID init controls and tolerate failures.
+    configureDirectUsbHidInterface(ifSession);
+
+    struct usb_endpoint_descriptor *epDesc = pickInputEndpoint(&ifSession);
+    if (!epDesc) {
+      overlayUsbLog("No interrupt IN endpoint found for path=%s",
+                    state.interfaces[order[oi]].pathstr);
+      usbHsIfClose(&ifSession);
+      continue;
+    }
+
+    u8 *ioBuf = static_cast<u8 *>(memalign(0x1000, 0x1000));
+    if (!ioBuf) {
+      overlayUsbLog("memalign io buffer failed");
+      usbHsIfClose(&ifSession);
+      break;
+    }
+    memset(ioBuf, 0, 0x1000);
+
+    rc = usbHsIfOpenUsbEp(&ifSession, &epSession, 1, epDesc->wMaxPacketSize, epDesc);
+    if (R_FAILED(rc)) {
+      overlayUsbLog("usbHsIfOpenUsbEp failed rc=0x%x ep=0x%02X", rc,
+                    epDesc->bEndpointAddress);
+      free(ioBuf);
+      usbHsIfClose(&ifSession);
+      continue;
+    }
+
+    link.active = true;
+    link.ifSession = ifSession;
+    link.epSession = epSession;
+    link.ioBuf = ioBuf;
+    link.ioBufSize = 0x1000;
+    link.endpointAddress = epDesc->bEndpointAddress;
+    link.endpointPacketSize = epDesc->wMaxPacketSize;
+    // Accept any 8-byte interrupt endpoint as boot-style candidate.
+    link.decodeBoot = (epDesc->wMaxPacketSize == 8);
+    overlayUsbLog(
+        "Acquired interface path=%s ep=0x%02X packet=%u ifprot=%u ifsub=%u decode=%u",
+        state.interfaces[order[oi]].pathstr, epDesc->bEndpointAddress,
+        epDesc->wMaxPacketSize, ifSession.inf.inf.interface_desc.bInterfaceProtocol,
+        ifSession.inf.inf.interface_desc.bInterfaceSubClass,
+        link.decodeBoot ? 1 : 0);
+    state.links[acquired++] = link;
+  }
+
+  state.activeLinks = acquired;
+  if (acquired > 0) {
+    state.noInterfaceStreak = 0;
+    state.sysmoduleKickDone = true;
+  }
+  overlayUsbLog("active_links=%d", state.activeLinks);
+}
+
+void pollDirectUsbLink(DirectUsbInputState &state, DirectUsbLink &link) {
+  if (!link.active)
+    return;
+
+  if (!link.pendingAsync) {
+    u32 xferId = 0;
+    const u32 reqSize =
+        (link.endpointPacketSize > 0 && link.endpointPacketSize <= link.ioBufSize)
+            ? link.endpointPacketSize
+            : link.ioBufSize;
+    const Result rc = usbHsEpPostBufferAsync(&link.epSession, link.ioBuf, reqSize,
+                                             ++link.asyncToken, &xferId);
+    state.lastResult = rc;
+    if (R_FAILED(rc)) {
+      overlayUsbLog("usbHsEpPostBufferAsync failed rc=0x%x ep=0x%02X", rc,
+                    link.endpointAddress);
+      closeDirectUsbLink(link);
+      state.activeLinks--;
+      return;
+    }
+    link.pendingAsync = true;
+    return;
+  }
+
+  if (R_FAILED(eventWait(usbHsEpGetXferEvent(&link.epSession), 0)))
+    return;
+  eventClear(usbHsEpGetXferEvent(&link.epSession));
+
+  UsbHsXferReport reports[8]{};
+  u32 count = 0;
+  const Result rc = usbHsEpGetXferReport(&link.epSession, reports, 8, &count);
+  state.lastResult = rc;
+  link.pendingAsync = false;
+  if (R_FAILED(rc)) {
+    overlayUsbLog("usbHsEpGetXferReport failed rc=0x%x ep=0x%02X", rc,
+                  link.endpointAddress);
+    closeDirectUsbLink(link);
+    state.activeLinks--;
+    return;
+  }
+
+  for (u32 i = 0; i < count; ++i) {
+    if (R_FAILED(reports[i].res))
+      continue;
+    if (reports[i].transferredSize == 0)
+      continue;
+    if (!link.decodeBoot)
+      continue;
+    decodeBootReport(state, link, link.ioBuf, reports[i].transferredSize);
+  }
+}
+
+void pollDirectUsbKeyboard() {
+  DirectUsbInputState &state = g_directUsbState;
+  initOverlayUsbLog();
+  if (!state.usbReady) {
+    const u64 now = armGetSystemTick();
+    if (state.initAttempted &&
+        armTicksToNs(now - state.lastInitTryTick) < 2000000000ULL) {
+      return;
+    }
+    state.initAttempted = true;
+    state.lastInitTryTick = now;
+    state.lastResult = usbHsInitialize();
+    state.usbReady = R_SUCCEEDED(state.lastResult);
+    overlayUsbLog("usbHsInitialize rc=0x%x ready=%d", state.lastResult,
+                  state.usbReady ? 1 : 0);
+    if (!state.usbReady)
+      return;
+  }
+
+  if (state.activeLinks <= 0)
+    tryAcquireDirectUsbLinks(state);
+
+  // Only do the start/stop "kick" if direct USB repeatedly failed to see the
+  // dongle in this boot/session.
+  if (state.activeLinks <= 0 && !state.sysmoduleKickDone &&
+      !state.sysmoduleKickAttempted && state.noInterfaceStreak >= 4) {
+    kickAuroraBridgeSysmoduleOnce(state);
+  }
+
+  if (state.activeLinks <= 0)
+    return;
+
+  for (auto &link : state.links)
+    pollDirectUsbLink(state, link);
+
+  if (state.activeLinks <= 0)
+    releaseAllDirectUsbLinks(state);
+}
+
+size_t popDirectUsbEvents(DirectUsbEvent *out, size_t maxEvents) {
+  DirectUsbInputState &state = g_directUsbState;
+  if (!out || maxEvents == 0)
+    return 0;
+
+  size_t outCount = 0;
+  const u32 endSeq = state.writeSeq;
+  const u32 available = endSeq - state.readSeq;
+  const u32 toRead = std::min<u32>(available, static_cast<u32>(maxEvents));
+  if (toRead == 0)
+    return 0;
+
+  const u32 firstSeq = endSeq - toRead + 1;
+  for (u32 i = 0; i < toRead; ++i) {
+    const u32 seq = firstSeq + i;
+    out[outCount++] = state.events[seq % kUsbEventQueueSize];
+  }
+  state.readSeq = endSeq;
+  return outCount;
 }
 
 bool allowsTextCharacter(searchType_t type, const std::string &title, char c) {
@@ -18283,12 +18997,16 @@ KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
       m_onToggleC4AutoRepeat(onToggleC4AutoRepeat),
       m_isConstrained(constrained) {
   initializePhysicalKeyboardInput();
+  acquireDirectUsbUser();
   m_isNumpad = (type != SEARCH_TYPE_POINTER && type != SEARCH_TYPE_NONE);
   m_cursorPos = m_value.length();
   tsl::disableJumpTo = true;
 }
 
-KeyboardGui::~KeyboardGui() { tsl::disableJumpTo = false; }
+KeyboardGui::~KeyboardGui() {
+  releaseDirectUsbUser();
+  tsl::disableJumpTo = false;
+}
 
 elm::Element *KeyboardGui::createUI() {
   m_onToggleCapsVisual = nullptr;
@@ -18924,96 +19642,136 @@ bool KeyboardGui::handleInput(u64 keysDown, u64 keysHeld,
 }
 
 bool KeyboardGui::handlePhysicalKeyboardInput() {
+  pollDirectUsbKeyboard();
+
+  DirectUsbEvent usbEvents[64]{};
+  const size_t usbEventCount = popDirectUsbEvents(usbEvents, 64);
+
   HidKeyboardState currentKeyboardState{};
-  if (hidGetKeyboardStates(&currentKeyboardState, 1) <= 0) {
+  const bool hasHidKeyboard = (hidGetKeyboardStates(&currentKeyboardState, 1) > 0);
+  if (!hasHidKeyboard && usbEventCount == 0 && !m_hasPrevKeyboardState) {
     m_hasPrevKeyboardState = false;
     return false;
   }
 
-  if (!m_hasPrevKeyboardState) {
+  if (hasHidKeyboard && !m_hasPrevKeyboardState) {
     m_prevKeyboardState = currentKeyboardState;
     m_hasPrevKeyboardState = true;
-    return false;
   }
 
   bool handled = false;
-  auto keyDown = [&](HidKeyboardKey key) {
+  auto hidKeyDown = [&](HidKeyboardKey key) -> bool {
+    if (!hasHidKeyboard || !m_hasPrevKeyboardState)
+      return false;
     return isKeyJustPressed(currentKeyboardState, m_prevKeyboardState, key);
   };
-  auto acceptChar = [&](char c) {
+  const bool hidShiftHeld =
+      hasHidKeyboard &&
+      ((currentKeyboardState.modifiers & HidKeyboardModifier_Shift) != 0);
+
+  auto acceptChar = [&](u8 usage, bool shift) {
+    const char c = mapKeyboardUsageToChar(usage, shift);
     if (!allowsTextCharacter(m_type, m_title, c))
       return;
     handleKeyPress(c, true);
     handled = true;
   };
-
-  if (keyDown(HidKeyboardKey_Backspace)) {
-    handleBackspace();
-    handled = true;
-  }
-  const bool shiftHeld =
-      (currentKeyboardState.modifiers & HidKeyboardModifier_Shift) != 0;
-  if (keyDown(HidKeyboardKey_NumPadEnter) ||
-      (keyDown(HidKeyboardKey_Return) && shiftHeld)) {
-    m_prevKeyboardState = currentKeyboardState;
-    handleConfirm();
-    return true;
-  }
-  if (keyDown(HidKeyboardKey_Escape)) {
-    m_prevKeyboardState = currentKeyboardState;
-    handleCancel();
-    return true;
-  }
-
-  if (keyDown(HidKeyboardKey_LeftArrow)) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_cursorPos > 0)
-      m_cursorPos--;
-    handled = true;
-  }
-  if (keyDown(HidKeyboardKey_RightArrow)) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_cursorPos < m_value.length())
-      m_cursorPos++;
-    handled = true;
-  }
-  if (keyDown(HidKeyboardKey_Insert)) {
-    toggleManualOvertype();
-    if (m_valueDisplay)
-      m_valueDisplay->invalidate();
-    handled = true;
-  }
-  if (m_type == SEARCH_TYPE_TEXT && keyDown(HidKeyboardKey_CapsLock)) {
-    if (m_onToggleCapsVisual) {
-      m_onToggleCapsVisual();
-    } else {
-      m_capsMode = !m_capsMode;
+  auto handleUsageDown = [&](u8 usage, bool shift) -> bool {
+    if (usage == 0x2A) {
+      handleBackspace();
+      handled = true;
+      return false;
     }
-    handled = true;
-  }
-
-  for (HidKeyboardKey key = HidKeyboardKey_A; key <= HidKeyboardKey_Z;
-       key = static_cast<HidKeyboardKey>(key + 1)) {
-    if (keyDown(key))
-      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
-  }
-
-  for (HidKeyboardKey key = HidKeyboardKey_D1; key <= HidKeyboardKey_D0;
-       key = static_cast<HidKeyboardKey>(key + 1)) {
-    if (keyDown(key))
-      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
-  }
-
-  constexpr HidKeyboardKey symbolKeys[] = {
-      HidKeyboardKey_Space, HidKeyboardKey_Minus,        HidKeyboardKey_Period,
-      HidKeyboardKey_Comma, HidKeyboardKey_OpenBracket,  HidKeyboardKey_CloseBracket,
+    if (usage == 0x58 || (usage == 0x28 && shift)) {
+      if (hasHidKeyboard)
+        m_prevKeyboardState = currentKeyboardState;
+      handleConfirm();
+      return true;
+    }
+    if (usage == 0x29) {
+      if (hasHidKeyboard)
+        m_prevKeyboardState = currentKeyboardState;
+      handleCancel();
+      return true;
+    }
+    if (usage == 0x50) {
+      std::lock_guard<std::recursive_mutex> lock(m_mutex);
+      if (m_cursorPos > 0)
+        m_cursorPos--;
+      handled = true;
+      return false;
+    }
+    if (usage == 0x4F) {
+      std::lock_guard<std::recursive_mutex> lock(m_mutex);
+      if (m_cursorPos < m_value.length())
+        m_cursorPos++;
+      handled = true;
+      return false;
+    }
+    if (usage == 0x49) {
+      toggleManualOvertype();
+      if (m_valueDisplay)
+        m_valueDisplay->invalidate();
+      handled = true;
+      return false;
+    }
+    if (m_type == SEARCH_TYPE_TEXT && usage == 0x39) {
+      if (m_onToggleCapsVisual) {
+        m_onToggleCapsVisual();
+      } else {
+        m_capsMode = !m_capsMode;
+      }
+      handled = true;
+      return false;
+    }
+    acceptChar(usage, shift);
+    return false;
   };
-  for (HidKeyboardKey key : symbolKeys) {
-    if (keyDown(key))
-      acceptChar(mapPhysicalKeyToChar(currentKeyboardState, key));
+
+  if (hasHidKeyboard && m_hasPrevKeyboardState) {
+    for (u8 usage = 0x04; usage <= 0x1D; ++usage) {
+      const HidKeyboardKey key = static_cast<HidKeyboardKey>(usage);
+      if (hidKeyDown(key) && handleUsageDown(usage, hidShiftHeld))
+        return true;
+    }
+    for (u8 usage = 0x1E; usage <= 0x27; ++usage) {
+      const HidKeyboardKey key = static_cast<HidKeyboardKey>(usage);
+      if (hidKeyDown(key) && handleUsageDown(usage, hidShiftHeld))
+        return true;
+    }
+    constexpr u8 usageControls[] = {0x2A, 0x28, 0x29, 0x39, 0x49, 0x4F, 0x50, 0x58};
+    for (u8 usage : usageControls) {
+      const HidKeyboardKey key = static_cast<HidKeyboardKey>(usage);
+      if (hidKeyDown(key) && handleUsageDown(usage, hidShiftHeld))
+        return true;
+    }
+    constexpr u8 usageSymbols[] = {
+        0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x33,
+        0x34, 0x35, 0x36, 0x37, 0x38, 0x54, 0x55, 0x56,
+        0x57, 0x63, 0x85,
+    };
+    for (u8 usage : usageSymbols) {
+      const HidKeyboardKey key = static_cast<HidKeyboardKey>(usage);
+      if (hidKeyDown(key) && handleUsageDown(usage, hidShiftHeld))
+        return true;
+    }
   }
 
-  m_prevKeyboardState = currentKeyboardState;
+  for (size_t i = 0; i < usbEventCount; ++i) {
+    if (usbEvents[i].type != kEventTypeDown)
+      continue;
+    const bool shiftHeld = (usbEvents[i].modifiers & (0x02 | 0x20)) != 0;
+    if (handleUsageDown(usbEvents[i].usage, shiftHeld))
+      return true;
+  }
+
+  if (hasHidKeyboard) {
+    m_prevKeyboardState = currentKeyboardState;
+    m_hasPrevKeyboardState = true;
+  } else {
+    m_hasPrevKeyboardState = false;
+  }
+
   return handled;
 }
 

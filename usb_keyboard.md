@@ -91,7 +91,8 @@ Examples of mapped direct characters include:
 ## Limitations
 
 - Behavior depends on whether the keyboard dongle is recognized by Switch HID.
-- Non-standard or vendor-specific receivers may work on PC but fail on Switch.
+- Non-standard or vendor-specific receivers may work on PC but fail on Switch HID.
+- Breezehand now includes internal direct USB fallback support for known unsupported dongles.
 - International layouts and non-ASCII text input are not fully handled.
 - Some keys with platform/layout-specific meanings may not be mapped.
 
@@ -100,6 +101,24 @@ Examples of mapped direct characters include:
 - `source/keyboard.hpp`
 - `source/main.cpp`
 - `lib/libultrahand/libtesla/include/tesla.hpp`
+- `usb_direct_dongle_guide.md`
+
+## Internal Unsupported-Dongle Support
+
+For some dongles that are not exposed through Switch HID keyboard APIs,
+Breezehand can read USB input directly inside the overlay (no sysmodule/IPC path).
+
+Current implementation details:
+
+- Device filter currently targets `VID_1A2C` / `PID_8FFF`.
+- Uses `usb:hs` in overlay process.
+- Prefers interrupt IN endpoints with boot-style 8-byte reports.
+- Decodes key down/up transitions from HID boot report format.
+- Feeds decoded events directly into `KeyboardGui` input handling.
+
+For adapting support to other dongles, see:
+
+- `usb_direct_dongle_guide.md`
 
 ## Troubleshooting
 
