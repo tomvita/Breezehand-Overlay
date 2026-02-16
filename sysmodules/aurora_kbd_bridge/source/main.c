@@ -26,7 +26,7 @@
 #endif
 
 #ifndef AURORA_EXIT_AFTER_INIT
-#define AURORA_EXIT_AFTER_INIT 1
+#define AURORA_EXIT_AFTER_INIT 0
 #endif
 
 typedef struct {
