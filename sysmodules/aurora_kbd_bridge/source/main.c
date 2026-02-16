@@ -25,6 +25,10 @@
 #define AURORA_LOGGING 0
 #endif
 
+#ifndef AURORA_EXIT_AFTER_INIT
+#define AURORA_EXIT_AFTER_INIT 1
+#endif
+
 typedef struct {
     u32 magic;             // 'AKBD'
     u32 version;           // protocol version
@@ -848,6 +852,9 @@ int main(int argc, char *argv[]) {
 
     write_state(&state);
 
+#if AURORA_EXIT_AFTER_INIT
+    log_line("Init-only mode active, exiting");
+#else
     while (true) {
         u64 now = armGetSystemTick();
         bool should_try_acquire = (active_links <= 0);
@@ -919,6 +926,7 @@ int main(int argc, char *argv[]) {
 
         svcSleepThread(1 * 1000 * 1000ULL);
     }
+#endif
 
     for (int i = 0; i < MAX_LINKS; ++i) {
         close_keyboard_link(&links[i]);
