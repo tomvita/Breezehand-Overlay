@@ -60,9 +60,27 @@ APP_AUTHOR	:= tomvita
 APP_VERSION	:= 0.8.8
 TARGET		:= breezehand
 BUILD		:= build
+NO_ICON		:= 1
+
+#---------------------------------------------------------------------------------
+# Lite build: drops the on-screen keyboard implementation and the capstone
+# disassembler. Search/edit-cheat menus still link as code, but they never
+# disassemble opcodes (DisassembleARM64 returns "") and any KeyboardGui call
+# falls through a tiny stub that just goes back. Default ON to keep the
+# overlay's runtime memory footprint minimal for the cheat-menu use case.
+#---------------------------------------------------------------------------------
+BREEZEHAND_LITE ?= 1
+# Editcheat targets always need capstone regardless of BREEZEHAND_LITE.
+ifeq ($(strip $(TARGET)),editcheat)
 SOURCES		:= source common ../capstone ../capstone/arch/AArch64
 INCLUDES	:= source common include ../capstone/include/capstone ../capstone/include/
-NO_ICON		:= 1
+else ifeq ($(strip $(BREEZEHAND_LITE)),1)
+SOURCES		:= source common
+INCLUDES	:= source common include
+else
+SOURCES		:= source common ../capstone ../capstone/arch/AArch64
+INCLUDES	:= source common include ../capstone/include/capstone ../capstone/include/
+endif
 
 # This location should reflect where you place the libultrahand directory (lib can vary between projects).
 include ${TOPDIR}/lib/libultrahand/ultrahand.mk
@@ -78,7 +96,14 @@ CFLAGS := -g -Wall -Os -ffunction-sections -fdata-sections -flto \
           -fno-strict-aliasing -frename-registers -falign-functions=16 \
           $(ARCH) $(DEFINES)
 
-CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2 -DCAPSTONE_HAS_ARM64 -DCAPSTONE_USE_SYS_DYN_MEM -DCAPSTONE_DIET -DCAPSTONE_STATIC
+CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2
+ifeq ($(strip $(TARGET)),editcheat)
+CFLAGS += -DCAPSTONE_HAS_ARM64 -DCAPSTONE_USE_SYS_DYN_MEM -DCAPSTONE_DIET -DCAPSTONE_STATIC
+else ifeq ($(strip $(BREEZEHAND_LITE)),1)
+CFLAGS += -DBREEZEHAND_LITE=1
+else
+CFLAGS += -DCAPSTONE_HAS_ARM64 -DCAPSTONE_USE_SYS_DYN_MEM -DCAPSTONE_DIET -DCAPSTONE_STATIC
+endif
 
 
 #---------------------------------------------------------------------------------
@@ -296,8 +321,9 @@ editcheat:
 		NROFLAGS= \
 		TOPDIR=$(CURDIR) \
 		USE_KEYSTONE_ASM=0 \
+		BREEZEHAND_LITE=0 \
 		KEYSTONE_ROOT=$(CURDIR)/../keystone \
-		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../capstone/include/capstone -I$(CURDIR)/../capstone/include -I$(CURDIR)/../keystone/include" \
 		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
 		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
 	@mkdir -p build_editcheatk
@@ -313,8 +339,9 @@ editcheat:
 		NROFLAGS= \
 		TOPDIR=$(CURDIR) \
 		USE_KEYSTONE_ASM=1 \
+		BREEZEHAND_LITE=0 \
 		KEYSTONE_ROOT=$(CURDIR)/../keystone \
-		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../capstone/include/capstone -I$(CURDIR)/../capstone/include -I$(CURDIR)/../keystone/include" \
 		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
 		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
 	@mkdir -p out/switch/.overlays/
@@ -364,6 +391,23 @@ full: all
 #---------------------------------------------------------------------------------
 else
 .PHONY: all
+
+# When invoked recursively with -C $(BUILD), the inner branch runs in the
+# build directory. If the parent's exported OFILES_SRC isn't suitable
+# (e.g. editcheat needs capstone but the parent built with BREEZEHAND_LITE=1),
+# re-evaluate the source list here using TOPDIR-relative paths.
+ifneq ($(strip $(TARGET)),breezehand)
+VPATH := $(foreach dir,$(SOURCES),$(TOPDIR)/$(dir)) \
+		$(foreach dir,$(DATA),$(TOPDIR)/$(dir))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(TOPDIR)/$(dir)/*.c)))
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(TOPDIR)/$(dir)/*.cpp)))
+SFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(TOPDIR)/$(dir)/*.s)))
+BINFILES := $(foreach dir,$(DATA),$(notdir $(wildcard $(TOPDIR)/$(dir)/*.*)))
+OFILES_BIN := $(addsuffix .o,$(BINFILES))
+OFILES_SRC := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+OFILES := $(OFILES_BIN) $(OFILES_SRC)
+HFILES_BIN := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+endif
 
 DEPENDS := $(OFILES:.o=.d)
 

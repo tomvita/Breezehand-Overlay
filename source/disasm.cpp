@@ -1,4 +1,6 @@
 #include "disasm.hpp"
+
+#if !defined(BREEZEHAND_LITE)
 #include <capstone.h>
 
 namespace air {
@@ -28,3 +30,14 @@ namespace air {
         return result;
     }
 }
+#else
+// Lite build: capstone is not linked. Provide a stub so callers compile and
+// link without pulling in the disassembler. All in-overlay disassembly views
+// (cheat-edit notes, asm preview) become empty strings, which the existing
+// fallback paths in main.cpp already handle.
+namespace air {
+    std::string DisassembleARM64(uint32_t /*code*/, uint64_t /*address*/) {
+        return std::string();
+    }
+}
+#endif

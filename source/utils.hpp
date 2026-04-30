@@ -1132,15 +1132,18 @@ std::tuple<Result, std::string, std::string, bool, bool> getOverlayInfo(const st
     fclose(file);
 
     // --- Extract strings ---
-    const char* nameEnd = static_cast<const char*>(std::memchr(nacp.lang[0].name, '\0', sizeof(nacp.lang[0].name)));
-    const size_t nameLen = nameEnd ? (nameEnd - nacp.lang[0].name) : sizeof(nacp.lang[0].name);
+    // Newer libnx (21.0.0+) wraps the language entries inside `lang_data`.
+    // Use the helper to get a forward-compatible pointer.
+    const NacpLanguageEntry &langEntry = nacp.lang_data.lang[0];
+    const char* nameEnd = static_cast<const char*>(std::memchr(langEntry.name, '\0', sizeof(langEntry.name)));
+    const size_t nameLen = nameEnd ? (nameEnd - langEntry.name) : sizeof(langEntry.name);
     
     const char* versionEnd = static_cast<const char*>(std::memchr(nacp.display_version, '\0', sizeof(nacp.display_version)));
     const size_t versionLen = versionEnd ? (versionEnd - nacp.display_version) : sizeof(nacp.display_version);
 
     return {
         ResultSuccess,
-        std::string(nacp.lang[0].name, nameLen),
+        std::string(langEntry.name, nameLen),
         std::string(nacp.display_version, versionLen),
         usingLibUltrahand,
         usesNewLibNX

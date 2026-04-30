@@ -612,6 +612,7 @@ public:
                            HidAnalogStickState rightJoyStick) override;
   virtual bool onClick(u64 keys) override;
 };
+#ifndef BREEZEHAND_LITE
 class UltrahandSettingsMenu : public tsl::Gui {
 private:
   std::string entryName, entryMode, overlayName, dropdownSelection,
@@ -2012,12 +2013,14 @@ public:
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override;
 };
+#endif // BREEZEHAND_LITE (UltrahandSettingsMenu)
 
 int settingsMenuPageDepth = 0;
 std::string rootEntryName, rootEntryMode, rootTitle, rootVersion;
 
 bool modeComboModified = false;
 
+#ifndef BREEZEHAND_LITE
 class SettingsMenu : public tsl::Gui {
 private:
   std::string entryName, entryMode, title, version, dropdownSelection,
@@ -2598,6 +2601,7 @@ public:
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override;
 };
+#endif // BREEZEHAND_LITE (SettingsMenu)
 
 // For persistent versions and colors across nested packages (when not
 // specified)
@@ -2611,6 +2615,7 @@ std::string packageRootLayerColor;
 
 bool overrideTitle = false, overrideVersion = false;
 
+#ifndef BREEZEHAND_LITE
 class ScriptOverlay : public tsl::Gui {
 private:
   std::vector<std::vector<std::string>> commands;
@@ -7166,6 +7171,7 @@ public:
     return false;
   };
 };
+#endif // BREEZEHAND_LITE (Script/Selection/PackageMenu)
 
 #include <algorithm>
 #include <cctype>
@@ -8227,29 +8233,11 @@ std::string GetComboKeyGlyphs(u32 key_mask) {
   return glyphs;
 }
 } // namespace CheatUtils
-static const char *const condition_str[] = {"",     " > ",  " >= ", " < ",
-                                            " <= ", " == ", " != "};
-static const char *const math_str[] = {
-    " + ",   " - ",   " * ",         " << ",   " >> ",   " & ",    " | ",
-    " NOT ", " XOR ", " None/Move ", " fadd ", " fsub ", " fmul ", " fdiv "};
-static const char *const heap_str[] = {"main+", "heap+", "alias+", "aslr+",
-                                       "blank+"};
-static const std::vector<u32> buttonCodes = {
-    0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002,
-    0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800,
-    0x80001000, 0x80002000, 0x80004000, 0x80008000, 0x80100000, 0x80200000,
-    0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000,
-    0x81000000, 0x82000000};
-static const std::vector<std::string> buttonNames = {
-    "", "", "", "", "", "", "", "",
-    "", "", "", "", "", "", "", "",
-    "", "", "", "", "", "", "", "",
-    "SL", "SR"};
 
-static bool s_noteMinimalMode = false;
-
-namespace {
-std::map<std::string, std::map<std::string, std::string>>
+// ParseCheatNotesFile is used by both the main CheatMenu (lite) and the
+// cheat-decoder note formatter (full build), so it lives outside the
+// BREEZEHAND_LITE gate.
+static std::map<std::string, std::map<std::string, std::string>>
 ParseCheatNotesFile(const std::string &notesPath) {
   std::map<std::string, std::map<std::string, std::string>> parsedData;
   if (notesPath.empty())
@@ -8320,6 +8308,38 @@ ParseCheatNotesFile(const std::string &notesPath) {
   return parsedData;
 }
 
+#ifndef BREEZEHAND_LITE
+// ============================================================================
+// CHEAT-DECODER + CHEAT-EDIT BLOCK
+//   - Opcode/value/note formatters that depend on air::DisassembleARM64
+//   - CheatFormatManager (asm assembly via Keystone, opcode caches)
+//   - CheatEditMenu (in-overlay cheat editor)
+// All of this is unreachable from the main cheat-display flow, so the lite
+// build excludes it entirely. The standalone editcheat.ovl variant builds
+// these classes with the full capstone backend.
+// ============================================================================
+static const char *const condition_str[] = {"",     " > ",  " >= ", " < ",
+                                            " <= ", " == ", " != "};
+static const char *const math_str[] = {
+    " + ",   " - ",   " * ",         " << ",   " >> ",   " & ",    " | ",
+    " NOT ", " XOR ", " None/Move ", " fadd ", " fsub ", " fmul ", " fdiv "};
+static const char *const heap_str[] = {"main+", "heap+", "alias+", "aslr+",
+                                       "blank+"};
+static const std::vector<u32> buttonCodes = {
+    0x80000040, 0x80000080, 0x80000100, 0x80000200, 0x80000001, 0x80000002,
+    0x80000004, 0x80000008, 0x80000010, 0x80000020, 0x80000400, 0x80000800,
+    0x80001000, 0x80002000, 0x80004000, 0x80008000, 0x80100000, 0x80200000,
+    0x80400000, 0x80800000, 0x80010000, 0x80020000, 0x80040000, 0x80080000,
+    0x81000000, 0x82000000};
+static const std::vector<std::string> buttonNames = {
+    "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "",
+    "SL", "SR"};
+
+static bool s_noteMinimalMode = false;
+
+namespace {
 std::string WrapNote(const std::string &note, size_t limit = 60) {
   if (note.length() <= limit)
     return note;
@@ -10833,7 +10853,17 @@ public:
     return false;
   }
 };
+#endif // BREEZEHAND_LITE  (end of CHEAT-DECODER + CHEAT-EDIT BLOCK)
 
+#ifndef BREEZEHAND_LITE
+// ============================================================================
+// SEARCH SUBSYSTEM
+//   - Search helper functions, candidate-record bookkeeping
+//   - 9 GUI classes: CandidateEntryOptionsMenu, CandidateEntriesMenu,
+//     ContinueSourceOptionsMenu, ContinueSearchFileMenu, SearchTypeSelectMenu,
+//     SearchModeSelectMenu, SearchDataMenu, SearchSetupMenu (and helpers)
+// All wrapped in one anonymous namespace and stripped from the lite build.
+// ============================================================================
 namespace {
 
 const char *SearchTypeLabel(searchType_t type) {
@@ -14215,6 +14245,14 @@ public:
 };
 
 } // namespace
+#endif // BREEZEHAND_LITE  (end of SEARCH SUBSYSTEM)
+
+#ifdef BREEZEHAND_LITE
+// Lite-build no-op stubs for symbols still referenced from MainMenu/Overlay.
+namespace {
+inline void StopSearchWorker() {}
+} // namespace
+#endif
 
 class MainMenu : public tsl::Gui {
 
@@ -14422,6 +14460,11 @@ public:
   }
 
   void createSearchManagerMenu(tsl::elm::List *list) {
+#ifdef BREEZEHAND_LITE
+    (void)list;
+    // Search subsystem is stripped from the lite build.
+    return;
+#else
     inOverlaysPage.store(false, std::memory_order_release);
     inPackagesPage.store(false, std::memory_order_release);
 
@@ -14581,6 +14624,7 @@ public:
     lastBufferItem->setNote(LastSearchBufferNote());
     list->addItem(lastBufferItem);
     m_lastBufferItem = lastBufferItem;
+#endif // BREEZEHAND_LITE
   }
 
   void createCheatsMenu(tsl::elm::List *list) {
@@ -15072,8 +15116,10 @@ public:
   : overlayVersion; jumpItemName = jumpItemValue = "";
 
                       tsl::shiftItemFocus(listItem);
+#ifndef BREEZEHAND_LITE
                       tsl::changeTo<SettingsMenu>(overlayFileName, OVERLAY_STR,
   overlayName, overlayVersion, "", !supportsAMS110);
+#endif
                       triggerRumbleClick.store(true, std::memory_order_release);
                       triggerSettingsSound.store(true,
   std::memory_order_release); return true;
@@ -15419,7 +15465,9 @@ public:
             returnJumpItemValue = hidePackageVersions ? "" : packageVersion;
 
             tsl::clearGlyphCacheNow.store(true, release);
+#ifndef BREEZEHAND_LITE
             tsl::swapTo<PackageMenu>(SwapDepth(2), packageFilePath, "");
+#endif
             return true;
           }
 
@@ -15462,8 +15510,10 @@ public:
             jumpItemName = jumpItemValue = "";
 
             tsl::shiftItemFocus(listItem);
+#ifndef BREEZEHAND_LITE
             tsl::changeTo<SettingsMenu>(packageName, PACKAGE_STR,
                                         newPackageName, packageVersion);
+#endif
             triggerRumbleClick.store(true, std::memory_order_release);
             triggerSettingsSound.store(true, std::memory_order_release);
             return true;
@@ -15600,11 +15650,21 @@ public:
       bool usingPages = false;
 
       const PackageHeader packageHeader = getPackageHeaderFromIni(PACKAGE_PATH);
+#ifndef BREEZEHAND_LITE
       noClickableItems = drawCommandsMenu(
           list, packageIniPath, packageConfigIniPath, packageHeader, "",
           pageLeftName, pageRightName, PACKAGE_PATH, LEFT_STR, "package.ini",
           this->dropdownSection, 0, pathPattern, pathPatternOn, pathPatternOff,
           usingPages, false);
+#else
+      (void)packageHeader;
+      (void)pageLeftName;
+      (void)pageRightName;
+      (void)pathPattern;
+      (void)pathPatternOn;
+      (void)pathPatternOff;
+      (void)usingPages;
+#endif
 
       if (!hideUserGuide && dropdownSection.empty()) {
         addHelpInfo(list);
@@ -15640,6 +15700,11 @@ public:
         dropdownSection.empty();
     setFooterBackLabel(shouldShowRestartLabel);
 
+#ifdef BREEZEHAND_LITE
+    if (menuMode == SEARCH_MANAGER_MENU_MODE) {
+      // Search subsystem is stripped from the lite build; ignore mode events.
+    }
+#else
     if (menuMode == SEARCH_MANAGER_MENU_MODE &&
         g_searchWorkerRunning.load(std::memory_order_acquire)) {
       focusSearchProgressItem();
@@ -15705,6 +15770,7 @@ public:
         }
       }
     }
+#endif // BREEZEHAND_LITE
 
     if ((keysHeld & KEY_ZL) && menuMode == OVERLAYS_STR) {
       if (keysDown & KEY_R) {
@@ -16229,7 +16295,9 @@ public:
                !(keysHeld & ~SYSTEM_SETTINGS_KEY & ALL_KEYS_MASK))))) {
           inMainMenu.store(false, std::memory_order_release);
           skipJumpReset.store(false, std::memory_order_release);
+#ifndef BREEZEHAND_LITE
           tsl::changeTo<UltrahandSettingsMenu>();
+#endif
           triggerRumbleClick.store(true, std::memory_order_release);
           triggerSettingsSound.store(true, std::memory_order_release);
           return true;
@@ -16306,7 +16374,9 @@ public:
         inMainMenu.store(false, std::memory_order_release);
         skipJumpReset.store(false, std::memory_order_release);
         lastMenu = "hiddenMenuMode"; // ADD THIS LINE
+#ifndef BREEZEHAND_LITE
         tsl::changeTo<UltrahandSettingsMenu>();
+#endif
         triggerRumbleClick.store(true, std::memory_order_release);
         triggerSettingsSound.store(true, std::memory_order_release);
         return true;
@@ -16342,6 +16412,7 @@ public:
   }
 
   virtual void update() override {
+#ifndef BREEZEHAND_LITE
     if (menuMode == SEARCH_MANAGER_MENU_MODE &&
         (g_searchWorkerRunning.load(std::memory_order_acquire) ||
          g_searchInProgress || g_searchQueuedAction != SEARCH_QUEUED_NONE)) {
@@ -16408,6 +16479,7 @@ public:
     const SearchQueuedAction action = g_searchQueuedAction;
     g_searchQueuedAction = SEARCH_QUEUED_NONE;
     BeginQueuedSearchWorker(action);
+#endif // BREEZEHAND_LITE
   }
 };
 
@@ -16750,7 +16822,12 @@ public:
         inMainMenu.store(false, std::memory_order_release);
 
         // Return PackageMenu directly instead of MainMenu
+#ifndef BREEZEHAND_LITE
         return initially<PackageMenu>(packageFilePath, "");
+#else
+        selectedPackage.clear();
+        return initially<MainMenu>();
+#endif
       } else {
         // Package not found, clear the selection and fall back to main menu
         selectedPackage.clear();
@@ -16923,6 +17000,7 @@ public:
  * @param argv An array of C-style strings representing command-line arguments.
  * @return The application's exit code.
  */
+#ifndef BREEZEHAND_LITE
 bool UltrahandSettingsMenu::handleInput(u64 keysDown, u64 keysHeld,
                                         touchPosition touchInput,
                                         JoystickPosition leftJoyStick,
@@ -17340,6 +17418,7 @@ bool SettingsMenu::handleInput(u64 keysDown, u64 keysHeld,
 
   return false;
 }
+#endif // BREEZEHAND_LITE (Settings impls)
 
 void TransitionToMainMenu(const std::string &arg1, const std::string &arg2) {
   tsl::changeTo<MainMenu>(arg1, arg2);
@@ -17582,7 +17661,9 @@ bool MainComboSetItem::handleInput(u64 keysDown, u64 keysHeld,
 
             // Refresh current menu immediately
             reloadMenu = true;
+#ifndef BREEZEHAND_LITE
             tsl::swapTo<UltrahandSettingsMenu>();
+#endif
             return true;
           } else {
             // Countdown/feedback
@@ -17714,6 +17795,8 @@ int main(int argc, char *argv[]) {
 // ==========================================
 // KEYBOARD IMPLEMENTATION (Merged)
 // ==========================================
+
+#ifndef BREEZEHAND_LITE
 
 #include "keyboard.hpp"
 #include <algorithm>
@@ -19859,3 +19942,97 @@ bool KeyboardGui::isOvertypeMode() const {
   return (m_type == SEARCH_TYPE_HEX && m_cursorPos < 8) || m_manualOvertype;
 }
 } // namespace tsl
+
+#else  // BREEZEHAND_LITE
+
+// ============================================================================
+// LITE STUB: KeyboardGui
+// ----------------------------------------------------------------------------
+// In the lite build the on-screen keyboard implementation (~2200 lines, plus
+// large key-tile/rendering tables and a per-instance std::function captures
+// table) is dropped. The existing search/edit-cheat menus still reference
+// `tsl::changeTo<tsl::KeyboardGui>(...)` from many call sites; rather than
+// gating each of those sites we keep the constructor signature alive and
+// supply a tiny placeholder that just informs the user the feature was
+// stripped and returns to the previous menu on B.
+// ============================================================================
+#include "keyboard.hpp"
+#include <tesla.hpp>
+
+namespace tsl {
+
+KeyboardGui::KeyboardGui(searchType_t type, const std::string &initialValue,
+                         const std::string &title,
+                         std::function<void(std::string)> onComplete,
+                         std::function<std::string(std::string &, size_t &)> onNoteUpdate,
+                         bool constrained,
+                         std::function<std::string(std::string &, size_t &)> onGetSignedEditValue,
+                         std::function<std::string(std::string &, size_t &)> onGetUnsignedEditValue,
+                         std::function<std::string(std::string &, size_t &)> onGetFloatEditValue,
+                         std::function<bool(std::string &, size_t &, const std::string &)> onApplySignedEdit,
+                         std::function<bool(std::string &, size_t &, const std::string &)> onApplyUnsignedEdit,
+                         std::function<bool(std::string &, size_t &, const std::string &)> onApplyFloatEdit,
+                         std::function<std::string(std::string &, size_t &)> onGetAsmEditValue,
+                         std::function<bool(std::string &, size_t &, const std::string &)> onApplyAsmEdit,
+                         std::function<bool(std::string &, size_t &)> onClearStoredValue,
+                         std::function<u32(std::string &, size_t &)> onGetCodeType,
+                         std::function<bool(std::string &, size_t &, u32, u64)> onApplyComboType,
+                         std::function<bool(std::string &, size_t &, u32)> onSetComboCodeType,
+                         std::function<bool(std::string &, size_t &)> onToggleC4AutoRepeat)
+    : m_type(type), m_value(initialValue), m_title(title),
+      m_onComplete(std::move(onComplete)),
+      m_onNoteUpdate(std::move(onNoteUpdate)),
+      m_onGetSignedEditValue(std::move(onGetSignedEditValue)),
+      m_onGetUnsignedEditValue(std::move(onGetUnsignedEditValue)),
+      m_onGetFloatEditValue(std::move(onGetFloatEditValue)),
+      m_onApplySignedEdit(std::move(onApplySignedEdit)),
+      m_onApplyUnsignedEdit(std::move(onApplyUnsignedEdit)),
+      m_onApplyFloatEdit(std::move(onApplyFloatEdit)),
+      m_onGetAsmEditValue(std::move(onGetAsmEditValue)),
+      m_onApplyAsmEdit(std::move(onApplyAsmEdit)),
+      m_onClearStoredValue(std::move(onClearStoredValue)),
+      m_onGetCodeType(std::move(onGetCodeType)),
+      m_onApplyComboType(std::move(onApplyComboType)),
+      m_onSetComboCodeType(std::move(onSetComboCodeType)),
+      m_onToggleC4AutoRepeat(std::move(onToggleC4AutoRepeat)),
+      m_isNumpad(false),
+      m_isConstrained(constrained) {}
+
+KeyboardGui::~KeyboardGui() {}
+
+elm::Element *KeyboardGui::createUI() {
+  auto *frame = new tsl::elm::OverlayFrame(m_title.empty() ? "Keyboard" : m_title,
+                                           "(unavailable in lite build)");
+  auto *list = new tsl::elm::List();
+  list->addItem(new tsl::elm::CategoryHeader("Keyboard input is disabled"));
+  auto *back = new tsl::elm::ListItem("Back");
+  back->setClickListener([](u64 keys) {
+    if (keys & KEY_A) { tsl::goBack(); return true; }
+    return false;
+  });
+  list->addItem(back);
+  frame->setContent(list);
+  return frame;
+}
+
+void KeyboardGui::update() {}
+
+bool KeyboardGui::handleInput(u64 keysDown, u64 /*keysHeld*/,
+                              const HidTouchState & /*touchPos*/,
+                              HidAnalogStickState /*leftJoyStick*/,
+                              HidAnalogStickState /*rightJoyStick*/) {
+  if (keysDown & KEY_B) { tsl::goBack(); return true; }
+  return false;
+}
+
+bool KeyboardGui::handlePhysicalKeyboardInput() { return false; }
+void KeyboardGui::handleKeyPress(char /*c*/, bool /*directPhysicalInput*/) {}
+void KeyboardGui::handleBackspace() {}
+void KeyboardGui::handleConfirm() { tsl::goBack(); }
+void KeyboardGui::handleCancel() { tsl::goBack(); }
+void KeyboardGui::switchType(searchType_t newType) { m_type = newType; }
+bool KeyboardGui::isOvertypeMode() const { return m_manualOvertype; }
+
+} // namespace tsl
+
+#endif // BREEZEHAND_LITE
