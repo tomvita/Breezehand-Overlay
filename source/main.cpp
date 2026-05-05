@@ -14625,16 +14625,39 @@ public:
         static NsApplicationControlData appControlData;
         size_t appControlDataSize = 0;
         NacpLanguageEntry *languageEntry = nullptr;
-        if (R_SUCCEEDED(nsGetApplicationControlData(
-                NsApplicationControlSource_Storage,
-                metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData,
-                sizeof(NsApplicationControlData), &appControlDataSize))) {
+        u64 acd_app_id = metadata.title_id & 0xFFFFFFFFFFFFFFF0;
+        Result acd_rc = nsGetApplicationControlData(
+            NsApplicationControlSource_Storage, acd_app_id, &appControlData,
+            sizeof(NsApplicationControlData), &appControlDataSize);
+        if (R_SUCCEEDED(acd_rc)) {
           if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp,
                                                           &languageEntry)) &&
               languageEntry) {
             titleStr = languageEntry->name;
           }
           versionStr = appControlData.nacp.display_version;
+        }
+        // Switch 2 Edition fallback: libnx 19.0.0+ exposes nsGetApplicationControlData2
+        // with acd_idx=1 to retrieve the Switch 2 Edition NACP for titles whose
+        // legacy NACP slot is blank.
+        if (titleStr.empty() && hosversionAtLeast(19, 0, 0)) {
+          u64 actual = 0;
+          u32 unk = 0;
+          std::memset(&appControlData, 0, sizeof(NsApplicationControlData));
+          if (R_SUCCEEDED(nsGetApplicationControlData2(
+                  NsApplicationControlSource_Storage, acd_app_id,
+                  &appControlData, sizeof(NsApplicationControlData), 0, 1,
+                  &actual, &unk))) {
+            languageEntry = nullptr;
+            if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(
+                    &appControlData.nacp, &languageEntry)) &&
+                languageEntry) {
+              titleStr = languageEntry->name;
+            }
+            if (versionStr.empty()) {
+              versionStr = appControlData.nacp.display_version;
+            }
+          }
         }
 
         if (titleStr.empty()) {
