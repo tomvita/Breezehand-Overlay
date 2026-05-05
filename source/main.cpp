@@ -53,6 +53,7 @@
 #include <thread>
 #include <utils.hpp>
 #include <cstdarg>
+#include <zlib.h>
 
 #ifndef USE_KEYSTONE_ASM
 #define USE_KEYSTONE_ASM 0
@@ -8226,6 +8227,201 @@ std::string GetComboKeyGlyphs(u32 key_mask) {
     glyphs += " ";
   return glyphs;
 }
+
+// ---------------------------------------------------------------------------
+// Switch 2 Edition / FW 21+ title-name lookup.
+//
+// nsGetApplicationControlData(2) returns lang_data in DEFLATE-compressed form
+// (NacpStruct.titles_data_format == 1) for Switch 2 Edition titles, and libnx
+// nacpGetLanguageEntry / nsGetApplicationDesiredLanguage do not decompress it,
+// so they yield empty names. To work around this we open control.nacp directly
+// from the content storage via ncm + fs, and inflate the compressed entries
+// when needed. Mirrors ftpsrv's get_app_name implementation.
+// ---------------------------------------------------------------------------
+static u32 BreezeNacpLangIndexFor(SetLanguage lang) {
+    switch (lang) {
+        case SetLanguage_JA:    return 2;
+        case SetLanguage_ENUS:  return 0;
+        case SetLanguage_ENGB:  return 1;
+        case SetLanguage_FR:    return 3;
+        case SetLanguage_DE:    return 4;
+        case SetLanguage_ES419: return 5;
+        case SetLanguage_ES:    return 6;
+        case SetLanguage_IT:    return 7;
+        case SetLanguage_NL:    return 8;
+        case SetLanguage_FRCA:  return 9;
+        case SetLanguage_PT:    return 10;
+        case SetLanguage_RU:    return 11;
+        case SetLanguage_KO:    return 12;
+        case SetLanguage_ZHTW:  return 13;
+        case SetLanguage_ZHCN:  return 14;
+        default:                return 0;
+    }
+}
+
+static u8 GetSystemLangIndex() {
+    static u8 cached = 0xFF;
+    if (cached != 0xFF) return cached;
+    u64 LanguageCode = 0;
+    SetLanguage Language = SetLanguage_ENUS;
+    if (R_SUCCEEDED(setGetSystemLanguage(&LanguageCode))) {
+        if (R_SUCCEEDED(setMakeLanguage(LanguageCode, &Language))) {
+            if ((int)Language < 0 || (int)Language >= 15) Language = SetLanguage_ENUS;
+        }
+    }
+    cached = (u8)BreezeNacpLangIndexFor(Language);
+    return cached;
+}
+
+// Read the title name for app_id from one (db, cs) pair.
+static Result GetAppNameFromStorage(u64 app_id, NcmContentMetaDatabase* db,
+                                    NcmContentStorage* cs,
+                                    char* out_name, size_t out_size) {
+    Result rc;
+    NcmContentMetaKey key;
+    s32 entries_total = 0, entries_written = 0;
+    if (R_FAILED(rc = ncmContentMetaDatabaseList(db, &entries_total, &entries_written, &key, 1, NcmContentMetaType_Application, app_id, 0, UINT64_MAX, NcmContentInstallType_Full))) {
+        return rc;
+    }
+    if (entries_written < 1) {
+        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    }
+
+    NcmContentId cid;
+    if (R_FAILED(rc = ncmContentMetaDatabaseGetContentIdByType(db, &cid, &key, NcmContentType_Control))) {
+        return rc;
+    }
+
+    char nxpath[FS_MAX_PATH];
+    if (R_FAILED(rc = ncmContentStorageGetPath(cs, nxpath, sizeof(nxpath), &cid))) {
+        return rc;
+    }
+
+    FsFileSystem fs;
+    if (R_FAILED(rc = fsOpenFileSystemWithId(&fs, key.id, FsFileSystemType_ContentControl, nxpath, FsContentAttributes_All))) {
+        return rc;
+    }
+
+    strcpy(nxpath, "/control.nacp");
+    FsFile file;
+    if (R_FAILED(rc = fsFsOpenFile(&fs, nxpath, FsOpenMode_Read, &file))) {
+        fsFsClose(&fs);
+        return rc;
+    }
+
+    out_name[0] = '\0';
+    const u8 lang_index = GetSystemLangIndex();
+
+    // Check NacpStruct.titles_data_format (compressed lang data on Switch 2 / FW21+).
+    {
+        u8 fmt = 0;
+        u64 fmt_read = 0;
+        const s64 fmt_off = (s64)offsetof(NacpStruct, titles_data_format);
+        rc = fsFileRead(&file, fmt_off, &fmt, sizeof(fmt), 0, &fmt_read);
+        if (R_SUCCEEDED(rc) && fmt_read == 1 && fmt == 1) {
+            const size_t raw_cap = 2 + 0x2FFE;
+            u8* raw = (u8*)malloc(raw_cap);
+            NacpLanguageEntry* decompressed = (NacpLanguageEntry*)malloc(sizeof(NacpLanguageEntry) * 32);
+            if (!raw || !decompressed) {
+                free(raw); free(decompressed);
+                fsFileClose(&file); fsFsClose(&fs);
+                return MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed);
+            }
+            u64 raw_read = 0;
+            rc = fsFileRead(&file, 0, raw, raw_cap, 0, &raw_read);
+            if (R_FAILED(rc) || raw_read < 2) {
+                Result rret = R_FAILED(rc) ? rc : MAKERESULT(Module_Libnx, LibnxError_BadInput);
+                free(raw); free(decompressed);
+                fsFileClose(&file); fsFsClose(&fs);
+                return rret;
+            }
+            const u16 csize = (u16)(raw[0] | (raw[1] << 8));
+            if (csize == 0 || csize > 0x2FFE || (u64)(2 + csize) > raw_read) {
+                free(raw); free(decompressed);
+                fsFileClose(&file); fsFsClose(&fs);
+                return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+            }
+            memset(decompressed, 0, sizeof(NacpLanguageEntry) * 32);
+            z_stream zs;
+            memset(&zs, 0, sizeof(zs));
+            if (inflateInit2(&zs, -15) != Z_OK) {
+                free(raw); free(decompressed);
+                fsFileClose(&file); fsFsClose(&fs);
+                return MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed);
+            }
+            zs.next_in   = &raw[2];
+            zs.avail_in  = csize;
+            zs.next_out  = (Bytef*)decompressed;
+            zs.avail_out = sizeof(NacpLanguageEntry) * 32;
+            const int zrc = inflate(&zs, Z_FINISH);
+            inflateEnd(&zs);
+            Result done = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+            if (zrc == Z_STREAM_END || zrc == Z_OK) {
+                const NacpLanguageEntry* chosen = nullptr;
+                if (lang_index < 32 && decompressed[lang_index].name[0] != '\0') {
+                    chosen = &decompressed[lang_index];
+                } else {
+                    for (int i = 0; i < 32; i++) {
+                        if (decompressed[i].name[0] != '\0') { chosen = &decompressed[i]; break; }
+                    }
+                }
+                if (chosen) {
+                    strncpy(out_name, chosen->name, out_size - 1);
+                    out_name[out_size - 1] = '\0';
+                    done = 0;
+                }
+            }
+            free(raw); free(decompressed);
+            fsFileClose(&file); fsFsClose(&fs);
+            return done;
+        }
+        // fmt != 1: fall through to legacy path.
+    }
+
+    // Legacy uncompressed lang[16] path.
+    s64 off = (s64)lang_index * (s64)sizeof(NacpLanguageEntry);
+    u64 bytes_read = 0;
+    rc = fsFileRead(&file, off, out_name, out_size, 0, &bytes_read);
+    if (R_SUCCEEDED(rc) && out_name[0] == '\0') {
+        for (int i = 0; i < 16; i++) {
+            off = (s64)i * (s64)sizeof(NacpLanguageEntry);
+            rc = fsFileRead(&file, off, out_name, out_size, 0, &bytes_read);
+            if (R_SUCCEEDED(rc) && out_name[0] != '\0') break;
+        }
+    }
+    out_name[out_size - 1] = '\0';
+
+    fsFileClose(&file);
+    fsFsClose(&fs);
+    return (out_name[0] != '\0') ? 0 : MAKERESULT(Module_Libnx, LibnxError_NotFound);
+}
+
+// Public entry point: writes the title name for app_id into out_name.
+// Returns 0 on success, non-zero on failure (out_name will be empty).
+Result GetTitleNameForAppId(u64 app_id, char* out_name, size_t out_size) {
+    if (!out_name || out_size == 0) {
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+    out_name[0] = '\0';
+
+    static NcmContentStorage s_cs[2];
+    static NcmContentMetaDatabase s_db[2];
+    static const NcmStorageId s_ids[2] = { NcmStorageId_SdCard, NcmStorageId_BuiltInUser };
+
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    for (int i = 0; i < 2; i++) {
+        if (!serviceIsActive(&s_cs[i].s)) {
+            if (R_FAILED(ncmOpenContentStorage(&s_cs[i], s_ids[i]))) continue;
+        }
+        if (!serviceIsActive(&s_db[i].s)) {
+            if (R_FAILED(ncmOpenContentMetaDatabase(&s_db[i], s_ids[i]))) continue;
+        }
+        rc = GetAppNameFromStorage(app_id, &s_db[i], &s_cs[i], out_name, out_size);
+        if (R_SUCCEEDED(rc) && out_name[0] != '\0') return rc;
+    }
+    return rc;
+}
+
 } // namespace CheatUtils
 static const char *const condition_str[] = {"",     " > ",  " >= ", " < ",
                                             " <= ", " == ", " != "};
@@ -14622,19 +14818,39 @@ public:
 
         std::string titleStr = "";
         std::string versionStr = "";
-        static NsApplicationControlData appControlData;
-        size_t appControlDataSize = 0;
-        NacpLanguageEntry *languageEntry = nullptr;
-        if (R_SUCCEEDED(nsGetApplicationControlData(
-                NsApplicationControlSource_Storage,
-                metadata.title_id & 0xFFFFFFFFFFFFFFF0, &appControlData,
-                sizeof(NsApplicationControlData), &appControlDataSize))) {
-          if (R_SUCCEEDED(nsGetApplicationDesiredLanguage(&appControlData.nacp,
-                                                          &languageEntry)) &&
-              languageEntry) {
-            titleStr = languageEntry->name;
-          }
-          versionStr = appControlData.nacp.display_version;
+        u64 acd_app_id = metadata.title_id & 0xFFFFFFFFFFFFFFF0;
+
+        // Primary path: read control.nacp directly via ncm + fs. This works for
+        // Switch 2 Edition titles whose lang_data is DEFLATE-compressed, which
+        // nsGetApplicationControlData(2) + nacpGetLanguageEntry do not handle.
+        {
+            char name_buf[0x200] = {0};
+            if (R_SUCCEEDED(CheatUtils::GetTitleNameForAppId(acd_app_id, name_buf, sizeof(name_buf)))) {
+                titleStr = name_buf;
+            }
+        }
+
+        // Secondary path: legacy ns API. Used only if the ncm path failed; also
+        // recovers display_version when available.
+        {
+            static NsApplicationControlData appControlData;
+            size_t appControlDataSize = 0;
+            NacpLanguageEntry *languageEntry = nullptr;
+            std::memset(&appControlData, 0, sizeof(NsApplicationControlData));
+            if (R_SUCCEEDED(nsGetApplicationControlData(
+                    NsApplicationControlSource_Storage, acd_app_id,
+                    &appControlData, sizeof(NsApplicationControlData),
+                    &appControlDataSize))) {
+                if (titleStr.empty() &&
+                    R_SUCCEEDED(nsGetApplicationDesiredLanguage(
+                        &appControlData.nacp, &languageEntry)) &&
+                    languageEntry) {
+                    titleStr = languageEntry->name;
+                }
+                if (versionStr.empty()) {
+                    versionStr = appControlData.nacp.display_version;
+                }
+            }
         }
 
         if (titleStr.empty()) {
@@ -16830,6 +17046,7 @@ public:
     // Initialize dmntcht and ns
     dmntchtInitialize();
     nsInitialize();
+    ncmInitialize();
 
     // CheckButtons thread removed
   }
@@ -16838,6 +17055,7 @@ public:
     StopSearchWorker();
     dmntchtExit();
     nsExit();
+    ncmExit();
 
     closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
 
@@ -16883,6 +17101,7 @@ public:
     unpackDeviceInfo();
     dmntchtInitialize();
     nsInitialize();
+    ncmInitialize();
 
     // Set settingsInitialized so background event loop can process overlay
     // launch requests
@@ -16899,6 +17118,7 @@ public:
     StopSearchWorker();
     dmntchtExit();
     nsExit();
+    ncmExit();
 
     closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
 
