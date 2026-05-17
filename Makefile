@@ -104,6 +104,10 @@ ifeq ($(strip $(TARGET)),editcheat)
     CFLAGS += -DEDITCHEAT_OVL
 endif
 
+ifeq ($(strip $(TARGET)),bookmark)
+    CFLAGS += -DBOOKMARK_OVL
+endif
+
 # Enable fstream (ideally for other overlays want full fstream instead of FILE*)
 #USING_FSTREAM_DIRECTIVE := 0
 #CFLAGS += -DUSING_FSTREAM_DIRECTIVE=$(USING_FSTREAM_DIRECTIVE)
@@ -274,13 +278,19 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all release full breezehand editcheat
+.PHONY: $(BUILD) clean all release full breezehand editcheat bookmark
 
 #---------------------------------------------------------------------------------
-all: breezehand editcheat
+all: breezehand editcheat bookmark
 
 
 breezehand: $(BUILD)
+
+# Serialize: editcheat and bookmark depend on breezehand so the destructive
+# `rm -rf out/switch` in the breezehand recipe doesn't race with their cp
+# steps when make is run with parallel jobs.
+editcheat: breezehand
+bookmark: breezehand
 
 editcheat:
 	@mkdir -p build_editcheat
@@ -322,6 +332,27 @@ editcheat:
 	@cp build_editcheat/editcheat.ovl out/switch/.overlays/editcheat.ovl
 	@cp build_editcheatk/editcheatk.ovl out/switch/.overlays/editcheatk.ovl
 
+bookmark:
+	@mkdir -p build_bookmark
+	@rm -f bookmark.nacp
+	@$(MAKE) --no-print-directory -C build_bookmark -f $(CURDIR)/Makefile \
+		TARGET=bookmark \
+		BUILD=build_bookmark \
+		APP_TITLE="Bookmark" \
+		APP_VERSION="1.0.0" \
+		APP_JSON= \
+		OUTPUT=bookmark \
+		DEPSDIR=$(CURDIR)/build_bookmark \
+		NROFLAGS= \
+		TOPDIR=$(CURDIR) \
+		USE_KEYSTONE_ASM=0 \
+		KEYSTONE_ROOT=$(CURDIR)/../keystone \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
+		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
+	@mkdir -p out/switch/.overlays/
+	@cp build_bookmark/bookmark.ovl out/switch/.overlays/bookmark.ovl
+
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
@@ -345,6 +376,7 @@ $(BUILD):
 clean:
 	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
 	@rm -fr build_editcheat build_editcheatk editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf editcheatk.ovl editcheatk.nro editcheatk.nacp editcheatk.elf
+	@rm -fr build_bookmark bookmark.ovl bookmark.nro bookmark.nacp bookmark.elf
 
 	@rm -rf out/
 	@rm -f $(TARGET).zip

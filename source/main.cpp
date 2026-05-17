@@ -50,6 +50,7 @@
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <thread>
 #include <utils.hpp>
 #include <cstdarg>
@@ -8398,25 +8399,47 @@ static Result GetAppNameFromStorage(u64 app_id, NcmContentMetaDatabase* db,
 
 // Public entry point: writes the title name for app_id into out_name.
 // Returns 0 on success, non-zero on failure (out_name will be empty).
+//
+// NCM session handles are opened lazily on first use and cached for the
+// lifetime of the process so repeat lookups don't pay the open cost.
+// MUST be explicitly closed by CloseCachedNcmHandles() before ncmExit()
+// in the overlay's exitServices(); without that close the ncm sysmodule
+// continues to track our session objects across rapid overlay process
+// restarts, eventually exhausting its internal slot table.
+static NcmContentStorage g_titleCs[2] = {};
+static NcmContentMetaDatabase g_titleDb[2] = {};
+static const NcmStorageId g_titleIds[2] = {
+    NcmStorageId_SdCard, NcmStorageId_BuiltInUser
+};
+
+void CloseCachedNcmHandles() {
+    for (int i = 0; i < 2; i++) {
+        if (serviceIsActive(&g_titleCs[i].s)) {
+            ncmContentStorageClose(&g_titleCs[i]);
+            g_titleCs[i] = NcmContentStorage{};
+        }
+        if (serviceIsActive(&g_titleDb[i].s)) {
+            ncmContentMetaDatabaseClose(&g_titleDb[i]);
+            g_titleDb[i] = NcmContentMetaDatabase{};
+        }
+    }
+}
+
 Result GetTitleNameForAppId(u64 app_id, char* out_name, size_t out_size) {
     if (!out_name || out_size == 0) {
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
     out_name[0] = '\0';
 
-    static NcmContentStorage s_cs[2];
-    static NcmContentMetaDatabase s_db[2];
-    static const NcmStorageId s_ids[2] = { NcmStorageId_SdCard, NcmStorageId_BuiltInUser };
-
     Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
     for (int i = 0; i < 2; i++) {
-        if (!serviceIsActive(&s_cs[i].s)) {
-            if (R_FAILED(ncmOpenContentStorage(&s_cs[i], s_ids[i]))) continue;
+        if (!serviceIsActive(&g_titleCs[i].s)) {
+            if (R_FAILED(ncmOpenContentStorage(&g_titleCs[i], g_titleIds[i]))) continue;
         }
-        if (!serviceIsActive(&s_db[i].s)) {
-            if (R_FAILED(ncmOpenContentMetaDatabase(&s_db[i], s_ids[i]))) continue;
+        if (!serviceIsActive(&g_titleDb[i].s)) {
+            if (R_FAILED(ncmOpenContentMetaDatabase(&g_titleDb[i], g_titleIds[i]))) continue;
         }
-        rc = GetAppNameFromStorage(app_id, &s_db[i], &s_cs[i], out_name, out_size);
+        rc = GetAppNameFromStorage(app_id, &g_titleDb[i], &g_titleCs[i], out_name, out_size);
         if (R_SUCCEEDED(rc) && out_name[0] != '\0') return rc;
     }
     return rc;
@@ -17055,6 +17078,13 @@ public:
     StopSearchWorker();
     dmntchtExit();
     nsExit();
+    // CRITICAL: Close cached NcmContentStorage / NcmContentMetaDatabase
+    // sessions opened by CheatUtils::GetTitleNameForAppId BEFORE
+    // ncmExit(). Without this, the ncm sysmodule continues to track
+    // those session objects across rapid overlay process restarts,
+    // eventually exhausting its internal slot table and crashing the
+    // next launch of breezehand. (Introduced by commit f6e4ff0c.)
+    CheatUtils::CloseCachedNcmHandles();
     ncmExit();
 
     closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
@@ -17118,6 +17148,13 @@ public:
     StopSearchWorker();
     dmntchtExit();
     nsExit();
+    // CRITICAL: Close cached NcmContentStorage / NcmContentMetaDatabase
+    // sessions opened by CheatUtils::GetTitleNameForAppId BEFORE
+    // ncmExit(). Without this, the ncm sysmodule continues to track
+    // those session objects across rapid overlay process restarts,
+    // eventually exhausting its internal slot table and crashing the
+    // next launch of breezehand. (Introduced by commit f6e4ff0c.)
+    CheatUtils::CloseCachedNcmHandles();
     ncmExit();
 
     closeInterpreterThread(); // just in case ¯\_(ツ)_/¯
@@ -17129,6 +17166,1052 @@ public:
   }
 };
 #endif
+
+#ifdef BOOKMARK_OVL
+// =====================================================================
+// Bookmark Overlay - displays bookmarks created by Breeze
+//
+// Reads Breeze bookmark file format:
+//   sdmc:/switch/breeze/cheats/<TITLE_ID>/<BUILD_ID>(NNN).bmk
+// File starts with BreezeFileHeader_t (magic "BREEZE00E"), then an array
+// of bookmark_t structs (packed). See Breeze: source/action.hpp / bookmark.cpp
+// =====================================================================
+namespace BreezeBookmark {
+
+#define BREEZE_FILEVERSION_LABEL "BREEZE00E"
+#define BREEZE_MAX_POINTER_DEPTH 12
+
+// Mirror of Breeze searchType_t (action.hpp)
+enum BreezeSearchType : u32 {
+  BREEZE_TYPE_U8 = 0,
+  BREEZE_TYPE_S8,
+  BREEZE_TYPE_U16,
+  BREEZE_TYPE_S16,
+  BREEZE_TYPE_U32,
+  BREEZE_TYPE_S32,
+  BREEZE_TYPE_U64,
+  BREEZE_TYPE_S64,
+  BREEZE_TYPE_F32,
+  BREEZE_TYPE_F64,
+  BREEZE_TYPE_POINTER,
+  BREEZE_TYPE_U40,
+};
+
+static const char *const kBreezeTypeNames[] = {"u8",  "s8",  "u16", "s16",
+                                               "u32", "s32", "u64", "s64",
+                                               "flt", "dbl", "ptr", "u40"};
+static const u8 kBreezeTypeSizes[] = {1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 8, 5};
+static const char *const kBreezeHeapNames[] = {"main", "heap", "alias", "aslr",
+                                               "blank"};
+
+struct BreezePointerChain {
+  u64 depth;
+  s64 offset[BREEZE_MAX_POINTER_DEPTH + 1];
+};
+
+// IMPORTANT: Breeze declares bookmark_t with `NX_PACKED` placed BEFORE the
+// `struct` keyword (action.hpp line 190). GCC silently IGNORES that attribute
+// placement and compiles bookmark_t with natural alignment instead. As a
+// result the on-disk record size is 160 bytes, not the 149 a packed layout
+// would produce. We mirror the natural layout exactly here.
+struct BreezeBookmarkEntry {
+  char label[19];               // offset 0
+  // 1 byte pad (offset 19)
+  BreezeSearchType type;        // offset 20  (u32)
+  BreezePointerChain pointer;   // offset 24  (u64 depth + 13 * s64 offset = 112 bytes)
+  u32 heap;                     // offset 136 (MemoryAccessType: 0=Main..4=Blank)
+  bool start_from_main;         // offset 140
+  // 3 bytes pad (offset 141..143)
+  s64 offset;                   // offset 144
+  bool deleted;                 // offset 152
+  // 7 bytes trailing pad (offset 153..159)  -> sizeof = 160
+};
+static_assert(sizeof(BreezePointerChain) == 112,
+              "BreezePointerChain size mismatch");
+static_assert(sizeof(BreezeBookmarkEntry) == 160,
+              "BreezeBookmarkEntry size mismatch (must match Breeze layout)");
+
+// Breeze BreezeFileHeader_t layout. We don't need every field but we need
+// the correct size to seek past it. Mirror the C++ default-init order:
+//   MAGIC[10] = "BREEZE00E"
+//   breezefile_t filetype  (enum -> u32)
+//   prefilename[100]
+//   bfilename[83]
+//   ptr_search_range u16
+//   timetaken u8
+//   bit_mask u8
+//   current_level u8
+//   new_targets u32
+//   from_to_size u64
+//   Search_condition (variable, see below)
+//   DmntCheatProcessMetadata Metadata
+//   bool compressed
+//   bool has_screenshot
+//   u64 dataSize
+//   End[8] = "HEADER@"
+// We can't easily reconstruct sizeof(BreezeFileHeader_t) from scratch since
+// Search_condition embeds fields that may shift with compiler alignment.
+// Instead: read the file, search for the "HEADER@" ending marker that
+// immediately precedes the bookmark data; that's robust across versions.
+constexpr const char *kBreezeHeaderEnd = "HEADER@";
+constexpr size_t kBreezeHeaderEndLen = 8; // includes trailing NUL
+
+// Resolve memory base for given heap type using current process metadata.
+static u64 GetHeapBase(u32 heap, const DmntCheatProcessMetadata &meta) {
+  switch (heap) {
+  case 0: return meta.main_nso_extents.base;
+  case 1: return meta.heap_extents.base;
+  case 2: return meta.alias_extents.base;
+  case 3: return meta.address_space_extents.base;
+  case 4: return 0;
+  default: return meta.main_nso_extents.base;
+  }
+}
+
+// Walk pointer chain to compute final address. Returns true on success.
+static bool ResolveBookmark(const BreezeBookmarkEntry &bm,
+                            const DmntCheatProcessMetadata &meta,
+                            u64 &out_address) {
+  if (bm.deleted) return false;
+  u64 next = GetHeapBase(bm.heap, meta);
+  u64 address = 0;
+  u64 depth = bm.pointer.depth;
+  if (depth > BREEZE_MAX_POINTER_DEPTH) return false;
+  for (s64 z1 = (s64)depth; z1 >= 0; z1--) {
+    int z = bm.start_from_main ? (int)(depth - z1) : (int)z1;
+    next += bm.pointer.offset[z];
+    MemoryInfo mi{};
+    u32 pageinfo = 0;
+    if (R_FAILED(dmntchtQueryCheatProcessMemory(&mi, next))) return false;
+    (void)pageinfo;
+    if (!(mi.perm & Perm_R)) return false;
+    address = next;
+    if (z1 > 0) {
+      u64 tmp = 0;
+      if (R_FAILED(dmntchtReadCheatProcessMemory(next, &tmp, sizeof(u64))))
+        return false;
+      next = tmp;
+    }
+  }
+  out_address = address;
+  return true;
+}
+
+static std::string FormatValue(u64 raw, BreezeSearchType type) {
+  char buf[64];
+  switch (type) {
+  case BREEZE_TYPE_U8:  std::snprintf(buf, sizeof(buf), "%u", (u8)raw); break;
+  case BREEZE_TYPE_S8:  std::snprintf(buf, sizeof(buf), "%d", (s8)raw); break;
+  case BREEZE_TYPE_U16: std::snprintf(buf, sizeof(buf), "%u", (u16)raw); break;
+  case BREEZE_TYPE_S16: std::snprintf(buf, sizeof(buf), "%d", (s16)raw); break;
+  case BREEZE_TYPE_U32: std::snprintf(buf, sizeof(buf), "%u", (u32)raw); break;
+  case BREEZE_TYPE_S32: std::snprintf(buf, sizeof(buf), "%d", (s32)raw); break;
+  case BREEZE_TYPE_U64: std::snprintf(buf, sizeof(buf), "%lu", (u64)raw); break;
+  case BREEZE_TYPE_S64: std::snprintf(buf, sizeof(buf), "%ld", (s64)raw); break;
+  case BREEZE_TYPE_F32: {
+    float f; std::memcpy(&f, &raw, sizeof(f));
+    std::snprintf(buf, sizeof(buf), "%g", f); break;
+  }
+  case BREEZE_TYPE_F64: {
+    double d; std::memcpy(&d, &raw, sizeof(d));
+    std::snprintf(buf, sizeof(buf), "%g", d); break;
+  }
+  case BREEZE_TYPE_POINTER: std::snprintf(buf, sizeof(buf), "0x%016lX", raw);
+    break;
+  default: std::snprintf(buf, sizeof(buf), "0x%lX", raw); break;
+  }
+  return std::string(buf);
+}
+
+// Format basestr() style prefix for absolute address relative to a known base.
+static std::string BaseStr(u64 address, const DmntCheatProcessMetadata &meta) {
+  if (address >= meta.main_nso_extents.base &&
+      address < meta.main_nso_extents.base + meta.main_nso_extents.size)
+    return "M+";
+  if (address >= meta.heap_extents.base &&
+      address < meta.heap_extents.base + meta.heap_extents.size)
+    return "H+";
+  if (address >= meta.alias_extents.base &&
+      address < meta.alias_extents.base + meta.alias_extents.size)
+    return "A+";
+  return "";
+}
+static u64 BaseOffset(u64 address, const DmntCheatProcessMetadata &meta) {
+  if (address >= meta.main_nso_extents.base &&
+      address < meta.main_nso_extents.base + meta.main_nso_extents.size)
+    return address - meta.main_nso_extents.base;
+  if (address >= meta.heap_extents.base &&
+      address < meta.heap_extents.base + meta.heap_extents.size)
+    return address - meta.heap_extents.base;
+  if (address >= meta.alias_extents.base &&
+      address < meta.alias_extents.base + meta.alias_extents.size)
+    return address - meta.alias_extents.base;
+  return address;
+}
+
+// Read bookmark file: locate "HEADER@" then read packed bookmark_t array.
+static bool ReadBookmarkFile(const std::string &path,
+                             std::vector<BreezeBookmarkEntry> &out) {
+  out.clear();
+  FILE *fp = std::fopen(path.c_str(), "rb");
+  if (!fp) return false;
+  std::fseek(fp, 0, SEEK_END);
+  long fsize = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  if (fsize <= (long)kBreezeHeaderEndLen) {
+    std::fclose(fp);
+    return false;
+  }
+  // Read into memory (typical bookmark files are small, a few KB-MB).
+  std::vector<u8> data(fsize);
+  if (std::fread(data.data(), 1, fsize, fp) != (size_t)fsize) {
+    std::fclose(fp);
+    return false;
+  }
+  std::fclose(fp);
+
+  // Verify magic.
+  if (std::memcmp(data.data(), BREEZE_FILEVERSION_LABEL,
+                  std::strlen(BREEZE_FILEVERSION_LABEL)) != 0)
+    return false;
+
+  // Locate "HEADER@" + NUL within first ~4KB to find end-of-header.
+  long headerEnd = -1;
+  long searchLimit = std::min<long>(fsize - (long)kBreezeHeaderEndLen, 0x2000);
+  for (long i = std::strlen(BREEZE_FILEVERSION_LABEL); i <= searchLimit; i++) {
+    if (std::memcmp(data.data() + i, kBreezeHeaderEnd, kBreezeHeaderEndLen) ==
+        0) {
+      headerEnd = i + (long)kBreezeHeaderEndLen;
+      break;
+    }
+  }
+  if (headerEnd < 0) return false;
+  long bodySize = fsize - headerEnd;
+  if (bodySize <= 0) return true; // empty bookmark file, valid header
+  const size_t entrySize = sizeof(BreezeBookmarkEntry);
+  size_t n = (size_t)bodySize / entrySize;
+  if (n == 0) return true;
+  out.resize(n);
+  std::memcpy(out.data(), data.data() + headerEnd, n * entrySize);
+  return true;
+}
+
+// Build per-game bookmark directory.
+static std::string GameBookmarkDir() {
+  return std::string("sdmc:/switch/breeze/cheats/") +
+         CheatUtils::GetTitleIdString() + "/";
+}
+
+// Build path to a specific bookmark file. fileNo: -1 = default (no suffix),
+// otherwise (NNN) zero-padded suffix.
+static std::string BookmarkFilePath(int fileNo) {
+  std::string p = GameBookmarkDir();
+  p += CheatUtils::GetBuildIdString().substr(0, 16);
+  if (fileNo >= 0) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "(%03d)", fileNo);
+    p += buf;
+  }
+  p += ".bmk";
+  return p;
+}
+
+// List existing bookmark file numbers for this game.
+static std::vector<int> ListBookmarkFiles() {
+  std::vector<int> out;
+  std::string dir = GameBookmarkDir();
+  std::string bidPrefix = CheatUtils::GetBuildIdString().substr(0, 16);
+  DIR *d = opendir(dir.c_str());
+  if (!d) return out;
+  struct dirent *e;
+  while ((e = readdir(d)) != nullptr) {
+    std::string name = e->d_name;
+    if (name.size() < bidPrefix.size() + 4) continue;
+    if (name.substr(0, bidPrefix.size()) != bidPrefix) continue;
+    if (name.substr(name.size() - 4) != ".bmk") continue;
+    // Look for "(NNN)" between prefix and ".bmk"
+    std::string mid = name.substr(bidPrefix.size(),
+                                  name.size() - bidPrefix.size() - 4);
+    if (mid.empty()) {
+      out.push_back(-1);
+    } else if (mid.size() == 5 && mid.front() == '(' && mid.back() == ')') {
+      int n = std::atoi(mid.c_str() + 1);
+      out.push_back(n);
+    }
+  }
+  closedir(d);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+} // namespace BreezeBookmark
+
+// Forward declarations
+class BookmarkMenu;
+class BookmarkMonitorMenu;
+
+// Shared state for live bookmark display. Held in static storage so a
+// monitor-mode swap (or hide/show by the system) does not lose it.
+struct BookmarkUiState {
+  int fileNo = -1;
+  std::vector<int> fileList;
+  size_t fileListIdx = 0;
+  std::vector<BreezeBookmark::BreezeBookmarkEntry> entries;
+  // Per-entry selection state. Sized in lockstep with entries.
+  std::vector<bool> selected;
+  DmntCheatProcessMetadata metadata{};
+  // mtime of the bookmark file at the moment its entries were loaded.
+  // Used to invalidate persisted selection if the user edits the file in
+  // Breeze.
+  time_t entriesMTime = 0;
+
+  // -----------------------------------------------------------------
+  // Monitor-mode display settings. Persisted to ini so they survive
+  // overlay restarts. Defaults match the previous hard-coded values.
+  // -----------------------------------------------------------------
+  // Indices into kMonitorColors[]: white (default), black, red, green, blue.
+  int monitorColorIdx = 0;
+  // Indices into kMonitorFontSizes[]: 12, 14, 16, 18, 20, 24, 28
+  int monitorFontSizeIdx = 2; // 16px default
+};
+static BookmarkUiState g_bmState;
+// True while a BookmarkMonitorMenu instance is the active Gui. Used by
+// BookmarkOverlay::onShow() to detect re-summon while in monitor mode.
+std::atomic<bool> g_bmInMonitor{false};
+// Page offset to apply to the next BookmarkMenu instance, set by L/R
+// page navigation before swapTo<BookmarkMenu>. Reset back to 0 after
+// being consumed in the constructor.
+static size_t g_bmState_pageOffsetHint = 0;
+
+// Monitor-mode color palette + label table (D-pad Left/Right cycle).
+struct MonitorColor {
+  const char *name;
+  tsl::Color color;
+};
+static const MonitorColor kMonitorColors[] = {
+    {"white", {0xF, 0xF, 0xF, 0xF}},
+    {"black", {0x0, 0x0, 0x0, 0xF}},
+    {"red",   {0xF, 0x2, 0x2, 0xF}},
+    {"green", {0x2, 0xF, 0x2, 0xF}},
+    {"blue",  {0x4, 0x8, 0xF, 0xF}},
+};
+constexpr int kMonitorColorCount =
+    (int)(sizeof(kMonitorColors) / sizeof(kMonitorColors[0]));
+
+// Monitor-mode font sizes (D-pad Up/Down cycle).
+static const int kMonitorFontSizes[] = {12, 14, 16, 18, 20, 24, 28};
+constexpr int kMonitorFontSizeCount =
+    (int)(sizeof(kMonitorFontSizes) / sizeof(kMonitorFontSizes[0]));
+
+// -----------------------------------------------------------------------
+// Format helpers shared by both menus.
+// -----------------------------------------------------------------------
+static std::string FormatBookmarkValueLine(
+    const BreezeBookmark::BreezeBookmarkEntry &bm,
+    const DmntCheatProcessMetadata &meta, bool includeAddr) {
+  u64 addr = 0;
+  bool ok = BreezeBookmark::ResolveBookmark(bm, meta, addr);
+  u64 raw = 0;
+  bool readOk = false;
+  if (ok) {
+    readOk = R_SUCCEEDED(
+        dmntchtReadCheatProcessMemory(addr, &raw, sizeof(u64)));
+  }
+  const char *typeName =
+      ((u32)bm.type < (sizeof(BreezeBookmark::kBreezeTypeNames) /
+                       sizeof(BreezeBookmark::kBreezeTypeNames[0])))
+          ? BreezeBookmark::kBreezeTypeNames[bm.type]
+          : "?";
+  std::string valueStr =
+      ok && readOk ? BreezeBookmark::FormatValue(raw, bm.type) : "-";
+  if (!includeAddr) {
+    return std::string(typeName) + "=" + valueStr;
+  }
+  std::string addrStr;
+  if (ok) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%lX",
+                  BreezeBookmark::BaseOffset(addr, meta));
+    addrStr = BreezeBookmark::BaseStr(addr, meta) + b;
+  } else {
+    addrStr = "unresolved";
+  }
+  return std::string("[") + addrStr + "] " + typeName + "=" + valueStr;
+}
+
+static std::string BookmarkLabel(
+    const BreezeBookmark::BreezeBookmarkEntry &bm) {
+  char labelBuf[20];
+  std::memcpy(labelBuf, bm.label, 19);
+  labelBuf[19] = 0;
+  std::string label = labelBuf[0] ? labelBuf : "(no label)";
+  if (bm.deleted) label = std::string("[del] ") + label;
+  return label;
+}
+
+// -----------------------------------------------------------------------
+// Selection persistence.
+// Stored in:
+//   sdmc:/config/breezehand/bookmark_selection.ini
+// Section name: the bookmark file's full sdmc path.
+// Keys per section:
+//   mtime  = decimal time_t of file's mtime when selection was saved.
+//   sel    = a bitstring (one char per entry, '1' or '0'), MSB = entry 0.
+// On load, if mtime mismatches the file's current mtime, the saved
+// selection is discarded and all entries start unselected.
+// -----------------------------------------------------------------------
+namespace BookmarkSelection {
+constexpr const char *kIniPath =
+    "sdmc:/config/breezehand/bookmark_selection.ini";
+
+static time_t FileMTime(const std::string &path) {
+  struct stat st{};
+  if (stat(path.c_str(), &st) != 0) return 0;
+  return st.st_mtime;
+}
+
+static std::string BitString(const std::vector<bool> &v) {
+  std::string s;
+  s.reserve(v.size());
+  for (bool b : v) s.push_back(b ? '1' : '0');
+  return s;
+}
+
+static void ApplyBitString(const std::string &s, std::vector<bool> &v) {
+  for (size_t i = 0; i < v.size() && i < s.size(); i++) {
+    v[i] = (s[i] == '1');
+  }
+}
+
+// Load saved selection for `path` into `out` (resized to entryCount).
+// Returns true if the persisted entry matched mtime and was applied.
+static bool Load(const std::string &path, time_t currentMTime,
+                 size_t entryCount, std::vector<bool> &out) {
+  out.assign(entryCount, false);
+  std::string mtimeStr =
+      ult::parseValueFromIniSection(kIniPath, path, "mtime");
+  if (mtimeStr.empty()) return false;
+  time_t savedMTime =
+      static_cast<time_t>(std::strtoll(mtimeStr.c_str(), nullptr, 10));
+  if (savedMTime != currentMTime) return false;
+  std::string sel = ult::parseValueFromIniSection(kIniPath, path, "sel");
+  if (sel.empty()) return false;
+  ApplyBitString(sel, out);
+  return true;
+}
+
+// Persist selection for `path` (with `mtime`).
+static void Save(const std::string &path, time_t mtime,
+                 const std::vector<bool> &v) {
+  // Ensure parent directory exists.
+  ult::createDirectory("sdmc:/config/breezehand/");
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%lld", (long long)mtime);
+  ult::setIniFileValue(kIniPath, path, "mtime", buf);
+  ult::setIniFileValue(kIniPath, path, "sel", BitString(v));
+}
+
+// -------------------------------------------------------------------
+// Global monitor-mode display settings (color + font size). Stored
+// under a fixed [settings] section in the same ini so they persist
+// across overlay restarts independent of which bookmark file is open.
+// -------------------------------------------------------------------
+constexpr const char *kSettingsSection = "settings";
+
+static void LoadDisplaySettings() {
+  std::string colorStr =
+      ult::parseValueFromIniSection(kIniPath, kSettingsSection, "color_idx");
+  std::string fontStr =
+      ult::parseValueFromIniSection(kIniPath, kSettingsSection, "font_idx");
+  if (!colorStr.empty()) {
+    int v = std::atoi(colorStr.c_str());
+    if (v >= 0 && v < kMonitorColorCount) g_bmState.monitorColorIdx = v;
+  }
+  if (!fontStr.empty()) {
+    int v = std::atoi(fontStr.c_str());
+    if (v >= 0 && v < kMonitorFontSizeCount) g_bmState.monitorFontSizeIdx = v;
+  }
+}
+
+static void SaveDisplaySettings() {
+  ult::createDirectory("sdmc:/config/breezehand/");
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%d", g_bmState.monitorColorIdx);
+  ult::setIniFileValue(kIniPath, kSettingsSection, "color_idx", buf);
+  std::snprintf(buf, sizeof(buf), "%d", g_bmState.monitorFontSizeIdx);
+  ult::setIniFileValue(kIniPath, kSettingsSection, "font_idx", buf);
+}
+} // namespace BookmarkSelection
+
+// =====================================================================
+// Normal bookmark menu - lists every entry as a cheat-style toggle row
+// with two-line display (label / address + type + value). Selection is
+// persisted to ini keyed on file path + mtime so it survives overlay
+// restarts as long as Breeze hasn't rewritten the bookmark file.
+// =====================================================================
+class BookmarkMenu : public tsl::Gui {
+  tsl::elm::List *m_list = nullptr;
+  tsl::elm::HeaderOverlayFrame *m_frame = nullptr;
+  // Per-entry ListItem pointer for live updates - holds the items
+  // currently rendered on the visible page only (size <= kPageSize).
+  // Parallel to m_pageEntryIndex which maps page position to the global
+  // index into g_bmState.entries.
+  std::vector<tsl::elm::ToggleListItem *> m_entryItems;
+  std::vector<size_t> m_pageEntryIndex;
+  // Throttle for value refresh.
+  u32 m_refreshTick = 0;
+  // Resolved path of the currently-loaded bookmark file (used as ini
+  // section key for selection persistence).
+  std::string m_filePath;
+  // Cached preview text for the header. Recomputed in update() at the
+  // same low rate as list refresh so the per-frame draw is allocation-
+  // free (no dmnt service calls in the renderer's hot path).
+  std::vector<std::string> m_previewLines;
+  // Current page offset (global index of the first visible entry).
+  // Pagination is necessary because bookmark files can contain thousands
+  // of entries (e.g. pointer-search results) and creating a Tesla
+  // ToggleListItem + initial dmnt resolve for every one of them at
+  // createUI() time is what made the bookmark menu slow to open.
+  size_t m_pageOffset = 0;
+  static constexpr size_t kPageSize = 10;
+
+public:
+  BookmarkMenu(int fileNo = -1) {
+    // Pick up a pending page offset from a previous L/R press (then
+    // clear it so the next plain navigation starts at page 0).
+    m_pageOffset = g_bmState_pageOffsetHint;
+    g_bmState_pageOffsetHint = 0;
+
+    dmntchtGetCheatProcessMetadata(&g_bmState.metadata);
+    g_bmState.fileList = BreezeBookmark::ListBookmarkFiles();
+    if (g_bmState.fileList.empty()) {
+      g_bmState.fileList.push_back(-1);
+    }
+    // Load persisted monitor-mode display settings (color + font size).
+    BookmarkSelection::LoadDisplaySettings();
+    // Prefer lowest non-negative file number (Breeze defaults to (000)).
+    if (fileNo == -1) {
+      bool found = false;
+      for (size_t i = 0; i < g_bmState.fileList.size(); i++) {
+        if (g_bmState.fileList[i] >= 0) {
+          g_bmState.fileListIdx = i;
+          g_bmState.fileNo = g_bmState.fileList[i];
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        g_bmState.fileListIdx = 0;
+        g_bmState.fileNo = g_bmState.fileList[0];
+      }
+    } else {
+      g_bmState.fileListIdx = 0;
+      for (size_t i = 0; i < g_bmState.fileList.size(); i++) {
+        if (g_bmState.fileList[i] == fileNo) {
+          g_bmState.fileListIdx = i;
+          break;
+        }
+      }
+      g_bmState.fileNo = g_bmState.fileList[g_bmState.fileListIdx];
+    }
+  }
+
+  void loadFile() {
+    m_filePath = BreezeBookmark::BookmarkFilePath(g_bmState.fileNo);
+    g_bmState.entriesMTime = BookmarkSelection::FileMTime(m_filePath);
+    BreezeBookmark::ReadBookmarkFile(m_filePath, g_bmState.entries);
+    // Restore persisted selection if mtime matches; otherwise reset.
+    BookmarkSelection::Load(m_filePath, g_bmState.entriesMTime,
+                            g_bmState.entries.size(), g_bmState.selected);
+  }
+
+  std::string titleString() const {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Bookmark(%d) [%zu]", g_bmState.fileNo,
+                  g_bmState.entries.size());
+    return buf;
+  }
+
+  // Persist current selection state to ini.
+  void persistSelection() const {
+    if (m_filePath.empty()) return;
+    BookmarkSelection::Save(m_filePath, g_bmState.entriesMTime,
+                            g_bmState.selected);
+  }
+
+  // Rebuild the cached preview text (up to kPreviewMax selected entries).
+  // Called at the same low rate as the list refresh - the header
+  // CustomDrawer reads from this cache so the per-frame draw is free of
+  // dmnt service calls and allocations.
+  void rebuildPreviewLines() {
+    m_previewLines.clear();
+    int shown = 0;
+    for (size_t i = 0; i < g_bmState.entries.size() && shown < kPreviewMax;
+         i++) {
+      if (i < g_bmState.selected.size() && g_bmState.selected[i]) {
+        m_previewLines.push_back(
+            BookmarkLabel(g_bmState.entries[i]) + ": " +
+            FormatBookmarkValueLine(g_bmState.entries[i],
+                                    g_bmState.metadata, false));
+        shown++;
+      }
+    }
+  }
+
+  // Number of selected entries to preview in the header (sample of how
+  // the monitor-mode HUD will look).
+  static constexpr int kPreviewMax = 3;
+  // Vertical pixels reserved for the header (replaces the standard
+  // Breezehand title bar). Sized to fit kPreviewMax lines at the largest
+  // supported font + a small caption.
+  static constexpr u16 kHeaderHeight = 175;
+
+  virtual tsl::elm::Element *createUI() override {
+    loadFile();
+    rebuildPreviewLines();
+
+    // Custom header that previews the first kPreviewMax selected entries
+    // in the current monitor-mode font + color, so the user can dial in
+    // their look-and-feel from the bookmark menu. The actual strings are
+    // built once per refresh tick by rebuildPreviewLines() and cached in
+    // m_previewLines so this render lambda is allocation-free.
+    auto *header = new tsl::elm::CustomDrawer(
+        [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+          (void)x; (void)y; (void)w; (void)h;
+          const int fontSize =
+              kMonitorFontSizes[g_bmState.monitorFontSizeIdx];
+          const tsl::Color &col =
+              kMonitorColors[g_bmState.monitorColorIdx].color;
+          const s32 lineH = fontSize + 4;
+
+          // Caption with current settings hint.
+          char caption[96];
+          std::snprintf(caption, sizeof(caption),
+                        "Preview  \u2190\u2192 color: %s   "
+                        "\u2191\u2193 size: %dpx",
+                        kMonitorColors[g_bmState.monitorColorIdx].name,
+                        fontSize);
+          r->drawString(std::string(caption), false, 30, 30, 16,
+                        tsl::Color{0xA, 0xA, 0xA, 0xF});
+
+          // Up to kPreviewMax cached selected entries rendered in monitor
+          // style. Cache is refreshed by update() at low frequency.
+          s32 yy = 30 + 22;
+          for (const auto &line : m_previewLines) {
+            r->drawString(line, false, 30, yy, fontSize, col);
+            yy += lineH;
+          }
+          if (m_previewLines.empty()) {
+            r->drawString(std::string("(no bookmarks selected)"), false, 30,
+                          yy, 16, tsl::Color{0x6, 0x6, 0x6, 0xF});
+          }
+        });
+
+    auto *frame = new tsl::elm::HeaderOverlayFrame(kHeaderHeight);
+    frame->setHeader(header);
+    m_frame = frame;
+    m_list = new tsl::elm::List();
+    // Header / instructions
+    m_list->addItem(new tsl::elm::CategoryHeader(
+        "A: select  +: monitor  D-pad: color/size  B: back"));
+
+    // File switcher (only show if more than 1 file exists).
+    if (g_bmState.fileList.size() > 1) {
+      auto *switcher = new tsl::elm::ListItem("Next bookmark file");
+      char val[24];
+      std::snprintf(val, sizeof(val), "%zu / %zu", g_bmState.fileListIdx + 1,
+                    g_bmState.fileList.size());
+      switcher->setValue(val);
+      switcher->setClickListener([this](u64 keys) {
+        if (keys & KEY_A) {
+          // Save current selection before switching files.
+          persistSelection();
+          g_bmState.fileListIdx =
+              (g_bmState.fileListIdx + 1) % g_bmState.fileList.size();
+          int next = g_bmState.fileList[g_bmState.fileListIdx];
+          // swapTo (not changeTo) replaces the current Gui instead of
+          // pushing - prevents the Gui stack from growing unboundedly
+          // each time the user cycles files.
+          tsl::swapTo<BookmarkMenu>(next);
+          return true;
+        }
+        return false;
+      });
+      m_list->addItem(switcher);
+    }
+
+    m_list->addItem(new tsl::elm::CategoryHeader("Entries"));
+
+    m_entryItems.clear();
+    m_pageEntryIndex.clear();
+    if (g_bmState.entries.empty()) {
+      auto *empty = new tsl::elm::ListItem("No bookmarks");
+      empty->setClickListener([](u64) { return false; });
+      m_list->addItem(empty);
+    } else {
+      const u8 kFontSize = 16;
+
+      // Clamp page offset in case the file shrank between visits.
+      if (m_pageOffset >= g_bmState.entries.size()) {
+        m_pageOffset = 0;
+      }
+      const size_t pageEnd =
+          std::min(m_pageOffset + kPageSize, g_bmState.entries.size());
+
+      // Page navigation header: shows page X / Y and total count.
+      {
+        const size_t totalPages =
+            (g_bmState.entries.size() + kPageSize - 1) / kPageSize;
+        const size_t currentPage = (m_pageOffset / kPageSize) + 1;
+        char hdr[96];
+        std::snprintf(hdr, sizeof(hdr),
+                      "Page %zu / %zu  (entries %zu-%zu of %zu)  L/R: page",
+                      currentPage, totalPages == 0 ? 1 : totalPages,
+                      m_pageOffset + 1, pageEnd, g_bmState.entries.size());
+        m_list->addItem(new tsl::elm::CategoryHeader(hdr));
+      }
+
+      for (size_t i = m_pageOffset; i < pageEnd; i++) {
+        const auto &bm = g_bmState.entries[i];
+        const bool sel = i < g_bmState.selected.size() && g_bmState.selected[i];
+
+        // Match the look of cheat rows: ToggleListItem with left checkbox,
+        // label on the first line, and the address/type/value on the
+        // second line via setNote(). Compact font keeps two lines short.
+        auto *item =
+            new tsl::elm::ToggleListItem(BookmarkLabel(bm), sel, "", "", true);
+        item->setUseLeftBox(true);
+        item->setFontSize(kFontSize);
+        item->setUseWrapping(true);
+        item->setNote(FormatBookmarkValueLine(bm, g_bmState.metadata, true));
+        item->setStateChangedListener([i, this](bool state) {
+          if (i < g_bmState.selected.size()) {
+            g_bmState.selected[i] = state;
+            persistSelection();
+            // Refresh preview immediately so the header reflects the new
+            // selection without waiting for the next refresh tick.
+            rebuildPreviewLines();
+          }
+        });
+        m_list->addItem(item);
+        m_entryItems.push_back(item);
+        m_pageEntryIndex.push_back(i);
+      }
+    }
+
+    frame->setContent(m_list);
+    return frame;
+  }
+
+  // Called by the framework every frame; refresh live values.
+  virtual void update() override {
+    // Throttle to ~5Hz (every 12 frames at 60fps) to limit dmntcht
+    // traffic and heap churn from std::string churn in setNote().
+    if ((++m_refreshTick % 12) != 0) return;
+    // Refresh only entries on the currently visible page. m_pageEntryIndex
+    // maps page-row -> global entry index in g_bmState.entries.
+    for (size_t row = 0;
+         row < m_entryItems.size() && row < m_pageEntryIndex.size(); row++) {
+      const size_t i = m_pageEntryIndex[row];
+      if (i >= g_bmState.entries.size()) continue;
+      m_entryItems[row]->setNote(
+          FormatBookmarkValueLine(g_bmState.entries[i], g_bmState.metadata,
+                                  true));
+    }
+    rebuildPreviewLines();
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysHeld;
+    (void)leftJoyStick;
+    (void)rightJoyStick;
+
+    // D-pad Left/Right: cycle preview text color.
+    if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
+      int step = (keysDown & KEY_DRIGHT) ? 1 : -1;
+      g_bmState.monitorColorIdx =
+          (g_bmState.monitorColorIdx + step + kMonitorColorCount) %
+          kMonitorColorCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    // D-pad Up/Down: cycle preview font size.
+    if (keysDown & (KEY_DUP | KEY_DDOWN)) {
+      int step = (keysDown & KEY_DDOWN) ? -1 : 1;
+      g_bmState.monitorFontSizeIdx =
+          (g_bmState.monitorFontSizeIdx + step + kMonitorFontSizeCount) %
+          kMonitorFontSizeCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+
+    // L / R: page navigation. With thousands of entries in a bookmark
+    // file, the menu only renders kPageSize entries at a time. L flips
+    // to the previous page, R flips to the next page. The list is
+    // rebuilt via swapTo<BookmarkMenu> so the existing UI machinery
+    // handles focus / scroll reset cleanly.
+    if (keysDown & (KEY_L | KEY_R)) {
+      if (g_bmState.entries.empty()) return true;
+      persistSelection();
+      const size_t total = g_bmState.entries.size();
+      const size_t maxOffset =
+          ((total + kPageSize - 1) / kPageSize) * kPageSize;
+      size_t newOffset = m_pageOffset;
+      if (keysDown & KEY_R) {
+        newOffset += kPageSize;
+        if (newOffset >= total) newOffset = 0; // wrap to first page
+      } else {
+        if (newOffset == 0) {
+          // wrap to last page
+          newOffset =
+              (total == 0) ? 0 : (((total - 1) / kPageSize) * kPageSize);
+        } else {
+          newOffset = (newOffset >= kPageSize) ? newOffset - kPageSize : 0;
+        }
+      }
+      (void)maxOffset;
+      // Persist desired page across the rebuild via a static.
+      static size_t s_pendingOffset = 0;
+      s_pendingOffset = newOffset;
+      // Stash on this instance so swapTo's fresh BookmarkMenu picks it up
+      // through the global state (simplest, no constructor changes).
+      g_bmState_pageOffsetHint = newOffset;
+      tsl::swapTo<BookmarkMenu>(g_bmState.fileNo);
+      return true;
+    }
+
+    // KEY_PLUS: enter monitor mode. Only meaningful if at least one entry
+    // is selected; otherwise show a hint via notification.
+    if (keysDown & KEY_PLUS) {
+      bool any = false;
+      for (bool s : g_bmState.selected) {
+        if (s) { any = true; break; }
+      }
+      if (!any) {
+        if (tsl::notification) {
+          tsl::notification->show("Select bookmarks with A first");
+        }
+        return true;
+      }
+      // Ensure latest selection is saved before switching modes.
+      persistSelection();
+      tsl::changeTo<BookmarkMonitorMenu>();
+      return true;
+    }
+
+    // KEY_B: persist + return to breezehand.ovl. Guard against
+    // spam-presses so multiple launches don't queue up.
+    if (keysDown & KEY_B) {
+      static std::atomic<bool> s_exitRequested{false};
+      if (s_exitRequested.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+      }
+      persistSelection();
+      std::string path = "sdmc:/switch/.overlays/breezehand.ovl";
+      std::string args = "";
+      std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
+      ult::requestedOverlayPath = path;
+      ult::requestedOverlayArgs = args;
+      ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
+                           ult::ULTRAHAND_PROJECT_NAME, ult::IN_OVERLAY_STR,
+                           ult::TRUE_STR);
+      ult::overlayLaunchRequested.store(true, std::memory_order_release);
+      return true;
+    }
+    return false;
+  }
+};
+
+// =====================================================================
+// Monitor mode menu - fully transparent overlay that only displays the
+// currently selected bookmarks (one line each: "label: value"). Color
+// and font size are taken from g_bmState (D-pad Left/Right cycles
+// colour, Up/Down cycles font size). All other input is ignored. The
+// Switch HOME button and the overlay launch combo are handled at the
+// system level and will hide the overlay; when it is re-summoned,
+// BookmarkOverlay::onShow() returns us to the normal BookmarkMenu (so
+// the user is always "back at normal mode" on re-summon).
+// =====================================================================
+class BookmarkMonitorMenu : public tsl::Gui {
+  // Live values updated by update().
+  struct LiveEntry {
+    std::string label;
+    std::string value;
+  };
+  std::vector<LiveEntry> m_lines;
+  u32 m_refreshTick = 0;
+  static constexpr s32 kMarginX = 24;
+  static constexpr s32 kMarginY = 24;
+
+public:
+  BookmarkMonitorMenu() {
+    rebuildLines();
+    g_bmInMonitor.store(true, std::memory_order_release);
+    // Hand controller input back to the running game so the player can
+    // keep playing while watching live bookmark values. The launch combo
+    // and HOME button are still picked up by libtesla's system thread
+    // (they go through hidsys aruid=0, which we leave enabled), so the
+    // user can still hide the overlay normally.
+    tsl::hlp::requestForeground(false);
+  }
+  virtual ~BookmarkMonitorMenu() {
+    // Reclaim input before any other Gui (or the breezehand overlay
+    // launched on exit) becomes active.
+    tsl::hlp::requestForeground(true);
+    g_bmInMonitor.store(false, std::memory_order_release);
+  }
+
+  void rebuildLines() {
+    m_lines.clear();
+    for (size_t i = 0; i < g_bmState.entries.size(); i++) {
+      if (i < g_bmState.selected.size() && g_bmState.selected[i]) {
+        LiveEntry e;
+        e.label = BookmarkLabel(g_bmState.entries[i]);
+        e.value = FormatBookmarkValueLine(g_bmState.entries[i],
+                                          g_bmState.metadata, false);
+        m_lines.push_back(std::move(e));
+      }
+    }
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *drawer = new tsl::elm::CustomDrawer(
+        [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+          (void)x; (void)y; (void)w; (void)h;
+          // Make the overlay layer fully transparent so the game shows
+          // through (4-bit channels: alpha 0 == fully transparent).
+          r->fillScreen(tsl::Color{0x0, 0x0, 0x0, 0x0});
+
+          if (m_lines.empty()) return;
+
+          const int fontSize =
+              kMonitorFontSizes[g_bmState.monitorFontSizeIdx];
+          const tsl::Color &col =
+              kMonitorColors[g_bmState.monitorColorIdx].color;
+          const s32 lineH = fontSize + 4;
+
+          s32 yy = kMarginY;
+          for (const auto &e : m_lines) {
+            std::string text = e.label + ": " + e.value;
+            r->drawString(text, false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+          }
+        });
+    return drawer;
+  }
+
+  virtual void update() override {
+    if ((++m_refreshTick % 12) != 0) return;
+    // Recompute values only (labels are static once selection is fixed).
+    size_t idx = 0;
+    for (size_t i = 0; i < g_bmState.entries.size(); i++) {
+      if (i < g_bmState.selected.size() && g_bmState.selected[i]) {
+        if (idx < m_lines.size()) {
+          m_lines[idx].value = FormatBookmarkValueLine(
+              g_bmState.entries[i], g_bmState.metadata, false);
+        }
+        idx++;
+      }
+    }
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysHeld;
+    (void)leftJoyStick;
+    (void)rightJoyStick;
+    // D-pad adjusts color/font live so the user can fine-tune from
+    // monitor mode too. (D-pad input still reaches the game because we
+    // called requestForeground(false) in the ctor.)
+    if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
+      int step = (keysDown & KEY_DRIGHT) ? 1 : -1;
+      g_bmState.monitorColorIdx =
+          (g_bmState.monitorColorIdx + step + kMonitorColorCount) %
+          kMonitorColorCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    if (keysDown & (KEY_DUP | KEY_DDOWN)) {
+      int step = (keysDown & KEY_DDOWN) ? -1 : 1;
+      g_bmState.monitorFontSizeIdx =
+          (g_bmState.monitorFontSizeIdx + step + kMonitorFontSizeCount) %
+          kMonitorFontSizeCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    // Everything else is ignored in monitor mode. The launch combo and
+    // HOME button are intercepted by the libtesla system thread.
+    return true;
+  }
+};
+
+class BookmarkOverlay : public tsl::Overlay {
+public:
+  virtual void onShow() override {
+    // Re-summoning the overlay while a monitor-mode Gui is on top returns
+    // us to the normal bookmark list. The system hides the overlay when
+    // the user presses the launch combo; show() is invoked when they hit
+    // it again. dynamic_cast is unavailable (RTTI disabled), so we rely on
+    // a global flag set by BookmarkMonitorMenu's ctor/dtor.
+    extern std::atomic<bool> g_bmInMonitor;
+    if (!g_bmInMonitor.load(std::memory_order_acquire)) return;
+    // Only pop if there is something underneath (BookmarkMenu) so we
+    // don't accidentally close the overlay if the stack got disturbed.
+    auto *ovl = tsl::Overlay::get();
+    if (ovl == nullptr) return;
+    // tsl::Overlay exposes the Gui stack only through getCurrentGui();
+    // since we always changeTo<BookmarkMonitorMenu>() from BookmarkMenu,
+    // stack size is >= 2 here in normal operation. tsl::goBack() will
+    // also self-protect by calling hide() instead if it would empty.
+    tsl::goBack();
+  }
+  virtual void onHide() override {}
+
+  virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
+    initializeSettingsAndDirectories();
+    return std::make_unique<BookmarkMenu>(-1);
+  }
+
+  virtual void initServices() override {
+    initializeSettingsAndDirectories();
+    deleteFileOrDirectory(RELOADING_FLAG_FILEPATH);
+    unpackDeviceInfo();
+    dmntchtInitialize();
+    nsInitialize();
+    ncmInitialize();
+    ult::settingsInitialized.store(true, std::memory_order_release);
+    // Defensive: ensure monitor-mode flag starts clear, in case static
+    // storage somehow survived a previous launch.
+    g_bmInMonitor.store(false, std::memory_order_release);
+  }
+
+  virtual void exitServices() override {
+    // Reclaim input in case the user exited the overlay while
+    // BookmarkMonitorMenu's destructor was bypassed.
+    if (g_bmInMonitor.load(std::memory_order_acquire)) {
+      tsl::hlp::requestForeground(true);
+      g_bmInMonitor.store(false, std::memory_order_release);
+    }
+    dmntchtExit();
+    nsExit();
+    // Bookmark.ovl doesn't itself call GetTitleNameForAppId, but be
+    // defensive: close any cached handles before ncmExit() in case
+    // future code adds a call here.
+    CheatUtils::CloseCachedNcmHandles();
+    ncmExit();
+    closeInterpreterThread();
+    if (exitingUltrahand.load(std::memory_order_acquire) && !reloadingBoot)
+      executeIniCommands(PACKAGE_PATH + EXIT_PACKAGE_FILENAME, "exit");
+    // Note: we don't curl_global_cleanup here because we never
+    // curl_global_init in this lean overlay.
+  }
+};
+#endif // BOOKMARK_OVL
 
 /**
  * @brief The entry point of the application.
@@ -17683,6 +18766,9 @@ tsl::elm::Element *CheatMenu::createUI() {
     });
     list->addItem(removeComboItem);
 
+    // ---- Save Cheats section ----
+    list->addItem(new tsl::elm::CategoryHeader("Save Cheats"));
+
     // Save to File (Breeze)
     auto *saveToBreezeItem = new tsl::elm::ListItem("Save to File (Breeze)");
     saveToBreezeItem->setClickListener([this](u64 keys) {
@@ -17713,6 +18799,40 @@ tsl::elm::Element *CheatMenu::createUI() {
       return false;
     });
     list->addItem(saveToAmsItem);
+
+    // ---- Bookmark section ----
+    list->addItem(new tsl::elm::CategoryHeader("Bookmark"));
+
+    // Bookmark: launches separate bookmark.ovl which displays Breeze bookmarks
+    auto *bookmarkItem = new tsl::elm::ListItem("Bookmark");
+    bookmarkItem->setClickListener([](u64 keys) {
+      if (keys & KEY_A) {
+        // Guard against double-launch (rapid A presses queueing multiple
+        // overlay-launch requests).
+        static std::atomic<bool> s_bookmarkLaunching{false};
+        if (s_bookmarkLaunching.exchange(true, std::memory_order_acq_rel)) {
+          return true;
+        }
+        const std::string path = "sdmc:/switch/.overlays/bookmark.ovl";
+        if (!ult::isFile(path)) {
+          s_bookmarkLaunching.store(false, std::memory_order_release);
+          if (tsl::notification) {
+            tsl::notification->show("Missing bookmark.ovl");
+          }
+          return true;
+        }
+        std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
+        ult::requestedOverlayPath = path;
+        ult::requestedOverlayArgs = "";
+        ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
+                             ult::ULTRAHAND_PROJECT_NAME,
+                             ult::IN_OVERLAY_STR, ult::TRUE_STR);
+        ult::overlayLaunchRequested.store(true, std::memory_order_release);
+        return true;
+      }
+      return false;
+    });
+    list->addItem(bookmarkItem);
   } else {
     auto *item = new tsl::elm::ListItem("Select a cheat to set combo!");
     item->setClickListener([](u64 keys) {
@@ -17926,6 +19046,8 @@ int main(int argc, char *argv[]) {
 
 #ifdef EDITCHEAT_OVL
   return tsl::loop<EditCheatOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+#elif defined(BOOKMARK_OVL)
+  return tsl::loop<BookmarkOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
 #else
   return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 #endif
