@@ -17446,9 +17446,408 @@ static std::vector<int> ListBookmarkFiles() {
 
 } // namespace BreezeBookmark
 
+// =====================================================================
+// Breeze gen2 fork integration.
+//
+// This implements the same in-process RPC pattern Breeze's gen2 menu
+// uses: bookmark.ovl attaches to the dmnt.gen2 sysmodule itself as a
+// debugger, locates the in-process m_watch_data struct, and pokes
+// commands/reads results via svc::{Read,Write}DebugProcessMemory.
+//
+// All work that requires kernel privilege (svcSetHardwareBreakPoint
+// across cores, watchpoint trap handling, stack-scan inside the game's
+// process) happens INSIDE the gen2 sysmodule. We are only the client.
+//
+// Requires Breeze's gen2 fork installed at
+//   /atmosphere/contents/010000000000d609/exefs.nsp
+// with version string matching kGen2Version. Stock Atmosphere
+// dmnt.gen2 will fail the version check and the Watch feature stays
+// disabled.
+// =====================================================================
+namespace BreezeGen2 {
+
+constexpr const char *kGen2Version = "v0.13i";
+constexpr u64 kGen2TitleId         = 0x010000000000d609ULL;
+constexpr size_t kMaxCallStack     = 5;
+constexpr size_t kMaxWatchBuffer   = 0x200;
+
+// Mirror of Breeze/gen2type.hpp. These layouts MUST match the gen2
+// sysmodule's compiled struct byte-for-byte; do not reorder fields.
+#pragma pack(push, 1)
+struct CallStack {
+  u32 SP_offset : 7;
+  u32 code_offset : 25;
+};
+struct From {
+  u64 address : 39;
+  u32 call_from : 25;
+  u32 count;
+};
+struct FromStack {
+  u64 address : 39;
+  u32 call_from : 25;
+  CallStack stack[kMaxCallStack];
+};
+struct From2 {
+  FromStack from_stack;
+  int count;
+};
+struct FromStackA {
+  u64 address : 39;
+  u32 call_from : 25;
+  u32 stack[kMaxCallStack];
+};
+struct From2A {
+  FromStackA from_stack;
+  int count;
+};
+struct From3 {
+  u64 address : 39;
+  u32 x30_offset : 25;
+  CallStack stack[kMaxCallStack];
+  u8 i : 5;
+  u8 j : 5;
+  u8 k : 5;
+  bool two_register : 1;
+  s16 offset : 16;
+};
+struct From1 {
+  u64 address : 39;
+  u32 x30_offset : 25;
+  u8 i : 5;
+  u8 j : 5;
+  u8 k : 5;
+  bool two_register : 1;
+  s16 offset : 16;
+};
+
+static constexpr size_t kMaxWatchBuffer2 =
+    (kMaxWatchBuffer * sizeof(From) / sizeof(From2));
+
+union FromU {
+  From    from[kMaxWatchBuffer];
+  From1   from1[kMaxWatchBuffer];
+  From2   from2[kMaxWatchBuffer2];
+  From2A  from2a[kMaxWatchBuffer2];
+  From3   from3[kMaxWatchBuffer2];
+};
+#pragma pack(pop)
+
+enum Gen2Command : u32 {
+  GEN2_SETW = 0,
+  GEN2_CLEARW,
+  GEN2_DETACH,
+  GEN2_ATTACH,
+  GEN2_ATTACH_CONT,
+  GEN2_CONT,
+  GEN2_INCPC,
+};
+
+enum X30CatchType : u8 {
+  X30_OFFSET = 0,
+  X30_NONE,
+  X30_STACK,
+  X30_R_MATCH,
+  X30_EXCLUSIVE_SEARCH,
+  X30_END_OF_TYPE,
+};
+
+// Exact mirror of Breeze's m_watch_data_t. The gen2 sysmodule reads
+// from / writes to this exact layout in its own memory; we either
+// match it byte-for-byte or we corrupt gen2 state.
+struct WatchData {
+  bool execute = false;
+  bool done = false;
+  Gen2Command command = GEN2_SETW;
+  int count = 0;
+  u16 i = 8;
+  u8 j = 0, k = 0;
+  u64 address = 0xAA55AA5566ULL;
+  u64 next_address = 0;
+  u64 base = 0;
+  u64 offset = 0;
+  const char *module_name = nullptr; // unused on our side; gen2 sets it
+  char name[10] = "unnamed";
+  bool read = false, next_read = false;
+  bool write = false, next_write = false;
+  bool intercepted = false;
+  X30CatchType x30_catch_type = X30_OFFSET;
+  u64 next_pc = 0x55AA55AAULL;
+  FromU fromU{};
+  int failed = 0;
+  u8 gen2loop_on = 0;
+  u64 next_pid = 0;
+  bool attach_success = false;
+  bool attached = false;
+  bool range_check = false;
+  u64 v1 = 0, v2 = 0;
+  int size = 4;
+  int vsize = 4;
+  char version[10] = "v0.13i"; // bookmark.ovl writes the expected version it was built for
+  u16 x30_match = 0;
+  bool check_x30 = false;
+  bool two_register = false;
+  u16 stack_check_count = 0;
+  u16 exclusive_search_count = 0;
+  bool exclusive_search_from2 = false;
+  u32 exclusive_search_target_trigger = 0;
+  u64 target_address = 0;
+  u64 main_start = 0, main_end = 0;
+  u64 total_trigger = 0;
+  u64 max_trigger = 0x10000;
+  u16 caller_SP_offset = 0;
+  u64 grab_A_address = 0;
+  bool grab_A = false;
+  bool grab_R = false;
+  u8 Register = 14;
+  u64 Register_match_value = 0;
+};
+
+// Persistent state held across BookmarkMenu / BookmarkWatchMenu Guis.
+// Lives in static storage; values reset between bookmark.ovl process
+// launches (i.e. each overlay launch starts with no gen2 attach).
+struct Gen2State {
+  bool initialized = false;     // process scan + attach completed at least once
+  u64 pid = 0;                  // dmnt.gen2 process id
+  Handle handle = 0;            // debug handle on dmnt.gen2 (NOT on game)
+  u64 main_start = 0;           // gen2 main NSO base in its own address space
+  u64 main_end = 0;
+  u64 wd_offset = 0;            // offset from main_start to m_watch_data
+  u64 wd_address = 0;           // == main_start + wd_offset, cached for speed
+  bool gen2_attached_to_game = false; // we've issued ATTACH_CONT successfully
+  bool version_matched = false;       // first read verified the version string
+};
+
+static Gen2State g_gen2State;
+
+// -------------------------------------------------------------------
+// Low-level helpers.
+// -------------------------------------------------------------------
+
+// Returns 0 on success and writes the dmnt.gen2 pid to *out_pid.
+static Result FindGen2Pid(u64 *out_pid) {
+  Result rc = pmdmntInitialize();
+  if (R_FAILED(rc)) return rc;
+  rc = pminfoInitialize();
+  if (R_FAILED(rc)) {
+    pmdmntExit();
+    return rc;
+  }
+  s32 count = 0;
+  u64 pids[200];
+  rc = svcGetProcessList(&count, pids, 200);
+  if (R_SUCCEEDED(rc)) {
+    rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    for (s32 i = 0; i < count; i++) {
+      u64 tid = 0;
+      if (R_SUCCEEDED(pminfoGetProgramId(&tid, pids[i])) && tid == kGen2TitleId) {
+        *out_pid = pids[i];
+        rc = 0;
+        break;
+      }
+    }
+  }
+  pminfoExit();
+  pmdmntExit();
+  return rc;
+}
+
+// Open / close debug handle on dmnt.gen2.
+static Result Gen2Open() {
+  if (g_gen2State.handle != 0) return 0;
+  if (g_gen2State.pid == 0) {
+    Result rc = FindGen2Pid(&g_gen2State.pid);
+    if (R_FAILED(rc)) return rc;
+  }
+  return svcDebugActiveProcess(&g_gen2State.handle, g_gen2State.pid);
+}
+
+static void Gen2Close() {
+  if (g_gen2State.handle != 0) {
+    svcCloseHandle(g_gen2State.handle);
+    g_gen2State.handle = 0;
+  }
+}
+
+// Walk the gen2 process's memory map exactly the same way Breeze does
+// (gen2menu.cpp::init_gen2_process) to locate the writable region that
+// contains m_watch_data. The 0x10030 offset and the "8th CodeMutable
+// region" heuristic come from Breeze; they're stable across gen2 fork
+// builds at the same source revision.
+static Result LocateWatchDataOffset() {
+  if (g_gen2State.handle == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+  MemoryInfo info{};
+  u32 pageinfo = 0;
+  u64 addr = 0;
+  u32 mod = 1, mod2 = 1;
+  Result rc = 0;
+  for (int count = 0; count < 100; count++) {
+    rc = svcQueryDebugProcessMemory(&info, &pageinfo, g_gen2State.handle, addr);
+    if (R_FAILED(rc)) break;
+    if (info.type == MemType_CodeStatic && info.perm == Perm_Rx) {
+      if (mod == 1) g_gen2State.main_start = info.addr;
+      mod++;
+    }
+    if (info.type == MemType_CodeMutable) {
+      if (mod == 2) {
+        g_gen2State.main_end = info.addr + info.size;
+        if (mod2++ == 8) {
+          g_gen2State.wd_offset = (info.addr - g_gen2State.main_start) + 0x10030;
+        }
+      }
+    }
+    if (info.addr + info.size == 0x8000000000ULL) break;
+    if (info.type == 0x10) break;
+    addr += info.size;
+  }
+  if (g_gen2State.main_start == 0 || g_gen2State.wd_offset == 0) {
+    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  }
+  g_gen2State.wd_address = g_gen2State.main_start + g_gen2State.wd_offset;
+  return 0;
+}
+
+// Read/write the full m_watch_data struct.
+static Result ReadWatchData(WatchData *out) {
+  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+  return svcReadDebugProcessMemory(out, g_gen2State.handle,
+                                   g_gen2State.wd_address, sizeof(WatchData));
+}
+
+static Result WriteWatchData(const WatchData *wd) {
+  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+  return svcWriteDebugProcessMemory(g_gen2State.handle, wd,
+                                    g_gen2State.wd_address, sizeof(WatchData));
+}
+
+// Set execute=true and wait briefly for done=true. Returns 0 on success.
+// Always re-opens the gen2 debug handle around the operation, mirroring
+// Breeze's pattern (open / write / close, so the gen2 sysmodule can run
+// its loop while we don't hold the debug handle).
+static Result ExecuteWatchData(WatchData *wd, u64 wait_ns = 200'000'000ULL) {
+  wd->execute = true;
+  wd->done = false;
+  if (R_FAILED(Gen2Open())) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  Result rc = WriteWatchData(wd);
+  Gen2Close();
+  if (R_FAILED(rc)) return rc;
+  svcSleepThread(wait_ns);
+  // Refresh state.
+  if (R_FAILED(Gen2Open())) return 0;
+  ReadWatchData(wd);
+  Gen2Close();
+  return 0;
+}
+
+// First-time gen2 discovery + version check. Caches state in g_gen2State.
+// Returns true if gen2 fork is present and version matches.
+static bool EnsureInitialized() {
+  if (g_gen2State.initialized) return g_gen2State.version_matched;
+  g_gen2State.initialized = true;
+
+  if (R_FAILED(Gen2Open())) return false;
+  Result rc = LocateWatchDataOffset();
+  if (R_FAILED(rc)) {
+    Gen2Close();
+    return false;
+  }
+  WatchData wd{};
+  rc = ReadWatchData(&wd);
+  Gen2Close();
+  if (R_FAILED(rc)) return false;
+  g_gen2State.version_matched =
+      (std::strncmp(wd.version, kGen2Version, sizeof(wd.version)) == 0);
+  return g_gen2State.version_matched;
+}
+
+// Tell gen2 to attach to the game (after dmnt:cht has been detached).
+// Returns true on success.
+static bool AttachToGame(u64 game_pid) {
+  WatchData wd{};
+  if (R_FAILED(Gen2Open())) return false;
+  ReadWatchData(&wd);
+  Gen2Close();
+
+  wd.command = GEN2_ATTACH_CONT;
+  wd.next_pid = game_pid;
+  wd.attached = true; // overwrite check, matches Breeze
+  ExecuteWatchData(&wd, 200'000'000ULL);
+
+  if (R_FAILED(Gen2Open())) return false;
+  ReadWatchData(&wd);
+  Gen2Close();
+  g_gen2State.gen2_attached_to_game = wd.attach_success;
+  return wd.attach_success;
+}
+
+// Tell gen2 to detach from the game and clear any watchpoints.
+static void DetachFromGame() {
+  if (!g_gen2State.gen2_attached_to_game) return;
+  WatchData wd{};
+  if (R_FAILED(Gen2Open())) return;
+  ReadWatchData(&wd);
+  Gen2Close();
+
+  if (wd.address != 0) {
+    wd.command = GEN2_CLEARW;
+    ExecuteWatchData(&wd, 100'000'000ULL);
+  }
+
+  if (R_FAILED(Gen2Open())) return;
+  ReadWatchData(&wd);
+  Gen2Close();
+  wd.command = GEN2_DETACH;
+  ExecuteWatchData(&wd, 100'000'000ULL);
+
+  g_gen2State.gen2_attached_to_game = false;
+}
+
+// Set a watchpoint at addr+size with read+write capture. Must be called
+// AFTER AttachToGame() returned true. Returns true on success.
+// Defaults match Breeze's gen2_menu defaults; callers normally pass in
+// values from g_bmState's persisted watch settings instead.
+static bool SetWatchpoint(u64 addr, int size,
+                          int stack_check_count,
+                          X30CatchType x30,
+                          bool read, bool write,
+                          u32 max_trigger) {
+  if (!g_gen2State.gen2_attached_to_game) return false;
+  WatchData wd{};
+  if (R_FAILED(Gen2Open())) return false;
+  ReadWatchData(&wd);
+  Gen2Close();
+
+  wd.command = GEN2_SETW;
+  wd.next_address = addr;
+  wd.address = addr;
+  wd.size = size;
+  wd.next_read = read;
+  wd.next_write = write;
+  wd.read = read;
+  wd.write = write;
+  wd.stack_check_count = (u16)stack_check_count;
+  wd.x30_catch_type = x30;
+  wd.max_trigger = max_trigger;
+  wd.count = 0;
+  wd.total_trigger = 0;
+  wd.failed = 0;
+  ExecuteWatchData(&wd, 200'000'000ULL);
+
+  return wd.failed == 0;
+}
+
+} // namespace BreezeGen2
+
 // Forward declarations
 class BookmarkMenu;
 class BookmarkMonitorMenu;
+class BookmarkWatchMenu;
+class BookmarkWatchSettingsMenu;
 
 // Shared state for live bookmark display. Held in static storage so a
 // monitor-mode swap (or hide/show by the system) does not lose it.
@@ -17473,11 +17872,39 @@ struct BookmarkUiState {
   int monitorColorIdx = 0;
   // Indices into kMonitorFontSizes[]: 12, 14, 16, 18, 20, 24, 28
   int monitorFontSizeIdx = 2; // 16px default
+
+  // -----------------------------------------------------------------
+  // Watch (gen2) parameters. Persisted to ini under [watch].
+  // -----------------------------------------------------------------
+  int watchSizeIdx = 2;          // index into kWatchSizes[]: 1, 2, 4, 8 -> default 4
+  int watchStackCount = 5;       // 0..5
+  bool watchRead = true;
+  bool watchWrite = true;
+  u32 watchMaxTrigger = 0x10000; // gen2 stops capture after this many hits
+  int watchX30TypeIdx = 0;       // index into kWatchX30Names[]
+
+  // Selected bookmark entry to use when X is pressed on settings menu.
+  // Set by BookmarkMenu when the user opens settings via X.
+  size_t pendingWatchEntryIdx = 0;
+  bool   pendingWatchEntryValid = false;
 };
 static BookmarkUiState g_bmState;
+
+// Watch parameter cycle tables (must align with the indices above).
+static const int kWatchSizes[]            = {1, 2, 4, 8};
+constexpr int    kWatchSizeCount          = 4;
+static const u32 kWatchMaxTriggerValues[] = {
+    0x100, 0x400, 0x1000, 0x4000, 0x10000, 0x40000, 0x100000, 0xFFFFFFFFu};
+constexpr int    kWatchMaxTriggerCount    = 8;
+// Names align with BreezeGen2::X30CatchType enum (OFFSET=0..EXCLUSIVE_SEARCH=4).
+static const char *const kWatchX30Names[] = {
+    "OFFSET", "NONE", "STACK", "R_MATCH", "EXCLUSIVE"};
+constexpr int    kWatchX30Count           = 5;
 // True while a BookmarkMonitorMenu instance is the active Gui. Used by
 // BookmarkOverlay::onShow() to detect re-summon while in monitor mode.
 std::atomic<bool> g_bmInMonitor{false};
+// True while a BookmarkWatchMenu is the active Gui.
+std::atomic<bool> g_bmInWatch{false};
 // Page offset to apply to the next BookmarkMenu instance, set by L/R
 // page navigation before swapTo<BookmarkMenu>. Reset back to 0 after
 // being consumed in the constructor.
@@ -17641,6 +18068,57 @@ static void SaveDisplaySettings() {
   std::snprintf(buf, sizeof(buf), "%d", g_bmState.monitorFontSizeIdx);
   ult::setIniFileValue(kIniPath, kSettingsSection, "font_idx", buf);
 }
+
+// -------------------------------------------------------------------
+// Watch parameter settings ([watch] section).
+// -------------------------------------------------------------------
+constexpr const char *kWatchSection = "watch";
+
+static void LoadWatchSettings() {
+  auto load_int = [](const char *key, int min_, int max_, int &dst) {
+    std::string s =
+        ult::parseValueFromIniSection(kIniPath, kWatchSection, key);
+    if (s.empty()) return;
+    int v = std::atoi(s.c_str());
+    if (v >= min_ && v <= max_) dst = v;
+  };
+  auto load_bool = [](const char *key, bool &dst) {
+    std::string s =
+        ult::parseValueFromIniSection(kIniPath, kWatchSection, key);
+    if (s.empty()) return;
+    dst = (s == "1" || s == "true" || s == "TRUE");
+  };
+  auto load_u32 = [](const char *key, u32 &dst) {
+    std::string s =
+        ult::parseValueFromIniSection(kIniPath, kWatchSection, key);
+    if (s.empty()) return;
+    dst = (u32)std::strtoul(s.c_str(), nullptr, 0);
+  };
+
+  load_int("size_idx",      0, kWatchSizeCount - 1,        g_bmState.watchSizeIdx);
+  load_int("stack_count",   0, 5,                          g_bmState.watchStackCount);
+  load_bool("read",         g_bmState.watchRead);
+  load_bool("write",        g_bmState.watchWrite);
+  load_u32("max_trigger",   g_bmState.watchMaxTrigger);
+  load_int("x30_type_idx",  0, kWatchX30Count - 1,         g_bmState.watchX30TypeIdx);
+}
+
+static void SaveWatchSettings() {
+  ult::createDirectory("sdmc:/config/breezehand/");
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%d", g_bmState.watchSizeIdx);
+  ult::setIniFileValue(kIniPath, kWatchSection, "size_idx", buf);
+  std::snprintf(buf, sizeof(buf), "%d", g_bmState.watchStackCount);
+  ult::setIniFileValue(kIniPath, kWatchSection, "stack_count", buf);
+  ult::setIniFileValue(kIniPath, kWatchSection, "read",
+                       g_bmState.watchRead ? "1" : "0");
+  ult::setIniFileValue(kIniPath, kWatchSection, "write",
+                       g_bmState.watchWrite ? "1" : "0");
+  std::snprintf(buf, sizeof(buf), "%u", g_bmState.watchMaxTrigger);
+  ult::setIniFileValue(kIniPath, kWatchSection, "max_trigger", buf);
+  std::snprintf(buf, sizeof(buf), "%d", g_bmState.watchX30TypeIdx);
+  ult::setIniFileValue(kIniPath, kWatchSection, "x30_type_idx", buf);
+}
 } // namespace BookmarkSelection
 
 // =====================================================================
@@ -17689,6 +18167,7 @@ public:
     }
     // Load persisted monitor-mode display settings (color + font size).
     BookmarkSelection::LoadDisplaySettings();
+    BookmarkSelection::LoadWatchSettings();
     // Prefer lowest non-negative file number (Breeze defaults to (000)).
     if (fileNo == -1) {
       bool found = false;
@@ -17738,6 +18217,49 @@ public:
     BookmarkSelection::Save(m_filePath, g_bmState.entriesMTime,
                             g_bmState.selected);
   }
+
+  // Switch to BookmarkWatchMenu for the bookmark at the given global
+  // index. Resolves the bookmark to an absolute memory address using
+  // the current process metadata, then changeTo's the watch Gui.
+  void startWatch(size_t entryIdx) {
+    if (entryIdx >= g_bmState.entries.size()) return;
+    const auto &bm = g_bmState.entries[entryIdx];
+
+    // Refresh metadata in case it's stale (game restart, etc).
+    dmntchtGetCheatProcessMetadata(&g_bmState.metadata);
+
+    u64 abs_address = 0;
+    if (!BreezeBookmark::ResolveBookmark(bm, g_bmState.metadata, abs_address)) {
+      if (tsl::notification) {
+        tsl::notification->show("Bookmark unresolved - can't watch");
+      }
+      return;
+    }
+
+    persistSelection();
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, BookmarkLabel(bm));
+  }
+
+  // Return the row index of the currently focused entry on this page,
+  // or SIZE_MAX if no row is focused.
+  size_t focusedRowIndex() {
+    auto *focused = this->getFocusedElement();
+    if (focused == nullptr) return SIZE_MAX;
+    for (size_t row = 0; row < m_entryItems.size() &&
+                          row < m_pageEntryIndex.size();
+         row++) {
+      if (static_cast<tsl::elm::Element *>(m_entryItems[row]) == focused) {
+        return row;
+      }
+    }
+    return SIZE_MAX;
+  }
+
+  // Open the virtual keyboard to edit the memory pointed to by the
+  // bookmark at the given global entry index. Reads the current value,
+  // shows the keyboard with that as initial text, and on confirm
+  // writes the parsed value back via dmntcht.
+  void startEditMemory(size_t entryIdx);
 
   // Rebuild the cached preview text (up to kPreviewMax selected entries).
   // Called at the same low rate as the list refresh - the header
@@ -17813,7 +18335,7 @@ public:
     m_list = new tsl::elm::List();
     // Header / instructions
     m_list->addItem(new tsl::elm::CategoryHeader(
-        "A: select  +: monitor  D-pad: color/size  B: back"));
+        "A:select X:watch_cfg Y:edit +:monitor B:back"));
 
     // File switcher (only show if more than 1 file exists).
     if (g_bmState.fileList.size() > 1) {
@@ -17893,6 +18415,11 @@ public:
             rebuildPreviewLines();
           }
         });
+        // Note: ToggleListItem::onClick consumes KEY_A for the toggle and
+        // does NOT delegate non-A keys back to Element::onClick, which
+        // means setClickListener on a ToggleListItem never fires for
+        // KEY_X. We instead handle KEY_X in BookmarkMenu::handleInput()
+        // by looking up the focused row via getFocusedElement().
         m_list->addItem(item);
         m_entryItems.push_back(item);
         m_pageEntryIndex.push_back(i);
@@ -17928,6 +18455,35 @@ public:
     (void)keysHeld;
     (void)leftJoyStick;
     (void)rightJoyStick;
+
+    // KEY_Y on a bookmark row: edit the bookmark's memory value via the
+    // virtual keyboard. Falls through silently if no bookmark row is
+    // focused.
+    if (keysDown & KEY_Y) {
+      const size_t row = focusedRowIndex();
+      if (row != SIZE_MAX) {
+        startEditMemory(m_pageEntryIndex[row]);
+        return true;
+      }
+    }
+
+    // KEY_X opens the watch settings menu. Remember which bookmark
+    // row was focused so the settings menu can launch a watch on it.
+    // Pressing X in the settings menu actually starts (or continues)
+    // the watch.
+    if (keysDown & KEY_X) {
+      const size_t row = focusedRowIndex();
+      if (row != SIZE_MAX) {
+        g_bmState.pendingWatchEntryIdx = m_pageEntryIndex[row];
+        g_bmState.pendingWatchEntryValid = true;
+      } else {
+        // Allow opening settings even without a focused row (e.g. for
+        // Continue mode where no new bookmark is needed).
+        g_bmState.pendingWatchEntryValid = false;
+      }
+      tsl::changeTo<BookmarkWatchSettingsMenu>();
+      return true;
+    }
 
     // D-pad Left/Right: cycle preview text color.
     if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
@@ -18024,6 +18580,108 @@ public:
     return false;
   }
 };
+
+// -------------------------------------------------------------------
+// BookmarkMenu::startEditMemory - opens the virtual keyboard for the
+// bookmark at entryIdx and writes the parsed value back to memory on
+// confirm. Defined out-of-class because the lambda captures by [this]
+// and needs the full BookmarkMenu type at definition time, but the
+// signature was forward-declared inside the class.
+// -------------------------------------------------------------------
+inline void BookmarkMenu::startEditMemory(size_t entryIdx) {
+  if (entryIdx >= g_bmState.entries.size()) return;
+  const auto &bm = g_bmState.entries[entryIdx];
+
+  dmntchtGetCheatProcessMetadata(&g_bmState.metadata);
+
+  u64 abs_address = 0;
+  if (!BreezeBookmark::ResolveBookmark(bm, g_bmState.metadata, abs_address)) {
+    if (tsl::notification) {
+      tsl::notification->show("Bookmark unresolved - can't edit");
+    }
+    return;
+  }
+
+  // Read current value into a string per the bookmark's type.
+  u64 raw = 0;
+  if (R_FAILED(dmntchtReadCheatProcessMemory(abs_address, &raw, sizeof(u64)))) {
+    if (tsl::notification) tsl::notification->show("Read failed");
+    return;
+  }
+  const auto bmType = bm.type;
+  std::string initial =
+      BreezeBookmark::FormatValue(raw, bmType);
+
+  // Map Breeze type -> KeyboardGui type (decimal, signed, float, hex).
+  ::searchType_t kbType = SEARCH_TYPE_UNSIGNED_32BIT;
+  switch (bmType) {
+  case BreezeBookmark::BREEZE_TYPE_U8:  kbType = SEARCH_TYPE_UNSIGNED_8BIT;  break;
+  case BreezeBookmark::BREEZE_TYPE_S8:  kbType = SEARCH_TYPE_SIGNED_8BIT;    break;
+  case BreezeBookmark::BREEZE_TYPE_U16: kbType = SEARCH_TYPE_UNSIGNED_16BIT; break;
+  case BreezeBookmark::BREEZE_TYPE_S16: kbType = SEARCH_TYPE_SIGNED_16BIT;   break;
+  case BreezeBookmark::BREEZE_TYPE_U32: kbType = SEARCH_TYPE_UNSIGNED_32BIT; break;
+  case BreezeBookmark::BREEZE_TYPE_S32: kbType = SEARCH_TYPE_SIGNED_32BIT;   break;
+  case BreezeBookmark::BREEZE_TYPE_U64: kbType = SEARCH_TYPE_UNSIGNED_64BIT; break;
+  case BreezeBookmark::BREEZE_TYPE_S64: kbType = SEARCH_TYPE_SIGNED_64BIT;   break;
+  case BreezeBookmark::BREEZE_TYPE_F32: kbType = SEARCH_TYPE_FLOAT;          break;
+  case BreezeBookmark::BREEZE_TYPE_F64: kbType = SEARCH_TYPE_DOUBLE;         break;
+  case BreezeBookmark::BREEZE_TYPE_POINTER:
+    kbType = SEARCH_TYPE_UNSIGNED_64BIT;
+    break;
+  case BreezeBookmark::BREEZE_TYPE_U40: kbType = SEARCH_TYPE_UNSIGNED_40BIT; break;
+  default: kbType = SEARCH_TYPE_UNSIGNED_32BIT; break;
+  }
+
+  // Compute byte width for write-back.
+  const u8 widths[] = {1,1,2,2,4,4,8,8,4,8,8,5};
+  const size_t writeSize =
+      ((u32)bmType < sizeof(widths)) ? widths[bmType] : 4;
+
+  std::string title = std::string("Edit ") + BookmarkLabel(bm);
+
+  tsl::changeTo<tsl::KeyboardGui>(
+      kbType, initial, title,
+      [abs_address, writeSize, bmType](std::string result) {
+        // Parse result based on type.
+        u64 newRaw = 0;
+        const char *s = result.c_str();
+        switch (bmType) {
+        case BreezeBookmark::BREEZE_TYPE_F32: {
+          float f = (float)std::strtod(s, nullptr);
+          std::memcpy(&newRaw, &f, sizeof(f));
+          break;
+        }
+        case BreezeBookmark::BREEZE_TYPE_F64: {
+          double d = std::strtod(s, nullptr);
+          std::memcpy(&newRaw, &d, sizeof(d));
+          break;
+        }
+        case BreezeBookmark::BREEZE_TYPE_S8:
+        case BreezeBookmark::BREEZE_TYPE_S16:
+        case BreezeBookmark::BREEZE_TYPE_S32:
+        case BreezeBookmark::BREEZE_TYPE_S64: {
+          long long v = std::strtoll(s, nullptr, 0);
+          std::memcpy(&newRaw, &v, sizeof(v));
+          break;
+        }
+        default: {
+          unsigned long long v = std::strtoull(s, nullptr, 0);
+          newRaw = (u64)v;
+          break;
+        }
+        }
+        if (R_FAILED(dmntchtWriteCheatProcessMemory(abs_address, &newRaw,
+                                                    writeSize))) {
+          if (tsl::notification) tsl::notification->show("Write failed");
+        }
+        // KeyboardGui::handleConfirm() invokes this lambda but does NOT
+        // dismiss itself - the callback is responsible for popping the
+        // keyboard. Without this goBack() the user sees no response to
+        // the + press. (Matches the pattern used by editcheatk's value
+        // edit callback.)
+        tsl::goBack();
+      });
+}
 
 // =====================================================================
 // Monitor mode menu - fully transparent overlay that only displays the
@@ -18150,27 +18808,481 @@ public:
   }
 };
 
+// =====================================================================
+// Watch settings menu.
+//
+// Opened by ZL+X from BookmarkMenu. Lets the user configure the
+// parameters the next Watch action will use:
+//   - Size      (1, 2, 4, 8 bytes)
+//   - Stack     (0..5 stack-scan slots captured by gen2)
+//   - Read      (capture loads from the watched address)
+//   - Write     (capture stores to the watched address)
+//   - Max trig  (gen2 stops capture after this many hits)
+//   - X30 mode  (OFFSET / NONE / STACK / R_MATCH / EXCLUSIVE)
+//
+// All values are persisted to the same bookmark_selection.ini under a
+// [watch] section so they survive overlay restarts.
+// =====================================================================
+class BookmarkWatchSettingsMenu : public tsl::Gui {
+  tsl::elm::List *m_list = nullptr;
+  // Held so we can refresh their displayed values on each tweak.
+  tsl::elm::ListItem *m_sizeItem = nullptr;
+  tsl::elm::ListItem *m_stackItem = nullptr;
+  tsl::elm::ToggleListItem *m_readItem = nullptr;
+  tsl::elm::ToggleListItem *m_writeItem = nullptr;
+  tsl::elm::ListItem *m_triggerItem = nullptr;
+  tsl::elm::ListItem *m_x30Item = nullptr;
+
+  static int findMaxTriggerIdx(u32 v) {
+    for (int i = 0; i < kWatchMaxTriggerCount; i++) {
+      if (kWatchMaxTriggerValues[i] == v) return i;
+    }
+    return 4; // 0x10000 default
+  }
+  static std::string sizeLabel()    {
+    char b[8]; std::snprintf(b, sizeof(b), "%d B",
+                             kWatchSizes[g_bmState.watchSizeIdx]); return b;
+  }
+  static std::string stackLabel()   {
+    char b[8]; std::snprintf(b, sizeof(b), "%d",
+                             g_bmState.watchStackCount); return b;
+  }
+  static std::string triggerLabel() {
+    char b[24]; std::snprintf(b, sizeof(b), "0x%X",
+                              g_bmState.watchMaxTrigger); return b;
+  }
+  static std::string x30Label()     {
+    return kWatchX30Names[g_bmState.watchX30TypeIdx];
+  }
+
+  // Resolve the bookmark for the pending entry and (re)start a watch.
+  // Called when the user presses X inside the settings menu. Always
+  // restarts (gen2 SETW clears its capture count for the new address).
+  void launchWatch() {
+    if (!g_bmState.pendingWatchEntryValid ||
+        g_bmState.pendingWatchEntryIdx >= g_bmState.entries.size()) {
+      if (tsl::notification) {
+        tsl::notification->show("Press X on a bookmark first");
+      }
+      return;
+    }
+    const auto &bm = g_bmState.entries[g_bmState.pendingWatchEntryIdx];
+    dmntchtGetCheatProcessMetadata(&g_bmState.metadata);
+    u64 abs_address = 0;
+    if (!BreezeBookmark::ResolveBookmark(bm, g_bmState.metadata, abs_address)) {
+      if (tsl::notification) {
+        tsl::notification->show("Bookmark unresolved - can't watch");
+      }
+      return;
+    }
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, BookmarkLabel(bm));
+  }
+
+public:
+  virtual tsl::elm::Element *createUI() override {
+    auto *frame =
+        new tsl::elm::OverlayFrame("Bookmark", "Watch parameters");
+    m_list = new tsl::elm::List();
+
+    m_list->addItem(new tsl::elm::CategoryHeader(
+        "A:cycle X:start B:back"));
+
+    m_list->addItem(new tsl::elm::CategoryHeader("Capture parameters"));
+
+    m_sizeItem = new tsl::elm::ListItem("Size");
+    m_sizeItem->setValue(sizeLabel());
+    m_sizeItem->setClickListener([this](u64 k) {
+      if (k & KEY_A) {
+        g_bmState.watchSizeIdx =
+            (g_bmState.watchSizeIdx + 1) % kWatchSizeCount;
+        m_sizeItem->setValue(sizeLabel());
+        BookmarkSelection::SaveWatchSettings();
+        return true;
+      }
+      return false;
+    });
+    m_list->addItem(m_sizeItem);
+
+    m_stackItem = new tsl::elm::ListItem("Stack slots");
+    m_stackItem->setValue(stackLabel());
+    m_stackItem->setClickListener([this](u64 k) {
+      if (k & KEY_A) {
+        g_bmState.watchStackCount = (g_bmState.watchStackCount + 1) % 6;
+        m_stackItem->setValue(stackLabel());
+        BookmarkSelection::SaveWatchSettings();
+        return true;
+      }
+      return false;
+    });
+    m_list->addItem(m_stackItem);
+
+    m_readItem = new tsl::elm::ToggleListItem("Capture reads",
+                                              g_bmState.watchRead);
+    m_readItem->setStateChangedListener([](bool s) {
+      g_bmState.watchRead = s;
+      BookmarkSelection::SaveWatchSettings();
+    });
+    m_list->addItem(m_readItem);
+
+    m_writeItem = new tsl::elm::ToggleListItem("Capture writes",
+                                               g_bmState.watchWrite);
+    m_writeItem->setStateChangedListener([](bool s) {
+      g_bmState.watchWrite = s;
+      BookmarkSelection::SaveWatchSettings();
+    });
+    m_list->addItem(m_writeItem);
+
+    m_triggerItem = new tsl::elm::ListItem("Max triggers");
+    m_triggerItem->setValue(triggerLabel());
+    m_triggerItem->setClickListener([this](u64 k) {
+      if (k & KEY_A) {
+        int idx = findMaxTriggerIdx(g_bmState.watchMaxTrigger);
+        idx = (idx + 1) % kWatchMaxTriggerCount;
+        g_bmState.watchMaxTrigger = kWatchMaxTriggerValues[idx];
+        m_triggerItem->setValue(triggerLabel());
+        BookmarkSelection::SaveWatchSettings();
+        return true;
+      }
+      return false;
+    });
+    m_list->addItem(m_triggerItem);
+
+    m_x30Item = new tsl::elm::ListItem("X30 catch type");
+    m_x30Item->setValue(x30Label());
+    m_x30Item->setClickListener([this](u64 k) {
+      if (k & KEY_A) {
+        g_bmState.watchX30TypeIdx =
+            (g_bmState.watchX30TypeIdx + 1) % kWatchX30Count;
+        m_x30Item->setValue(x30Label());
+        BookmarkSelection::SaveWatchSettings();
+        return true;
+      }
+      return false;
+    });
+    m_list->addItem(m_x30Item);
+
+    // Reset-to-defaults helper.
+    auto *resetItem = new tsl::elm::ListItem("Reset to defaults");
+    resetItem->setClickListener([this](u64 k) {
+      if (k & KEY_A) {
+        g_bmState.watchSizeIdx        = 2; // 4 B
+        g_bmState.watchStackCount     = 5;
+        g_bmState.watchRead           = true;
+        g_bmState.watchWrite          = true;
+        g_bmState.watchMaxTrigger     = 0x10000;
+        g_bmState.watchX30TypeIdx     = 0; // OFFSET
+        m_sizeItem->setValue(sizeLabel());
+        m_stackItem->setValue(stackLabel());
+        m_readItem->setState(true);
+        m_writeItem->setState(true);
+        m_triggerItem->setValue(triggerLabel());
+        m_x30Item->setValue(x30Label());
+        BookmarkSelection::SaveWatchSettings();
+        return true;
+      }
+      return false;
+    });
+    m_list->addItem(resetItem);
+
+    frame->setContent(m_list);
+    return frame;
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysHeld; (void)leftJoyStick; (void)rightJoyStick;
+    if (keysDown & KEY_X) {
+      launchWatch();
+      return true;
+    }
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+    return false;
+  }
+};
+
+// =====================================================================
+// Watch mode menu.
+//
+// Activated when the user presses Watch on a bookmark. Lives like the
+// monitor menu (fully transparent overlay, input forwarded to the
+// running game) so the player can keep playing while gen2 captures hit
+// data in the background.
+//
+// The actual data capture and stack scanning happens INSIDE the
+// dmnt.gen2 sysmodule (Breeze gen2 fork). We just poll the watch_data
+// struct from gen2's memory ~5Hz and render a compact summary.
+//
+// Exit mirrors monitor mode: pressing the launch combo hides the
+// overlay; on re-summon BookmarkOverlay::onShow() returns us to the
+// normal BookmarkMenu, and that goBack triggers the destructor which
+// tears down the watch + re-attaches dmnt:cht.
+// =====================================================================
+class BookmarkWatchMenu : public tsl::Gui {
+  u64 m_watchAddress = 0;
+  std::string m_watchLabel;
+  u32 m_refreshTick = 0;
+  // Latest gen2 watch_data snapshot, refreshed by update().
+  BreezeGen2::WatchData m_wd{};
+  bool m_setupOk = false;
+  std::string m_setupError;
+
+  static constexpr s32 kMarginX = 16;
+  static constexpr s32 kMarginY = 16;
+
+public:
+  // Construct WITHOUT starting gen2 yet - we want createUI() to run
+  // first so the overlay is visible while the (potentially slow)
+  // attach/sleep dance happens. The actual gen2 setup is done in
+  // the first update() call.
+  BookmarkWatchMenu(u64 watchAddress, std::string label)
+      : m_watchAddress(watchAddress), m_watchLabel(std::move(label)) {
+    g_bmInWatch.store(true, std::memory_order_release);
+    // Hand input to the game.
+    tsl::hlp::requestForeground(false);
+  }
+
+  virtual ~BookmarkWatchMenu() {
+    // Tear down: clear watchpoint, tell gen2 to detach from game, then
+    // re-attach dmnt:cht so cheats and the rest of breezehand keep
+    // working when the user returns to the bookmark menu.
+    BreezeGen2::DetachFromGame();
+    // Best-effort: re-open dmnt:cht cheat process. If this fails the
+    // user can manually trigger it from breezehand.
+    dmntchtForceOpenCheatProcess();
+
+    // Reclaim input.
+    tsl::hlp::requestForeground(true);
+    g_bmInWatch.store(false, std::memory_order_release);
+  }
+
+  // Perform the (slow) detach-dmnt / attach-gen2 / set-watchpoint
+  // sequence. Returns true on success, fills m_setupError on failure.
+  // Called from update() on the first tick so the overlay can render
+  // a "setting up..." message during the operation.
+  bool setupOnce() {
+    // Make sure dmnt:cht has the game's metadata cached for us.
+    DmntCheatProcessMetadata meta{};
+    if (R_FAILED(dmntchtGetCheatProcessMetadata(&meta))) {
+      m_setupError = "no cheat process";
+      return false;
+    }
+    const u64 game_pid = meta.process_id;
+
+    // Release dmnt:cht's grip so gen2 can attach.
+    dmntchtResumeCheatProcess();
+    dmntchtForceCloseCheatProcess();
+    svcSleepThread(50'000'000ULL);
+
+    if (!BreezeGen2::EnsureInitialized()) {
+      m_setupError = "gen2 fork not installed or version mismatch";
+      // Best-effort recovery.
+      dmntchtForceOpenCheatProcess();
+      return false;
+    }
+
+    if (!BreezeGen2::AttachToGame(game_pid)) {
+      m_setupError = "gen2 failed to attach to game";
+      dmntchtForceOpenCheatProcess();
+      return false;
+    }
+
+    if (!BreezeGen2::SetWatchpoint(
+            m_watchAddress,
+            kWatchSizes[g_bmState.watchSizeIdx],
+            g_bmState.watchStackCount,
+            (BreezeGen2::X30CatchType)g_bmState.watchX30TypeIdx,
+            g_bmState.watchRead,
+            g_bmState.watchWrite,
+            g_bmState.watchMaxTrigger)) {
+      m_setupError = "gen2 failed to set watchpoint";
+      BreezeGen2::DetachFromGame();
+      dmntchtForceOpenCheatProcess();
+      return false;
+    }
+    return true;
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *drawer = new tsl::elm::CustomDrawer(
+        [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+          (void)x; (void)y; (void)w; (void)h;
+          r->fillScreen(tsl::Color{0x0, 0x0, 0x0, 0x0});
+
+          const int fontSize =
+              kMonitorFontSizes[g_bmState.monitorFontSizeIdx];
+          const tsl::Color &col =
+              kMonitorColors[g_bmState.monitorColorIdx].color;
+          const s32 lineH = fontSize + 3;
+
+          s32 yy = kMarginY;
+
+          // Header line.
+          {
+            char hdr[128];
+            std::snprintf(hdr, sizeof(hdr), "Watch %s @ %lX",
+                          m_watchLabel.c_str(), m_watchAddress);
+            r->drawString(std::string(hdr), false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+          }
+
+          if (!m_setupOk) {
+            r->drawString(m_setupError.empty()
+                              ? std::string("setting up gen2 attach...")
+                              : std::string("error: ") + m_setupError,
+                          false, kMarginX, yy, fontSize, col);
+            return;
+          }
+
+          // Stats line.
+          {
+            char stats[160];
+            std::snprintf(stats, sizeof(stats),
+                          "count=%d trig=%llu failed=%d",
+                          m_wd.count,
+                          (unsigned long long)m_wd.total_trigger,
+                          m_wd.failed);
+            r->drawString(std::string(stats), false, kMarginX, yy, fontSize,
+                          col);
+            yy += lineH;
+          }
+
+          // Determine which fromU member gen2 fills, mirroring Breeze
+          // gen2menu.cpp's display logic:
+          //
+          //   memory watch (read|write == true) -> ALWAYS fromU.from2[]
+          //       (gen2 stores access PC + LR + stack slots, even when
+          //        stack_check_count == 0; the stack array is just zeros
+          //        in that case)
+          //
+          //   instruction watch (read==false && write==false):
+          //       stack_check_count == 0  -> fromU.from[]
+          //           (entries hold the value of register X<i> at PC)
+          //       stack_check_count >  0  -> fromU.from2[]
+          //           (same Xi value plus stack scan slots)
+          const bool memWatch = m_wd.read || m_wd.write;
+          const bool useFrom2 =
+              memWatch || (m_wd.stack_check_count > 0);
+          const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
+          const int rows = std::min<int>(m_wd.count, 12); // fit on screen
+          for (int i = 0; i < rows; i++) {
+            u64 address;
+            u32 call_from;
+            int count;
+            if (useFrom2) {
+              const auto &fs = m_wd.fromU.from2[i].from_stack;
+              address   = fs.address;
+              call_from = fs.call_from;
+              count     = m_wd.fromU.from2[i].count;
+            } else {
+              const auto &fe = m_wd.fromU.from[i];
+              address   = fe.address;
+              call_from = fe.call_from;
+              count     = fe.count;
+            }
+            char line[192];
+            if (memWatch) {
+              // Memory watch: address is the PC of the load/store
+              // instruction. Print as M+offset and show LR offset.
+              std::snprintf(line, sizeof(line),
+                            "[M+%lX] cf=%lX n=%d",
+                            (u64)address - mainBase,
+                            (u64)call_from << 2, count);
+            } else {
+              // Instruction watch: address is the value of register
+              // X<i> captured at the watched PC. Show the register
+              // index and the value (raw, not M-relative).
+              std::snprintf(line, sizeof(line),
+                            "X%u=0x%lX cf=%lX n=%d",
+                            (unsigned)m_wd.i,
+                            (u64)address,
+                            (u64)call_from << 2, count);
+            }
+            r->drawString(std::string(line), false, kMarginX, yy, fontSize,
+                          col);
+            yy += lineH;
+          }
+        });
+    return drawer;
+  }
+
+  virtual void update() override {
+    // First tick: do the (slow) gen2 setup so the overlay is already
+    // visible with the "setting up..." message.
+    if (!m_setupOk && m_setupError.empty()) {
+      m_setupOk = setupOnce();
+      // We deliberately don't tear down on setup failure - the user
+      // exits via the launch combo and the destructor handles it.
+      m_refreshTick = 0;
+      return;
+    }
+    // Refresh ~5 Hz.
+    if ((++m_refreshTick % 12) != 0) return;
+    if (!m_setupOk) return;
+    if (R_FAILED(BreezeGen2::Gen2Open())) return;
+    BreezeGen2::ReadWatchData(&m_wd);
+    BreezeGen2::Gen2Close();
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysDown; (void)keysHeld;
+    (void)leftJoyStick; (void)rightJoyStick;
+    // All input is ignored; game gets controller via requestForeground(false).
+    // Launch combo hides the overlay; re-summon returns to BookmarkMenu.
+    return true;
+  }
+};
+
 class BookmarkOverlay : public tsl::Overlay {
 public:
   virtual void onShow() override {
-    // Re-summoning the overlay while a monitor-mode Gui is on top returns
-    // us to the normal bookmark list. The system hides the overlay when
-    // the user presses the launch combo; show() is invoked when they hit
-    // it again. dynamic_cast is unavailable (RTTI disabled), so we rely on
-    // a global flag set by BookmarkMonitorMenu's ctor/dtor.
+    // Re-summoning the overlay while a monitor-mode or watch-mode Gui
+    // is on top returns us to the normal bookmark list. The system
+    // hides the overlay when the user presses the launch combo;
+    // show() is invoked when they hit it again. dynamic_cast is
+    // unavailable (RTTI disabled), so we rely on global flags set by
+    // BookmarkMonitorMenu / BookmarkWatchMenu ctors/dtors.
     extern std::atomic<bool> g_bmInMonitor;
-    if (!g_bmInMonitor.load(std::memory_order_acquire)) return;
+    extern std::atomic<bool> g_bmInWatch;
+    const bool inMonitor = g_bmInMonitor.load(std::memory_order_acquire);
+    const bool inWatch   = g_bmInWatch.load(std::memory_order_acquire);
+    if (!inMonitor && !inWatch) return;
     // Only pop if there is something underneath (BookmarkMenu) so we
     // don't accidentally close the overlay if the stack got disturbed.
     auto *ovl = tsl::Overlay::get();
     if (ovl == nullptr) return;
-    // tsl::Overlay exposes the Gui stack only through getCurrentGui();
-    // since we always changeTo<BookmarkMonitorMenu>() from BookmarkMenu,
-    // stack size is >= 2 here in normal operation. tsl::goBack() will
-    // also self-protect by calling hide() instead if it would empty.
+    // tsl::goBack() pops the top Gui (which triggers its destructor -
+    // BookmarkWatchMenu's destructor handles gen2 teardown +
+    // dmnt:cht re-attach). It will self-protect by calling hide()
+    // instead if it would empty the stack.
     tsl::goBack();
   }
-  virtual void onHide() override {}
+  virtual void onHide() override {
+    // The overlay is being hidden (launch combo pressed, HOME, etc.).
+    // If a gen2 watch is running we tear it down NOW so capture stops
+    // immediately instead of continuing to accumulate hits while the
+    // overlay is invisible. We also re-attach dmnt:cht so cheats
+    // resume.
+    //
+    // The Gui stack is NOT modified here - BookmarkWatchMenu remains on
+    // top. When the user re-summons the overlay, BookmarkOverlay::onShow
+    // calls tsl::goBack() which pops the watch Gui; ~BookmarkWatchMenu
+    // will then call DetachFromGame() + ForceOpenCheatProcess again,
+    // both of which are no-ops because DetachFromGame self-guards on
+    // g_gen2State.gen2_attached_to_game.
+    extern std::atomic<bool> g_bmInWatch;
+    if (g_bmInWatch.load(std::memory_order_acquire)) {
+      BreezeGen2::DetachFromGame();
+      dmntchtForceOpenCheatProcess();
+    }
+  }
 
   virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
     initializeSettingsAndDirectories();
@@ -18185,17 +19297,25 @@ public:
     nsInitialize();
     ncmInitialize();
     ult::settingsInitialized.store(true, std::memory_order_release);
-    // Defensive: ensure monitor-mode flag starts clear, in case static
-    // storage somehow survived a previous launch.
+    // Defensive: ensure monitor-mode and watch-mode flags start clear,
+    // in case static storage somehow survived a previous launch.
     g_bmInMonitor.store(false, std::memory_order_release);
+    g_bmInWatch.store(false, std::memory_order_release);
   }
 
   virtual void exitServices() override {
-    // Reclaim input in case the user exited the overlay while
-    // BookmarkMonitorMenu's destructor was bypassed.
-    if (g_bmInMonitor.load(std::memory_order_acquire)) {
+    // Reclaim input in case the user exited the overlay while a
+    // monitor-mode or watch-mode destructor was bypassed.
+    if (g_bmInMonitor.load(std::memory_order_acquire) ||
+        g_bmInWatch.load(std::memory_order_acquire)) {
       tsl::hlp::requestForeground(true);
       g_bmInMonitor.store(false, std::memory_order_release);
+      // If we were in watch mode, do a best-effort gen2 teardown so we
+      // don't leave dmnt:cht detached for the next breezehand launch.
+      if (g_bmInWatch.exchange(false, std::memory_order_acq_rel)) {
+        BreezeGen2::DetachFromGame();
+        dmntchtForceOpenCheatProcess();
+      }
     }
     dmntchtExit();
     nsExit();
