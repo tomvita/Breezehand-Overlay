@@ -1,4 +1,4 @@
-﻿/********************************************************************************
+/********************************************************************************
  * File: main.cpp
  * Author: ppkantorski
  * Description:
@@ -17466,7 +17466,7 @@ static std::vector<int> ListBookmarkFiles() {
 // =====================================================================
 namespace BreezeGen2 {
 
-constexpr const char *kGen2Version = "v0.13i";
+constexpr const char *kGen2Version = "v0.14";
 constexpr u64 kGen2TitleId         = 0x010000000000d609ULL;
 constexpr size_t kMaxCallStack     = 5;
 constexpr size_t kMaxWatchBuffer   = 0x200;
@@ -17583,7 +17583,7 @@ struct WatchData {
   u64 v1 = 0, v2 = 0;
   int size = 4;
   int vsize = 4;
-  char version[10] = "v0.13i"; // bookmark.ovl writes the expected version it was built for
+  char version[10] = "v0.14"; // bookmark.ovl writes the expected version it was built for
   u16 x30_match = 0;
   bool check_x30 = false;
   bool two_register = false;
@@ -17815,7 +17815,8 @@ static bool SetWatchpoint(u64 addr, int size,
                           int stack_check_count,
                           X30CatchType x30,
                           bool read, bool write,
-                          u32 max_trigger) {
+                          u32 max_trigger,
+                          u64 &offset) {
   if (!g_gen2State.gen2_attached_to_game) return false;
   WatchData wd{};
   if (R_FAILED(Gen2Open())) return false;
@@ -17836,6 +17837,73 @@ static bool SetWatchpoint(u64 addr, int size,
   wd.count = 0;
   wd.total_trigger = 0;
   wd.failed = 0;
+  wd.offset = offset;
+
+  if (!read && !write) {
+    u32 opcode = 0;
+    if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(addr, &opcode, 4))) {
+      std::string asmStr = ::DisassembleARM64(opcode, addr);
+      if (!asmStr.empty()) {
+        std::string mnemonic, op_str;
+        size_t space_pos = asmStr.find(' ');
+        if (space_pos != std::string::npos) {
+          mnemonic = asmStr.substr(0, space_pos);
+          op_str = asmStr.substr(space_pos + 1);
+        }
+
+        u16 reg_i = 0;
+        u8 reg_j = 0;
+        u8 reg_k = 0;
+        bool two_reg = false;
+        u64 parsed_offset = 0;
+
+        if (mnemonic[0] == 'b' && !op_str.empty() && op_str[0] == 'x') {
+          reg_i = 0;
+        } else if (mnemonic[0] == 's' || mnemonic[0] == 'l') {
+          size_t i = 0;
+          while (i < op_str.length() && op_str[i] != '[') i++;
+          if (i < op_str.length()) {
+            if (i + 2 < op_str.length() && op_str[i + 1] == 's' && op_str[i + 2] == 'p') {
+              reg_i = 31;
+            } else {
+              reg_i = std::strtoul(op_str.c_str() + i + 2, NULL, 10);
+            }
+
+            while (i < op_str.length() && op_str[i] != ',') i++;
+            if (i < op_str.length() && i + 2 < op_str.length() && (op_str[i + 2] == 'x' || op_str[i + 2] == 'w')) {
+              i += 2;
+              reg_j = std::strtoul(op_str.c_str() + i + 1, NULL, 10);
+              two_reg = true;
+              while (i < op_str.length() && op_str[i] != ',') i++;
+              if (i < op_str.length() && i + 5 < op_str.length() && op_str[i + 5] == '#') {
+                reg_k = std::strtoul(op_str.c_str() + i + 6, NULL, 10);
+              } else {
+                reg_k = 0;
+              }
+            } else {
+              two_reg = false;
+              size_t hash_pos = op_str.find('#', i);
+              if (hash_pos != std::string::npos) {
+                parsed_offset = std::strtoul(op_str.c_str() + hash_pos + 1, NULL, 10);
+              }
+              size_t hex_pos = op_str.find('x', i);
+              if (hex_pos != std::string::npos) {
+                parsed_offset = std::strtoul(op_str.c_str() + hex_pos + 1, NULL, 16);
+              }
+            }
+          }
+        }
+
+        wd.i = reg_i;
+        wd.j = reg_j;
+        wd.k = reg_k;
+        wd.two_register = two_reg;
+        offset = parsed_offset;
+        wd.offset = parsed_offset;
+      }
+    }
+  }
+
   ExecuteWatchData(&wd, 200'000'000ULL);
 
   return wd.failed == 0;
@@ -18237,7 +18305,8 @@ public:
     }
 
     persistSelection();
-    tsl::changeTo<BookmarkWatchMenu>(abs_address, BookmarkLabel(bm));
+    s64 offset = (bm.pointer.depth > 0) ? bm.pointer.offset[1] : 0;
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, BookmarkLabel(bm));
   }
 
   // Return the row index of the currently focused entry on this page,
@@ -18875,7 +18944,8 @@ class BookmarkWatchSettingsMenu : public tsl::Gui {
       }
       return;
     }
-    tsl::changeTo<BookmarkWatchMenu>(abs_address, BookmarkLabel(bm));
+    s64 offset = (bm.pointer.depth > 0) ? bm.pointer.offset[1] : 0;
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, BookmarkLabel(bm));
   }
 
 public:
@@ -19024,6 +19094,7 @@ public:
 // =====================================================================
 class BookmarkWatchMenu : public tsl::Gui {
   u64 m_watchAddress = 0;
+  u64 m_watchOffset = 0;
   std::string m_watchLabel;
   u32 m_refreshTick = 0;
   // Latest gen2 watch_data snapshot, refreshed by update().
@@ -19039,8 +19110,8 @@ public:
   // first so the overlay is visible while the (potentially slow)
   // attach/sleep dance happens. The actual gen2 setup is done in
   // the first update() call.
-  BookmarkWatchMenu(u64 watchAddress, std::string label)
-      : m_watchAddress(watchAddress), m_watchLabel(std::move(label)) {
+  BookmarkWatchMenu(u64 watchAddress, u64 watchOffset, std::string label)
+      : m_watchAddress(watchAddress), m_watchOffset(watchOffset), m_watchLabel(std::move(label)) {
     g_bmInWatch.store(true, std::memory_order_release);
     // Hand input to the game.
     tsl::hlp::requestForeground(false);
@@ -19075,7 +19146,7 @@ public:
 
     // Release dmnt:cht's grip so gen2 can attach.
     dmntchtResumeCheatProcess();
-    dmntchtForceCloseCheatProcess();
+    // dmntchtForceCloseCheatProcess();
     svcSleepThread(50'000'000ULL);
 
     if (!BreezeGen2::EnsureInitialized()) {
@@ -19098,7 +19169,8 @@ public:
             (BreezeGen2::X30CatchType)g_bmState.watchX30TypeIdx,
             g_bmState.watchRead,
             g_bmState.watchWrite,
-            g_bmState.watchMaxTrigger)) {
+            g_bmState.watchMaxTrigger,
+            m_watchOffset)) {
       m_setupError = "gen2 failed to set watchpoint";
       BreezeGen2::DetachFromGame();
       dmntchtForceOpenCheatProcess();
@@ -19184,23 +19256,99 @@ public:
               call_from = fe.call_from;
               count     = fe.count;
             }
+
+            // Disassemble the accessing instruction
+            std::string asmStr;
+            u32 opcode = 0;
+            u64 insnAddr = mainBase + ((u64)call_from << 2);
+            if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+              asmStr = DisassembleARM64(opcode, insnAddr);
+              if (asmStr.empty()) {
+                char raw[16];
+                std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                asmStr = raw;
+              }
+            }
+
             char line[192];
             if (memWatch) {
-              // Memory watch: address is the PC of the load/store
-              // instruction. Print as M+offset and show LR offset.
+              // Read watched memory value
+              u64 val = 0;
+              bool readOk = false;
+              if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(address, &val, m_wd.size))) {
+                readOk = true;
+              }
+              char valStr[32] = "";
+              if (readOk) {
+                if (m_wd.size == 1) {
+                  std::snprintf(valStr, sizeof(valStr), "0x%02X", (unsigned)val);
+                } else if (m_wd.size == 2) {
+                  std::snprintf(valStr, sizeof(valStr), "0x%04X", (unsigned)val);
+                } else if (m_wd.size == 4) {
+                  std::snprintf(valStr, sizeof(valStr), "0x%08X", (unsigned)val);
+                } else {
+                  std::snprintf(valStr, sizeof(valStr), "0x%016lX", (unsigned long)val);
+                }
+              } else {
+                std::snprintf(valStr, sizeof(valStr), "???");
+              }
+              // Memory watch: address is the watched memory address.
               std::snprintf(line, sizeof(line),
-                            "[M+%lX] cf=%lX n=%d",
+                            "[M+%lX] cf=%lX %s val=%s n=%d",
                             (u64)address - mainBase,
-                            (u64)call_from << 2, count);
+                            (u64)call_from << 2,
+                            asmStr.c_str(),
+                            valStr, count);
             } else {
-              // Instruction watch: address is the value of register
-              // X<i> captured at the watched PC. Show the register
-              // index and the value (raw, not M-relative).
-              std::snprintf(line, sizeof(line),
-                            "X%u=0x%lX cf=%lX n=%d",
-                            (unsigned)m_wd.i,
-                            (u64)address,
-                            (u64)call_from << 2, count);
+              // Instruction watch: address is the value of register X<i> (or X<i>+X<j>)
+              u64 regVal = address;
+              u64 val = 0;
+              bool readOk = false;
+              u64 targetAddr = regVal + m_watchOffset;
+              if (targetAddr > 0x10000 && targetAddr < 0x8000000000ULL) {
+                if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(targetAddr, &val, 4))) {
+                  readOk = true;
+                }
+              }
+              if (m_wd.two_register) {
+                if (readOk) {
+                  std::snprintf(line, sizeof(line),
+                                "X%u+X%u=0x%lX->0x%08X cf=%lX n=%d",
+                                (unsigned)m_wd.i, (unsigned)m_wd.j, (u64)regVal, (unsigned)val,
+                                (u64)call_from << 2, count);
+                } else {
+                  std::snprintf(line, sizeof(line),
+                                "X%u+X%u=0x%lX cf=%lX n=%d",
+                                (unsigned)m_wd.i, (unsigned)m_wd.j, (u64)regVal,
+                                (u64)call_from << 2, count);
+                }
+              } else {
+                if (m_watchOffset != 0) {
+                  if (readOk) {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX+0x%lX->0x%08X cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (u64)m_watchOffset, (unsigned)val,
+                                  (u64)call_from << 2, count);
+                  } else {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX+0x%lX cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (u64)m_watchOffset,
+                                  (u64)call_from << 2, count);
+                  }
+                } else {
+                  if (readOk) {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX->0x%08X cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (unsigned)val,
+                                  (u64)call_from << 2, count);
+                  } else {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal,
+                                  (u64)call_from << 2, count);
+                  }
+                }
+              }
             }
             r->drawString(std::string(line), false, kMarginX, yy, fontSize,
                           col);
