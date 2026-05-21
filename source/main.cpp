@@ -17915,6 +17915,20 @@ static std::string FormatBookmarkValueLine(
   return std::string("[") + addrStr + "] " + typeName + "=" + valueStr;
 }
 
+static std::string FormatWatchHeaderValue(u64 addr,
+                                         BreezeBookmark::BreezeSearchType type) {
+  u64 raw = 0;
+  bool readOk = R_SUCCEEDED(
+      dmntchtReadCheatProcessMemory(addr, &raw, sizeof(u64)));
+  const char *typeName =
+      ((u32)type < (sizeof(BreezeBookmark::kBreezeTypeNames) /
+                   sizeof(BreezeBookmark::kBreezeTypeNames[0])))
+          ? BreezeBookmark::kBreezeTypeNames[type]
+          : "?";
+  std::string valueStr = readOk ? BreezeBookmark::FormatValue(raw, type) : "-";
+  return std::string(typeName) + "=" + valueStr;
+}
+
 static std::string BookmarkLabel(
     const BreezeBookmark::BreezeBookmarkEntry &bm) {
   char labelBuf[20];
@@ -18187,7 +18201,8 @@ public:
 
     persistSelection();
     s64 offset = (bm.pointer.depth > 0) ? bm.pointer.offset[1] : 0;
-    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, BookmarkLabel(bm));
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, bm.type,
+                                      BookmarkLabel(bm));
   }
 
   // Return the row index of the currently focused entry on this page,
@@ -18826,7 +18841,8 @@ class BookmarkWatchSettingsMenu : public tsl::Gui {
       return;
     }
     s64 offset = (bm.pointer.depth > 0) ? bm.pointer.offset[1] : 0;
-    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, BookmarkLabel(bm));
+    tsl::changeTo<BookmarkWatchMenu>(abs_address, offset, bm.type,
+                                      BookmarkLabel(bm));
   }
 
 public:
@@ -18976,6 +18992,8 @@ public:
 class BookmarkWatchMenu : public tsl::Gui {
   u64 m_watchAddress = 0;
   u64 m_watchOffset = 0;
+  BreezeBookmark::BreezeSearchType m_watchType =
+      BreezeBookmark::BREEZE_TYPE_U32;
   std::string m_watchLabel;
   u32 m_refreshTick = 0;
   // Latest gen2 watch_data snapshot, refreshed by update().
@@ -18991,8 +19009,13 @@ public:
   // first so the overlay is visible while the (potentially slow)
   // attach/sleep dance happens. The actual gen2 setup is done in
   // the first update() call.
-  BookmarkWatchMenu(u64 watchAddress, u64 watchOffset, std::string label)
-      : m_watchAddress(watchAddress), m_watchOffset(watchOffset), m_watchLabel(std::move(label)) {
+  BookmarkWatchMenu(u64 watchAddress, u64 watchOffset,
+                    BreezeBookmark::BreezeSearchType watchType,
+                    std::string label)
+      : m_watchAddress(watchAddress),
+        m_watchOffset(watchOffset),
+        m_watchType(watchType),
+        m_watchLabel(std::move(label)) {
     g_bmInWatch.store(true, std::memory_order_release);
     // Hand input to the game.
     tsl::hlp::requestForeground(false);
@@ -19073,12 +19096,33 @@ public:
           const s32 lineH = fontSize + 3;
 
           s32 yy = kMarginY;
-
+          const bool memWatch = m_wd.read || m_wd.write;
+          
           // Header line.
           {
-            char hdr[128];
-            std::snprintf(hdr, sizeof(hdr), "Watch %s @ %lX",
-                          m_watchLabel.c_str(), m_watchAddress);
+            char hdr[256];
+            if (memWatch) {
+              std::string watchValue =
+                  FormatWatchHeaderValue(m_watchAddress, m_watchType);
+              std::snprintf(hdr, sizeof(hdr), "Watch %s: %s",
+                            m_watchLabel.c_str(), watchValue.c_str());
+            } else {
+              // Disassemble the accessing instruction
+              std::string asmStr;
+              u32 opcode = 0;
+              u64 insnAddr = m_watchAddress;
+              if (R_SUCCEEDED(
+                      dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+                asmStr = DisassembleARM64(opcode, insnAddr);
+                if (asmStr.empty()) {
+                  char raw[16];
+                  std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                  asmStr = raw;
+                }
+              }
+              std::snprintf(hdr, sizeof(hdr), "Watch %s: %s",
+                            m_watchLabel.c_str(), asmStr.c_str());
+            }
             r->drawString(std::string(hdr), false, kMarginX, yy, fontSize, col);
             yy += lineH;
           }
@@ -19117,7 +19161,6 @@ public:
           //           (entries hold the value of register X<i> at PC)
           //       stack_check_count >  0  -> fromU.from2[]
           //           (same Xi value plus stack scan slots)
-          const bool memWatch = m_wd.read || m_wd.write;
           const bool useFrom2 =
               memWatch || (m_wd.stack_check_count > 0);
           auto appendStackSlots = [&](char *line, size_t lineSize,
