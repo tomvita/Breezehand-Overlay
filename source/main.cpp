@@ -1,4 +1,4 @@
-/********************************************************************************
+﻿/********************************************************************************
  * File: main.cpp
  * Author: ppkantorski
  * Description:
@@ -19256,49 +19256,23 @@ public:
               call_from = fe.call_from;
               count     = fe.count;
             }
-
-            // Disassemble the accessing instruction
-            std::string asmStr;
-            u32 opcode = 0;
-            u64 insnAddr = mainBase + ((u64)call_from << 2);
-            if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
-              asmStr = DisassembleARM64(opcode, insnAddr);
-              if (asmStr.empty()) {
-                char raw[16];
-                std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
-                asmStr = raw;
-              }
-            }
-
             char line[192];
             if (memWatch) {
-              // Read watched memory value
-              u64 val = 0;
-              bool readOk = false;
-              if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(address, &val, m_wd.size))) {
-                readOk = true;
-              }
-              char valStr[32] = "";
-              if (readOk) {
-                if (m_wd.size == 1) {
-                  std::snprintf(valStr, sizeof(valStr), "0x%02X", (unsigned)val);
-                } else if (m_wd.size == 2) {
-                  std::snprintf(valStr, sizeof(valStr), "0x%04X", (unsigned)val);
-                } else if (m_wd.size == 4) {
-                  std::snprintf(valStr, sizeof(valStr), "0x%08X", (unsigned)val);
-                } else {
-                  std::snprintf(valStr, sizeof(valStr), "0x%016lX", (unsigned long)val);
+              // Disassemble the accessing instruction
+              std::string asmStr;
+              u32 opcode = 0;
+              u64 insnAddr = address;
+              if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+                asmStr = DisassembleARM64(opcode, insnAddr);
+                if (asmStr.empty()) {
+                  char raw[16];
+                  std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                  asmStr = raw;
                 }
-              } else {
-                std::snprintf(valStr, sizeof(valStr), "???");
               }
-              // Memory watch: address is the watched memory address.
-              std::snprintf(line, sizeof(line),
-                            "[M+%lX] cf=%lX %s val=%s n=%d",
-                            (u64)address - mainBase,
-                            (u64)call_from << 2,
-                            asmStr.c_str(),
-                            valStr, count);
+              std::snprintf(line, sizeof(line), "[M+%lX] cf=%lX %s n=%d",
+                            (u64)address - mainBase, (u64)call_from << 2,
+                            asmStr.c_str(), count);
             } else {
               // Instruction watch: address is the value of register X<i> (or X<i>+X<j>)
               u64 regVal = address;
