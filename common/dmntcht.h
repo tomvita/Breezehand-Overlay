@@ -93,6 +93,9 @@ Result dmntchtGetFrozenAddress(DmntFrozenAddressEntry *out, u64 address);
 Result dmntchtEnableFrozenAddress(u64 address, u64 width, u64 *out_value);
 Result dmntchtDisableFrozenAddress(u64 address);
 
+Result dmntchtGetGen2WatchData(void *buffer, size_t size);
+Result dmntchtSetGen2WatchData(const void *buffer, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
