@@ -17449,25 +17449,47 @@ static std::vector<int> ListBookmarkFiles() {
 // =====================================================================
 // Breeze gen2 fork integration.
 //
-// This implements the same in-process RPC pattern Breeze's gen2 menu
-// uses: bookmark.ovl attaches to the dmnt.gen2 sysmodule itself as a
-// debugger, locates the in-process m_watch_data struct, and pokes
-// commands/reads results via svc::{Read,Write}DebugProcessMemory.
+// This communicates with the dmnt.gen2 sysmodule via the dmnt:cht IPC
+// service. Specifically, it uses two fork-only commands:
+//   65400 GetGen2WatchData(OutBuffer)  - read sysmodule's m_watch_data
+//   65401 SetGen2WatchData(InBuffer)   - write sysmodule's m_watch_data
+// Both perform a memcpy of the entire `m_watch_data_t` struct.
+//
+// Flow per command:
+//   1. Read current state (so we don't clobber Breeze's settings).
+//   2. Set command + parameters.
+//   3. Set execute=true, done=false; write back over IPC.
+//   4. Poll-read until done==true (gen2's 50 ms tick consumes execute).
+//
+// dmnt:cht supports two concurrent sessions, so Breeze (which owns
+// dmnt:cht session 1) and bookmark.ovl (session 2) can coexist.
 //
 // All work that requires kernel privilege (svcSetHardwareBreakPoint
-// across cores, watchpoint trap handling, stack-scan inside the game's
-// process) happens INSIDE the gen2 sysmodule. We are only the client.
+// across cores, watchpoint trap handling, stack-scan inside the
+// game's process) happens INSIDE the gen2 sysmodule. We are only the
+// client.
+//
+// HISTORICAL NOTE: bookmark.ovl previously attached to the dmnt.gen2
+// sysmodule itself as a debugger (svcDebugActiveProcess on its pid)
+// and svcRead/WriteDebugProcessMemory directly into the in-process
+// `m_watch_data` global at a hand-computed offset (`+0x10030 in the
+// 8th CodeMutable region`). That was racy and broke whenever the
+// fork's NSO layout shifted. The IPC path replaces that entirely.
 //
 // Requires Breeze's gen2 fork installed at
 //   /atmosphere/contents/010000000000d609/exefs.nsp
 // with version string matching kGen2Version. Stock Atmosphere
-// dmnt.gen2 will fail the version check and the Watch feature stays
+// dmnt.gen2 will not advertise commands 65400/65401, so
+// EnsureInitialized() will return false and the Watch feature stays
 // disabled.
 // =====================================================================
 namespace BreezeGen2 {
 
 constexpr const char *kGen2Version = "v0.14";
-constexpr u64 kGen2TitleId         = 0x010000000000d609ULL;
+// Title id of the Tomvita dmnt.gen2 fork. No longer needed for IPC
+// (which goes through sm/dmnt:cht) but kept here as documentation of
+// which sysmodule we require.
+[[maybe_unused]] constexpr u64 kGen2TitleId = 0x010000000000d609ULL;
 constexpr size_t kMaxCallStack     = 5;
 constexpr size_t kMaxWatchBuffer   = 0x200;
 
@@ -17606,14 +17628,13 @@ struct WatchData {
 // Persistent state held across BookmarkMenu / BookmarkWatchMenu Guis.
 // Lives in static storage; values reset between bookmark.ovl process
 // launches (i.e. each overlay launch starts with no gen2 attach).
+//
+// As of the IPC migration, this struct no longer holds a debug handle
+// or memory offsets. It exists only to cache the one-time version
+// probe and to remember whether we have already issued ATTACH(_CONT)
+// to gen2 so we don't double-attach.
 struct Gen2State {
-  bool initialized = false;     // process scan + attach completed at least once
-  u64 pid = 0;                  // dmnt.gen2 process id
-  Handle handle = 0;            // debug handle on dmnt.gen2 (NOT on game)
-  u64 main_start = 0;           // gen2 main NSO base in its own address space
-  u64 main_end = 0;
-  u64 wd_offset = 0;            // offset from main_start to m_watch_data
-  u64 wd_address = 0;           // == main_start + wd_offset, cached for speed
+  bool initialized = false;     // version probe completed at least once
   bool gen2_attached_to_game = false; // we've issued ATTACH_CONT successfully
   bool version_matched = false;       // first read verified the version string
 };
@@ -17622,144 +17643,106 @@ static Gen2State g_gen2State;
 
 // -------------------------------------------------------------------
 // Low-level helpers.
+//
+// Previously bookmark.ovl talked to dmnt.gen2 by attaching a debug
+// handle on the sysmodule's PID and svc::{Read,Write}DebugProcessMemory
+// directly against the in-process m_watch_data struct, using a
+// hand-computed `+0x10030 inside the 8th CodeMutable region` offset.
+// That approach was racy (no atomicity guarantees, layout-drift would
+// silently corrupt state) and required the overlay to hold a debug
+// handle on a sysmodule.
+//
+// The fork already exposes the same struct via two dmnt:cht IPC
+// commands (65400 GetGen2WatchData, 65401 SetGen2WatchData). dmnt:cht
+// supports two concurrent sessions, so Breeze (session 1) and
+// bookmark.ovl (session 2) can coexist. We now use those exclusively.
+//
+// The legacy function names (Gen2Open / Gen2Close / ReadWatchData /
+// WriteWatchData / ExecuteWatchData) are preserved as thin wrappers
+// over the IPC so the rest of the file does not need to change.
 // -------------------------------------------------------------------
 
-// Returns 0 on success and writes the dmnt.gen2 pid to *out_pid.
-static Result FindGen2Pid(u64 *out_pid) {
-  Result rc = pmdmntInitialize();
-  if (R_FAILED(rc)) return rc;
-  rc = pminfoInitialize();
-  if (R_FAILED(rc)) {
-    pmdmntExit();
-    return rc;
-  }
-  s32 count = 0;
-  u64 pids[200];
-  rc = svcGetProcessList(&count, pids, 200);
-  if (R_SUCCEEDED(rc)) {
-    rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    for (s32 i = 0; i < count; i++) {
-      u64 tid = 0;
-      if (R_SUCCEEDED(pminfoGetProgramId(&tid, pids[i])) && tid == kGen2TitleId) {
-        *out_pid = pids[i];
-        rc = 0;
-        break;
-      }
-    }
-  }
-  pminfoExit();
-  pmdmntExit();
-  return rc;
-}
+// Compile-time guard: WatchData must match the gen2 fork's
+// m_watch_data_t exactly, since both sides memcpy by sizeof().
+// Re-check whenever fields are added/removed on either side.
+static_assert(sizeof(WatchData) > 0, "WatchData must be a complete type");
 
-// Open / close debug handle on dmnt.gen2.
+// No-op kept for source compatibility with the pre-IPC code. The IPC
+// session is opened once in Overlay::initServices (dmntchtInitialize)
+// and closed in Overlay::exitServices.
 static Result Gen2Open() {
-  if (g_gen2State.handle != 0) return 0;
-  if (g_gen2State.pid == 0) {
-    Result rc = FindGen2Pid(&g_gen2State.pid);
-    if (R_FAILED(rc)) return rc;
-  }
-  return svcDebugActiveProcess(&g_gen2State.handle, g_gen2State.pid);
-}
-
-static void Gen2Close() {
-  if (g_gen2State.handle != 0) {
-    svcCloseHandle(g_gen2State.handle);
-    g_gen2State.handle = 0;
-  }
-}
-
-// Walk the gen2 process's memory map exactly the same way Breeze does
-// (gen2menu.cpp::init_gen2_process) to locate the writable region that
-// contains m_watch_data. The 0x10030 offset and the "8th CodeMutable
-// region" heuristic come from Breeze; they're stable across gen2 fork
-// builds at the same source revision.
-static Result LocateWatchDataOffset() {
-  if (g_gen2State.handle == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-
-  MemoryInfo info{};
-  u32 pageinfo = 0;
-  u64 addr = 0;
-  u32 mod = 1, mod2 = 1;
-  Result rc = 0;
-  for (int count = 0; count < 100; count++) {
-    rc = svcQueryDebugProcessMemory(&info, &pageinfo, g_gen2State.handle, addr);
-    if (R_FAILED(rc)) break;
-    if (info.type == MemType_CodeStatic && info.perm == Perm_Rx) {
-      if (mod == 1) g_gen2State.main_start = info.addr;
-      mod++;
-    }
-    if (info.type == MemType_CodeMutable) {
-      if (mod == 2) {
-        g_gen2State.main_end = info.addr + info.size;
-        if (mod2++ == 8) {
-          g_gen2State.wd_offset = (info.addr - g_gen2State.main_start) + 0x10030;
-        }
-      }
-    }
-    if (info.addr + info.size == 0x8000000000ULL) break;
-    if (info.type == 0x10) break;
-    addr += info.size;
-  }
-  if (g_gen2State.main_start == 0 || g_gen2State.wd_offset == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-  }
-  g_gen2State.wd_address = g_gen2State.main_start + g_gen2State.wd_offset;
   return 0;
 }
 
-// Read/write the full m_watch_data struct.
+static void Gen2Close() {
+  // No-op for IPC path; dmntchtExit handles teardown globally.
+}
+
+// Read the full m_watch_data struct over dmnt:cht IPC.
 static Result ReadWatchData(WatchData *out) {
-  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-  }
-  return svcReadDebugProcessMemory(out, g_gen2State.handle,
-                                   g_gen2State.wd_address, sizeof(WatchData));
+  if (out == nullptr) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  return dmntchtGetGen2WatchData(out, sizeof(WatchData));
 }
 
+// Write the full m_watch_data struct over dmnt:cht IPC. The
+// sysmodule's polling thread will see execute==true within ~50 ms
+// and dispatch the command.
 static Result WriteWatchData(const WatchData *wd) {
-  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-  }
-  return svcWriteDebugProcessMemory(g_gen2State.handle, wd,
-                                    g_gen2State.wd_address, sizeof(WatchData));
+  if (wd == nullptr) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  return dmntchtSetGen2WatchData(wd, sizeof(WatchData));
 }
 
-// Set execute=true and wait briefly for done=true. Returns 0 on success.
-// Always re-opens the gen2 debug handle around the operation, mirroring
-// Breeze's pattern (open / write / close, so the gen2 sysmodule can run
-// its loop while we don't hold the debug handle).
+// Set execute=true and wait for done=true (with a fallback timeout).
+//
+// Behaviour matches the previous svc-debug-memory path: the caller
+// passes in a fully-populated WatchData, we mark it executable, push
+// it, then poll until the sysmodule clears `done` back to true and
+// reflects any results (capture buffer, attach_success, failed code).
+//
+// `wait_ns` is the *total* time budget. We poll every 20 ms because
+// the sysmodule's gen2_loop runs every 50 ms; sub-50 ms polling is
+// wasted IPC traffic. Returns 0 if the IPC writes/reads succeeded,
+// regardless of whether `done` flipped (callers should check
+// wd->done / wd->failed themselves, same as before).
 static Result ExecuteWatchData(WatchData *wd, u64 wait_ns = 200'000'000ULL) {
+  if (wd == nullptr) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
   wd->execute = true;
   wd->done = false;
-  if (R_FAILED(Gen2Open())) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
   Result rc = WriteWatchData(wd);
-  Gen2Close();
   if (R_FAILED(rc)) return rc;
-  svcSleepThread(wait_ns);
-  // Refresh state.
-  if (R_FAILED(Gen2Open())) return 0;
-  ReadWatchData(wd);
-  Gen2Close();
+
+  // Poll for done. 20 ms poll interval; gen2_loop ticks at 50 ms so
+  // we will usually catch the result on the 2nd or 3rd iteration.
+  const u64 poll_step_ns = 20'000'000ULL;
+  u64 elapsed = 0;
+  while (elapsed < wait_ns) {
+    svcSleepThread(poll_step_ns);
+    elapsed += poll_step_ns;
+    if (R_FAILED(ReadWatchData(wd))) {
+      // Transient IPC failure; keep trying until timeout.
+      continue;
+    }
+    if (wd->done) break;
+  }
   return 0;
 }
 
 // First-time gen2 discovery + version check. Caches state in g_gen2State.
-// Returns true if gen2 fork is present and version matches.
+// Returns true if gen2 fork is present and its struct layout (as
+// signaled by the version string) matches what we compiled against.
+//
+// On stock Atmosphere dmnt.gen2 (no fork), command 65400 does not
+// exist and ReadWatchData returns an error; we report not-matched
+// and the Watch feature stays disabled.
 static bool EnsureInitialized() {
   if (g_gen2State.initialized) return g_gen2State.version_matched;
   g_gen2State.initialized = true;
 
-  if (R_FAILED(Gen2Open())) return false;
-  Result rc = LocateWatchDataOffset();
-  if (R_FAILED(rc)) {
-    Gen2Close();
-    return false;
-  }
   WatchData wd{};
-  rc = ReadWatchData(&wd);
-  Gen2Close();
-  if (R_FAILED(rc)) return false;
+  if (R_FAILED(ReadWatchData(&wd))) return false;
+
   g_gen2State.version_matched =
       (std::strncmp(wd.version, kGen2Version, sizeof(wd.version)) == 0);
   return g_gen2State.version_matched;
@@ -17767,20 +17750,54 @@ static bool EnsureInitialized() {
 
 // Tell gen2 to attach to the game (after dmnt:cht has been detached).
 // Returns true on success.
+//
+// Note: with the IPC path we share the dmnt:cht session with Breeze,
+// but the cheat-VM debug handle is owned globally by dmnt:cht itself.
+// The gen2 ATTACH_CONT command tells gen2 to take ownership of that
+// handle (via SuspendDebugEvents + Gen2Attach inside the sysmodule)
+// regardless of which client requested it.
+//
+// We also publish the game's main NSO code range into m_watch_data so
+// gen2's capture path (which uses `main_start/main_end` to detect
+// return addresses on the stack and to compute x30 offsets) has the
+// right values. Breeze does the same thing in its gen2_menu execute
+// path; previously bookmark.ovl left these as zero which meant the
+// capture-side maths in ProcessDebugEvents and get_from_stack
+// produced garbage (lr << 37 overflows u64) and stack scanning
+// rejected every return address. The shift overflow alone doesn't
+// crash the game, but the bogus call_from addresses written into
+// fromU could trigger a kernel debug-exception loop on the next
+// SETW dispatch under some firmware revisions.
 static bool AttachToGame(u64 game_pid) {
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return false;
+  // Pull current sysmodule state first so we don't clobber settings
+  // the user (or Breeze) configured.
   ReadWatchData(&wd);
-  Gen2Close();
+
+  // Resolve the game's main NSO .text range. main_nso_extents covers
+  // the entire NSO (text+rodata+data); we want just the executable
+  // first region so x30/lr values from data sections don't get
+  // misidentified as return addresses. Matches Breeze's m_mainCodeEnd
+  // computation in action.cpp.
+  DmntCheatProcessMetadata meta{};
+  if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&meta))) {
+    wd.main_start = meta.main_nso_extents.base;
+    MemoryInfo mi{};
+    if (R_SUCCEEDED(dmntchtQueryCheatProcessMemory(&mi, meta.main_nso_extents.base))) {
+      wd.main_end = mi.addr + mi.size;
+    } else {
+      // Fallback: whole NSO. Less precise but better than zero.
+      wd.main_end = meta.main_nso_extents.base + meta.main_nso_extents.size;
+    }
+  }
 
   wd.command = GEN2_ATTACH_CONT;
   wd.next_pid = game_pid;
   wd.attached = true; // overwrite check, matches Breeze
   ExecuteWatchData(&wd, 200'000'000ULL);
 
-  if (R_FAILED(Gen2Open())) return false;
+  // Re-read to pick up attach_success.
   ReadWatchData(&wd);
-  Gen2Close();
   g_gen2State.gen2_attached_to_game = wd.attach_success;
   return wd.attach_success;
 }
@@ -17789,18 +17806,14 @@ static bool AttachToGame(u64 game_pid) {
 static void DetachFromGame() {
   if (!g_gen2State.gen2_attached_to_game) return;
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return;
   ReadWatchData(&wd);
-  Gen2Close();
 
   if (wd.address != 0) {
     wd.command = GEN2_CLEARW;
     ExecuteWatchData(&wd, 100'000'000ULL);
   }
 
-  if (R_FAILED(Gen2Open())) return;
   ReadWatchData(&wd);
-  Gen2Close();
   wd.command = GEN2_DETACH;
   ExecuteWatchData(&wd, 100'000'000ULL);
 
@@ -17819,9 +17832,7 @@ static bool SetWatchpoint(u64 addr, int size,
                           u64 &offset) {
   if (!g_gen2State.gen2_attached_to_game) return false;
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return false;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return false;
 
   wd.command = GEN2_SETW;
   wd.next_address = addr;
@@ -19388,9 +19399,7 @@ public:
     // Refresh ~5 Hz.
     if ((++m_refreshTick % 12) != 0) return;
     if (!m_setupOk) return;
-    if (R_FAILED(BreezeGen2::Gen2Open())) return;
-    BreezeGen2::ReadWatchData(&m_wd);
-    BreezeGen2::Gen2Close();
+    if (R_FAILED(BreezeGen2::ReadWatchData(&m_wd))) return;
   }
 
   virtual bool handleInput(u64 keysDown, u64 keysHeld,

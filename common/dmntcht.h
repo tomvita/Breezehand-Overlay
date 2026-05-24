@@ -93,6 +93,26 @@ Result dmntchtGetFrozenAddress(DmntFrozenAddressEntry *out, u64 address);
 Result dmntchtEnableFrozenAddress(u64 address, u64 width, u64 *out_value);
 Result dmntchtDisableFrozenAddress(u64 address);
 
+/* Tomvita dmnt.gen2 fork extensions (cmd 65400/65401).
+ *
+ * The gen2 sysmodule exposes the in-process `m_watch_data` struct via
+ * two extra dmnt:cht commands. Clients (Breeze, bookmark.ovl) memcpy
+ * the whole struct in/out and the sysmodule's gen2 worker thread
+ * reacts when `execute == true` is observed.
+ *
+ * `size` must equal `sizeof(m_watch_data_t)`; the sysmodule clamps to
+ * `min(sizeof(server_struct), buffer_size)` so passing a smaller
+ * buffer silently truncates. Both client and server MUST agree on
+ * struct layout (`version` field == GEN2_VERSION).
+ *
+ * These commands are only present in Tomvita's gen2 fork. On stock
+ * Atmosphere dmnt.gen2 they will return an error
+ * (`ResultCheatUnknownCommandId`-equivalent) and the caller should
+ * treat that as "fork not installed".
+ */
+Result dmntchtGetGen2WatchData(void *buffer, size_t size);
+Result dmntchtSetGen2WatchData(const void *buffer, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
