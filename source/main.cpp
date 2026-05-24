@@ -17449,10 +17449,9 @@ static std::vector<int> ListBookmarkFiles() {
 // =====================================================================
 // Breeze gen2 fork integration.
 //
-// This implements the same in-process RPC pattern Breeze's gen2 menu
-// uses: bookmark.ovl attaches to the dmnt.gen2 sysmodule itself as a
-// debugger, locates the in-process m_watch_data struct, and pokes
-// commands/reads results via svc::{Read,Write}DebugProcessMemory.
+// This implements the same client RPC pattern Breeze's gen2 menu uses:
+// bookmark.ovl sends commands and reads results through dmnt:cht IPC
+// wrappers for gen2's m_watch_data struct.
 //
 // All work that requires kernel privilege (svcSetHardwareBreakPoint
 // across cores, watchpoint trap handling, stack-scan inside the game's
@@ -17467,7 +17466,6 @@ static std::vector<int> ListBookmarkFiles() {
 namespace BreezeGen2 {
 
 constexpr const char *kGen2Version = "v0.14";
-constexpr u64 kGen2TitleId         = 0x010000000000d609ULL;
 constexpr size_t kMaxCallStack     = 5;
 constexpr size_t kMaxWatchBuffer   = 0x200;
 
@@ -17490,15 +17488,6 @@ struct FromStack {
 };
 struct From2 {
   FromStack from_stack;
-  int count;
-};
-struct FromStackA {
-  u64 address : 39;
-  u32 call_from : 25;
-  u32 stack[kMaxCallStack];
-};
-struct From2A {
-  FromStackA from_stack;
   int count;
 };
 struct From3 {
@@ -17528,7 +17517,6 @@ union FromU {
   From    from[kMaxWatchBuffer];
   From1   from1[kMaxWatchBuffer];
   From2   from2[kMaxWatchBuffer2];
-  From2A  from2a[kMaxWatchBuffer2];
   From3   from3[kMaxWatchBuffer2];
 };
 #pragma pack(pop)
@@ -17608,121 +17596,26 @@ struct WatchData {
 // launches (i.e. each overlay launch starts with no gen2 attach).
 struct Gen2State {
   bool initialized = false;     // process scan + attach completed at least once
-  u64 pid = 0;                  // dmnt.gen2 process id
-  Handle handle = 0;            // debug handle on dmnt.gen2 (NOT on game)
-  u64 main_start = 0;           // gen2 main NSO base in its own address space
-  u64 main_end = 0;
-  u64 wd_offset = 0;            // offset from main_start to m_watch_data
-  u64 wd_address = 0;           // == main_start + wd_offset, cached for speed
   bool gen2_attached_to_game = false; // we've issued ATTACH_CONT successfully
   bool version_matched = false;       // first read verified the version string
 };
 
 static Gen2State g_gen2State;
 
-// -------------------------------------------------------------------
-// Low-level helpers.
-// -------------------------------------------------------------------
-
-// Returns 0 on success and writes the dmnt.gen2 pid to *out_pid.
-static Result FindGen2Pid(u64 *out_pid) {
-  Result rc = pmdmntInitialize();
-  if (R_FAILED(rc)) return rc;
-  rc = pminfoInitialize();
-  if (R_FAILED(rc)) {
-    pmdmntExit();
-    return rc;
-  }
-  s32 count = 0;
-  u64 pids[200];
-  rc = svcGetProcessList(&count, pids, 200);
-  if (R_SUCCEEDED(rc)) {
-    rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    for (s32 i = 0; i < count; i++) {
-      u64 tid = 0;
-      if (R_SUCCEEDED(pminfoGetProgramId(&tid, pids[i])) && tid == kGen2TitleId) {
-        *out_pid = pids[i];
-        rc = 0;
-        break;
-      }
-    }
-  }
-  pminfoExit();
-  pmdmntExit();
-  return rc;
-}
-
-// Open / close debug handle on dmnt.gen2.
 static Result Gen2Open() {
-  if (g_gen2State.handle != 0) return 0;
-  if (g_gen2State.pid == 0) {
-    Result rc = FindGen2Pid(&g_gen2State.pid);
-    if (R_FAILED(rc)) return rc;
-  }
-  return svcDebugActiveProcess(&g_gen2State.handle, g_gen2State.pid);
+  return 0;
 }
 
 static void Gen2Close() {
-  if (g_gen2State.handle != 0) {
-    svcCloseHandle(g_gen2State.handle);
-    g_gen2State.handle = 0;
-  }
-}
-
-// Walk the gen2 process's memory map exactly the same way Breeze does
-// (gen2menu.cpp::init_gen2_process) to locate the writable region that
-// contains m_watch_data. The 0x10030 offset and the "8th CodeMutable
-// region" heuristic come from Breeze; they're stable across gen2 fork
-// builds at the same source revision.
-static Result LocateWatchDataOffset() {
-  if (g_gen2State.handle == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-
-  MemoryInfo info{};
-  u32 pageinfo = 0;
-  u64 addr = 0;
-  u32 mod = 1, mod2 = 1;
-  Result rc = 0;
-  for (int count = 0; count < 100; count++) {
-    rc = svcQueryDebugProcessMemory(&info, &pageinfo, g_gen2State.handle, addr);
-    if (R_FAILED(rc)) break;
-    if (info.type == MemType_CodeStatic && info.perm == Perm_Rx) {
-      if (mod == 1) g_gen2State.main_start = info.addr;
-      mod++;
-    }
-    if (info.type == MemType_CodeMutable) {
-      if (mod == 2) {
-        g_gen2State.main_end = info.addr + info.size;
-        if (mod2++ == 8) {
-          g_gen2State.wd_offset = (info.addr - g_gen2State.main_start) + 0x10030;
-        }
-      }
-    }
-    if (info.addr + info.size == 0x8000000000ULL) break;
-    if (info.type == 0x10) break;
-    addr += info.size;
-  }
-  if (g_gen2State.main_start == 0 || g_gen2State.wd_offset == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-  }
-  g_gen2State.wd_address = g_gen2State.main_start + g_gen2State.wd_offset;
-  return 0;
 }
 
 // Read/write the full m_watch_data struct.
 static Result ReadWatchData(WatchData *out) {
-  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-  }
-  return svcReadDebugProcessMemory(out, g_gen2State.handle,
-                                   g_gen2State.wd_address, sizeof(WatchData));
+  return dmntchtGetGen2WatchData(out, sizeof(WatchData));
 }
 
 static Result WriteWatchData(const WatchData *wd) {
-  if (g_gen2State.handle == 0 || g_gen2State.wd_address == 0) {
-    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-  }
-  return svcWriteDebugProcessMemory(g_gen2State.handle, wd,
-                                    g_gen2State.wd_address, sizeof(WatchData));
+  return dmntchtSetGen2WatchData(wd, sizeof(WatchData));
 }
 
 // Set execute=true and wait briefly for done=true. Returns 0 on success.
@@ -17732,16 +17625,10 @@ static Result WriteWatchData(const WatchData *wd) {
 static Result ExecuteWatchData(WatchData *wd, u64 wait_ns = 200'000'000ULL) {
   wd->execute = true;
   wd->done = false;
-  if (R_FAILED(Gen2Open())) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
   Result rc = WriteWatchData(wd);
-  Gen2Close();
   if (R_FAILED(rc)) return rc;
   svcSleepThread(wait_ns);
-  // Refresh state.
-  if (R_FAILED(Gen2Open())) return 0;
-  ReadWatchData(wd);
-  Gen2Close();
-  return 0;
+  return ReadWatchData(wd);
 }
 
 // First-time gen2 discovery + version check. Caches state in g_gen2State.
@@ -17750,15 +17637,8 @@ static bool EnsureInitialized() {
   if (g_gen2State.initialized) return g_gen2State.version_matched;
   g_gen2State.initialized = true;
 
-  if (R_FAILED(Gen2Open())) return false;
-  Result rc = LocateWatchDataOffset();
-  if (R_FAILED(rc)) {
-    Gen2Close();
-    return false;
-  }
   WatchData wd{};
-  rc = ReadWatchData(&wd);
-  Gen2Close();
+  Result rc = ReadWatchData(&wd);
   if (R_FAILED(rc)) return false;
   g_gen2State.version_matched =
       (std::strncmp(wd.version, kGen2Version, sizeof(wd.version)) == 0);
@@ -17769,18 +17649,14 @@ static bool EnsureInitialized() {
 // Returns true on success.
 static bool AttachToGame(u64 game_pid) {
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return false;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return false;
 
   wd.command = GEN2_ATTACH_CONT;
   wd.next_pid = game_pid;
   wd.attached = true; // overwrite check, matches Breeze
   ExecuteWatchData(&wd, 200'000'000ULL);
 
-  if (R_FAILED(Gen2Open())) return false;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return false;
   g_gen2State.gen2_attached_to_game = wd.attach_success;
   return wd.attach_success;
 }
@@ -17789,18 +17665,14 @@ static bool AttachToGame(u64 game_pid) {
 static void DetachFromGame() {
   if (!g_gen2State.gen2_attached_to_game) return;
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return;
 
   if (wd.address != 0) {
     wd.command = GEN2_CLEARW;
     ExecuteWatchData(&wd, 100'000'000ULL);
   }
 
-  if (R_FAILED(Gen2Open())) return;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return;
   wd.command = GEN2_DETACH;
   ExecuteWatchData(&wd, 100'000'000ULL);
 
@@ -17819,9 +17691,12 @@ static bool SetWatchpoint(u64 addr, int size,
                           u64 &offset) {
   if (!g_gen2State.gen2_attached_to_game) return false;
   WatchData wd{};
-  if (R_FAILED(Gen2Open())) return false;
-  ReadWatchData(&wd);
-  Gen2Close();
+  if (R_FAILED(ReadWatchData(&wd))) return false;
+
+  if (wd.address != 0) {
+    wd.command = GEN2_CLEARW;
+    if (R_FAILED(ExecuteWatchData(&wd, 100'000'000ULL))) return false;
+  }
 
   wd.command = GEN2_SETW;
   wd.next_address = addr;
@@ -17838,6 +17713,12 @@ static bool SetWatchpoint(u64 addr, int size,
   wd.total_trigger = 0;
   wd.failed = 0;
   wd.offset = offset;
+  DmntCheatProcessMetadata meta{};
+  if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&meta))) {
+    wd.main_start = meta.main_nso_extents.base;
+    wd.main_end = meta.main_nso_extents.base + meta.main_nso_extents.size;
+  }
+  std::memset(&wd.fromU, 0, sizeof(wd.fromU));
 
   if (!read && !write) {
     u32 opcode = 0;
@@ -19282,17 +19163,34 @@ public:
           //           (same Xi value plus stack scan slots)
           const bool useFrom2 =
               memWatch || (m_wd.stack_check_count > 0);
+          auto appendStackSlots = [&](char *line, size_t lineSize,
+                                      const BreezeGen2::FromStack &fs) {
+            if (!useFrom2 || m_wd.stack_check_count == 0) return;
+            size_t len = std::strlen(line);
+            for (u32 s = 0; s < m_wd.stack_check_count &&
+                            s < BreezeGen2::kMaxCallStack && len < lineSize; s++) {
+              const auto &slot = fs.stack[s];
+              int written = std::snprintf(line + len, lineSize - len,
+                                          " %u,M+%X",
+                                          (unsigned)slot.SP_offset,
+                                          (unsigned)(slot.code_offset << 2));
+              if (written <= 0) break;
+              len += std::min<size_t>((size_t)written, lineSize - len);
+            }
+          };
           const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
           const int rows = std::min<int>(m_wd.count, 12); // fit on screen
           for (int i = 0; i < rows; i++) {
             u64 address;
             u32 call_from;
             int count;
+            const BreezeGen2::FromStack *fromStack = nullptr;
             if (useFrom2) {
               const auto &fs = m_wd.fromU.from2[i].from_stack;
               address   = fs.address;
               call_from = fs.call_from;
               count     = m_wd.fromU.from2[i].count;
+              fromStack = &fs;
             } else {
               const auto &fe = m_wd.fromU.from[i];
               address   = fe.address;
@@ -19316,6 +19214,7 @@ public:
               std::snprintf(line, sizeof(line), "[M+%lX] cf=%lX %s n=%d",
                             (u64)address - mainBase, (u64)call_from << 2,
                             asmStr.c_str(), count);
+              if (fromStack != nullptr) appendStackSlots(line, sizeof(line), *fromStack);
             } else {
               // Instruction watch: address is the value of register X<i> (or X<i>+X<j>)
               u64 regVal = address;
@@ -19366,6 +19265,7 @@ public:
                   }
                 }
               }
+              if (fromStack != nullptr) appendStackSlots(line, sizeof(line), *fromStack);
             }
             r->drawString(std::string(line), false, kMarginX, yy, fontSize,
                           col);

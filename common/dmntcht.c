@@ -205,3 +205,17 @@ Result dmntchtEnableFrozenAddress(u64 address, u64 width, u64 *out_value) {
 Result dmntchtDisableFrozenAddress(u64 address) {
     return serviceDispatchIn(&g_dmntchtSrv, 65304, address);
 }
+
+Result dmntchtGetGen2WatchData(void *buffer, size_t size) {
+    return serviceDispatch(&g_dmntchtSrv, 65400,
+        .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
+        .buffers = { { buffer, size } },
+    );
+}
+
+Result dmntchtSetGen2WatchData(const void *buffer, size_t size) {
+    return serviceDispatch(&g_dmntchtSrv, 65401,
+        .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcMapAlias },
+        .buffers = { { buffer, size } },
+    );
+}
