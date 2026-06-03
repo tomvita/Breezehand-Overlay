@@ -18751,7 +18751,7 @@ public:
     // D-pad adjusts color/font live so the user can fine-tune from
     // monitor mode too. (D-pad input still reaches the game because we
     // called requestForeground(false) in the ctor.)
-    if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
+    if ((keysHeld & KEY_RSTICK) && (keysDown & (KEY_DLEFT | KEY_DRIGHT))) {
       int step = (keysDown & KEY_DRIGHT) ? 1 : -1;
       g_bmState.monitorColorIdx =
           (g_bmState.monitorColorIdx + step + kMonitorColorCount) %
@@ -18759,7 +18759,7 @@ public:
       BookmarkSelection::SaveDisplaySettings();
       return true;
     }
-    if (keysDown & (KEY_DUP | KEY_DDOWN)) {
+    if ((keysHeld & KEY_RSTICK) && (keysDown & (KEY_DUP | KEY_DDOWN))) {
       int step = (keysDown & KEY_DDOWN) ? -1 : 1;
       g_bmState.monitorFontSizeIdx =
           (g_bmState.monitorFontSizeIdx + step + kMonitorFontSizeCount) %
