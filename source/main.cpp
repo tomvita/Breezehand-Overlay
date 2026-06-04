@@ -1,4 +1,4 @@
-﻿/********************************************************************************
+/********************************************************************************
  * File: main.cpp
  * Author: ppkantorski
  * Description:
@@ -17465,7 +17465,7 @@ static std::vector<int> ListBookmarkFiles() {
 // =====================================================================
 namespace BreezeGen2 {
 
-constexpr const char *kGen2Version = "v0.14";
+constexpr const char *kGen2Version = "v0.15";
 constexpr size_t kMaxCallStack     = 5;
 constexpr size_t kMaxWatchBuffer   = 0x200;
 
@@ -17529,6 +17529,11 @@ enum Gen2Command : u32 {
   GEN2_ATTACH_CONT,
   GEN2_CONT,
   GEN2_INCPC,
+  GEN2_SETB,
+  GEN2_CLEARB,
+  GEN2_STEP,
+  GEN2_STEPOVER,
+  GEN2_SETREGS
 };
 
 enum X30CatchType : u8 {
@@ -17539,6 +17544,21 @@ enum X30CatchType : u8 {
   X30_EXCLUSIVE_SEARCH,
   X30_END_OF_TYPE,
 };
+
+struct alignas(16) WatchThreadContext {
+  u64 r[29];
+  u64 fp;
+  u64 lr;
+  u64 sp;
+  u64 pc;
+  u32 pstate;
+  u32 padding;
+  struct { u64 lo; u64 hi; } v[32];
+  u32 fpcr;
+  u32 fpsr;
+  u64 tpidr;
+};
+
 
 // Exact mirror of Breeze's m_watch_data_t. The gen2 sysmodule reads
 // from / writes to this exact layout in its own memory; we either
@@ -17571,7 +17591,7 @@ struct WatchData {
   u64 v1 = 0, v2 = 0;
   int size = 4;
   int vsize = 4;
-  char version[10] = "v0.14"; // bookmark.ovl writes the expected version it was built for
+  char version[10] = "v0.15"; // bookmark.ovl writes the expected version it was built for
   u16 x30_match = 0;
   bool check_x30 = false;
   bool two_register = false;
@@ -17589,6 +17609,14 @@ struct WatchData {
   bool grab_R = false;
   u8 Register = 14;
   u64 Register_match_value = 0;
+  bool bp_hit = false;
+  u64 bp_addr = 0;
+  u64 bp_thread_id = 0;
+  WatchThreadContext bp_ctx{};
+  bool bp_match_trigger = false;
+  u64 bp_match_pc = 0;
+  u64 bp_match_lr = 0;
+  u32 bp_original_insn = 0;
 };
 
 // Persistent state held across BookmarkMenu / BookmarkWatchMenu Guis.
@@ -17637,7 +17665,8 @@ static bool EnsureInitialized() {
   if (g_gen2State.initialized) return g_gen2State.version_matched;
   g_gen2State.initialized = true;
 
-  WatchData wd{};
+  auto wd_ptr = std::make_unique<WatchData>();
+  WatchData &wd = *wd_ptr;
   Result rc = ReadWatchData(&wd);
   if (R_FAILED(rc)) return false;
   g_gen2State.version_matched =
@@ -17648,7 +17677,8 @@ static bool EnsureInitialized() {
 // Tell gen2 to attach to the game (after dmnt:cht has been detached).
 // Returns true on success.
 static bool AttachToGame(u64 game_pid) {
-  WatchData wd{};
+  auto wd_ptr = std::make_unique<WatchData>();
+  WatchData &wd = *wd_ptr;
   if (R_FAILED(ReadWatchData(&wd))) return false;
 
   wd.command = GEN2_ATTACH_CONT;
@@ -17664,7 +17694,8 @@ static bool AttachToGame(u64 game_pid) {
 // Tell gen2 to detach from the game and clear any watchpoints.
 static void DetachFromGame() {
   if (!g_gen2State.gen2_attached_to_game) return;
-  WatchData wd{};
+  auto wd_ptr = std::make_unique<WatchData>();
+  WatchData &wd = *wd_ptr;
   if (R_FAILED(ReadWatchData(&wd))) return;
 
   if (wd.address != 0) {
@@ -17690,7 +17721,8 @@ static bool SetWatchpoint(u64 addr, int size,
                           u32 max_trigger,
                           u64 &offset) {
   if (!g_gen2State.gen2_attached_to_game) return false;
-  WatchData wd{};
+  auto wd_ptr = std::make_unique<WatchData>();
+  WatchData &wd = *wd_ptr;
   if (R_FAILED(ReadWatchData(&wd))) return false;
 
   if (wd.address != 0) {
@@ -17854,6 +17886,8 @@ constexpr int    kWatchX30Count           = 5;
 std::atomic<bool> g_bmInMonitor{false};
 // True while a BookmarkWatchMenu is the active Gui.
 std::atomic<bool> g_bmInWatch{false};
+// True while a BookmarkTraceMenu is the active Gui.
+std::atomic<bool> g_bmInTrace{false};
 // Page offset to apply to the next BookmarkMenu instance, set by L/R
 // page navigation before swapTo<BookmarkMenu>. Reset back to 0 after
 // being consumed in the constructor.
@@ -18972,6 +19006,550 @@ public:
   }
 };
 
+class BookmarkTraceMenu : public tsl::Gui {
+  u64 m_watchAddress;
+  u64 m_watchOffset;
+  BreezeBookmark::BreezeSearchType m_watchType;
+  std::string m_watchLabel;
+  BreezeGen2::WatchData m_wd;
+
+  bool m_bpWaiting = false;
+  u64 m_bpAddr = 0;
+  u32 m_refreshTick = 0;
+  size_t m_selectedLineIdx = 0;
+
+  bool m_fpuMode = false;      // Toggle between integer and FPU registers
+  bool m_doublePrec = false;   // Toggle float vs double precision for FPU registers
+  s32 m_selectedRegRow = 0;    // 0 to 16
+  s32 m_selectedRegCol = 0;    // 0 to 1
+  bool m_stepActive = false;
+
+  struct TraceLine {
+    u64 target_pc;
+    u64 target_lr;
+    std::string text;
+  };
+  std::vector<TraceLine> m_traceLines;
+
+public:
+  BookmarkTraceMenu(u64 watchAddress, u64 watchOffset,
+                    BreezeBookmark::BreezeSearchType watchType,
+                    std::string label,
+                    const BreezeGen2::WatchData &wd)
+      : m_watchAddress(watchAddress),
+        m_watchOffset(watchOffset),
+        m_watchType(watchType),
+        m_watchLabel(label),
+        m_wd(wd) {
+    g_bmInTrace.store(true, std::memory_order_release);
+    rebuildTraceLines();
+  }
+
+  virtual ~BookmarkTraceMenu() {
+    tsl::hlp::requestForeground(false);
+    g_bmInTrace.store(false, std::memory_order_release);
+  }
+
+  void rebuildTraceLines() {
+    m_traceLines.clear();
+    const bool memWatch = m_wd.read || m_wd.write;
+    const bool useFrom2 = memWatch || (m_wd.stack_check_count > 0);
+    const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
+    const int rows = std::min<int>(m_wd.count, 12);
+
+    for (int i = 0; i < rows; ++i) {
+      TraceLine tl;
+      u64 address;
+      u32 call_from;
+      int count;
+      if (useFrom2) {
+        const auto &fs = m_wd.fromU.from2[i].from_stack;
+        address = (u64)fs.address & 0x7FFFFFFFFFULL;
+        call_from = fs.call_from;
+        count = m_wd.fromU.from2[i].count;
+      } else {
+        const auto &fe = m_wd.fromU.from[i];
+        address = (u64)fe.address & 0x7FFFFFFFFFULL;
+        call_from = fe.call_from;
+        count = fe.count;
+      }
+
+      char line[192];
+      if (memWatch) {
+        // Disassemble the accessing instruction
+        std::string asmStr;
+        u32 opcode = 0;
+        u64 insnAddr = address;
+        if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+          asmStr = DisassembleARM64(opcode, insnAddr);
+          if (asmStr.empty()) {
+            char raw[16];
+            std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+            asmStr = raw;
+          }
+        }
+        std::snprintf(line, sizeof(line), "[M+%lX] %s n=%d",
+                      (u64)address - mainBase, asmStr.c_str(), count);
+        tl.target_pc = address;
+        tl.target_lr = mainBase + ((u64)call_from << 2);
+      } else {
+        // Instruction watch: address is register value
+        u64 regVal = address;
+        if (m_wd.two_register) {
+          std::snprintf(line, sizeof(line), "X%u+X%u=0x%lX cf=%lX n=%d",
+                        (unsigned)m_wd.i, (unsigned)m_wd.j, (u64)regVal,
+                        (u64)call_from << 2, count);
+        } else {
+          if (m_watchOffset != 0) {
+            std::snprintf(line, sizeof(line), "X%u=0x%lX+0x%lX cf=%lX n=%d",
+                          (unsigned)m_wd.i, (u64)regVal, (u64)m_watchOffset,
+                          (u64)call_from << 2, count);
+          } else {
+            std::snprintf(line, sizeof(line), "X%u=0x%lX cf=%lX n=%d",
+                          (unsigned)m_wd.i, (u64)regVal, (u64)call_from << 2, count);
+          }
+        }
+        tl.target_pc = m_watchAddress;
+        tl.target_lr = mainBase + ((u64)call_from << 2);
+      }
+      tl.text = line;
+      m_traceLines.push_back(tl);
+    }
+  }
+
+  void GetRegisterString(char *buf, size_t buf_size, int row, int col) {
+    if (!m_fpuMode) {
+      if (row < 14) {
+        int reg_idx = row * 2 + col;
+        std::snprintf(buf, buf_size, "X%d: 0x%lX", reg_idx, m_wd.bp_ctx.r[reg_idx]);
+      } else if (row == 14) {
+        if (col == 0) {
+          std::snprintf(buf, buf_size, "X28: 0x%lX", m_wd.bp_ctx.r[28]);
+        } else {
+          std::snprintf(buf, buf_size, "FP : 0x%lX", m_wd.bp_ctx.fp);
+        }
+      } else if (row == 15) {
+        if (col == 0) {
+          std::snprintf(buf, buf_size, "LR : 0x%lX", m_wd.bp_ctx.lr);
+        } else {
+          std::snprintf(buf, buf_size, "SP : 0x%lX", m_wd.bp_ctx.sp);
+        }
+      } else if (row == 16) {
+        if (col == 0) {
+          std::snprintf(buf, buf_size, "PC : 0x%lX", m_wd.bp_ctx.pc);
+        } else {
+          std::snprintf(buf, buf_size, "PS : 0x%X", m_wd.bp_ctx.pstate);
+        }
+      }
+    } else {
+      if (row < 16) {
+        int reg_idx = row * 2 + col;
+        if (!m_doublePrec) {
+          float fval = *(float*)&m_wd.bp_ctx.v[reg_idx].lo;
+          std::snprintf(buf, buf_size, "V%d: %.6g", reg_idx, fval);
+        } else {
+          double dval = *(double*)&m_wd.bp_ctx.v[reg_idx].lo;
+          std::snprintf(buf, buf_size, "V%d: %.12g", reg_idx, dval);
+        }
+      } else if (row == 16) {
+        if (col == 0) {
+          std::snprintf(buf, buf_size, "FPSR: 0x%X", m_wd.bp_ctx.fpsr);
+        } else {
+          std::snprintf(buf, buf_size, "FPCR: 0x%X", m_wd.bp_ctx.fpcr);
+        }
+      }
+    }
+  }
+
+  void EditRegister() {
+    int row = m_selectedRegRow;
+    int col = m_selectedRegCol;
+
+    if (!m_fpuMode) {
+      u64 *val_ptr = nullptr;
+      u32 *val32_ptr = nullptr;
+      std::string title = "";
+
+      if (row < 14) {
+        int idx = row * 2 + col;
+        val_ptr = &m_wd.bp_ctx.r[idx];
+        title = "Edit X" + std::to_string(idx);
+      } else if (row == 14) {
+        if (col == 0) {
+          val_ptr = &m_wd.bp_ctx.r[28];
+          title = "Edit X28";
+        } else {
+          val_ptr = &m_wd.bp_ctx.fp;
+          title = "Edit FP";
+        }
+      } else if (row == 15) {
+        if (col == 0) {
+          val_ptr = &m_wd.bp_ctx.lr;
+          title = "Edit LR";
+        } else {
+          val_ptr = &m_wd.bp_ctx.sp;
+          title = "Edit SP";
+        }
+      } else if (row == 16) {
+        if (col == 0) {
+          val_ptr = &m_wd.bp_ctx.pc;
+          title = "Edit PC";
+        } else {
+          val32_ptr = &m_wd.bp_ctx.pstate;
+          title = "Edit PSTATE";
+        }
+      }
+
+      char initial[64];
+      if (val_ptr) {
+        std::snprintf(initial, sizeof(initial), "0x%lX", *val_ptr);
+      } else {
+        std::snprintf(initial, sizeof(initial), "0x%X", *val32_ptr);
+      }
+
+      tsl::changeTo<tsl::KeyboardGui>(
+          val_ptr ? SEARCH_TYPE_UNSIGNED_64BIT : SEARCH_TYPE_UNSIGNED_32BIT,
+          initial, title,
+          [val_ptr, val32_ptr, this](std::string result) {
+            u64 val = std::strtoull(result.c_str(), nullptr, 0);
+            if (val_ptr) {
+              *val_ptr = val;
+            } else {
+              *val32_ptr = (u32)val;
+            }
+            m_wd.command = BreezeGen2::GEN2_SETREGS;
+            BreezeGen2::ExecuteWatchData(&m_wd);
+            tsl::goBack();
+          });
+    } else {
+      if (row < 16) {
+        int idx = row * 2 + col;
+        char initial[64];
+        if (!m_doublePrec) {
+          float fval = *(float*)&m_wd.bp_ctx.v[idx].lo;
+          std::snprintf(initial, sizeof(initial), "%f", fval);
+        } else {
+          double dval = *(double*)&m_wd.bp_ctx.v[idx].lo;
+          std::snprintf(initial, sizeof(initial), "%f", dval);
+        }
+
+        std::string title = "Edit V" + std::to_string(idx);
+        tsl::changeTo<tsl::KeyboardGui>(
+            m_doublePrec ? SEARCH_TYPE_DOUBLE : SEARCH_TYPE_FLOAT,
+            initial, title,
+            [idx, this](std::string result) {
+              if (!m_doublePrec) {
+                float f = (float)std::strtod(result.c_str(), nullptr);
+                std::memcpy(&m_wd.bp_ctx.v[idx].lo, &f, sizeof(f));
+                m_wd.bp_ctx.v[idx].hi = 0;
+              } else {
+                double d = std::strtod(result.c_str(), nullptr);
+                std::memcpy(&m_wd.bp_ctx.v[idx].lo, &d, sizeof(d));
+                m_wd.bp_ctx.v[idx].hi = 0;
+              }
+              m_wd.command = BreezeGen2::GEN2_SETREGS;
+              BreezeGen2::ExecuteWatchData(&m_wd);
+              tsl::goBack();
+            });
+      } else if (row == 16) {
+        u32 *val32_ptr = (col == 0) ? &m_wd.bp_ctx.fpsr : &m_wd.bp_ctx.fpcr;
+        std::string title = (col == 0) ? "Edit FPSR" : "Edit FPCR";
+        char initial[64];
+        std::snprintf(initial, sizeof(initial), "0x%X", *val32_ptr);
+
+        tsl::changeTo<tsl::KeyboardGui>(
+            SEARCH_TYPE_UNSIGNED_32BIT,
+            initial, title,
+            [val32_ptr, this](std::string result) {
+              u64 val = std::strtoull(result.c_str(), nullptr, 0);
+              *val32_ptr = (u32)val;
+              m_wd.command = BreezeGen2::GEN2_SETREGS;
+              BreezeGen2::ExecuteWatchData(&m_wd);
+              tsl::goBack();
+            });
+      }
+    }
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *drawer = new tsl::elm::CustomDrawer(
+        [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+          (void)x; (void)y; (void)w; (void)h;
+
+          if (m_wd.bp_hit) {
+            // Draw Break & Trace UI (Dark premium mode)
+            r->fillScreen(tsl::Color{0x1, 0x1, 0x2, 0xF}); // Dark background
+
+            // Header
+            r->drawString("PAUSED AT BREAKPOINT", false, 16, 24, 20, tsl::Color{0xF, 0x3, 0x3, 0xF}); // Red accent
+            if (m_wd.failed != 0) {
+              char fail_str[32];
+              std::snprintf(fail_str, sizeof(fail_str), "ERR: 0x%X", m_wd.failed);
+              r->drawString(fail_str, false, 320, 24, 14, tsl::Color{0xF, 0x3, 0x3, 0xF});
+            }
+
+            char pc_str[64];
+            const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
+            std::snprintf(pc_str, sizeof(pc_str), "PC: M+%lX  TID: %lu", m_wd.bp_addr - mainBase, m_wd.bp_thread_id);
+            r->drawString(pc_str, false, 16, 50, 14, tsl::Color{0xA, 0xA, 0xA, 0xF});
+
+            // Disassembly Box (draw 5 lines of disassembly)
+            r->drawString("DISASSEMBLY", false, 16, 80, 14, tsl::Color{0x8, 0x8, 0x8, 0xF});
+            s32 yy = 100;
+            u64 start_pc = m_wd.bp_addr - 2 * 4;
+            for (int i = 0; i < 5; ++i) {
+              u64 cur_pc = start_pc + i * 4;
+              u32 opcode = 0;
+              bool read_ok = false;
+              if (cur_pc == m_wd.bp_addr && m_wd.bp_original_insn != 0) {
+                opcode = m_wd.bp_original_insn;
+                read_ok = true;
+              } else {
+                read_ok = R_SUCCEEDED(dmntchtReadCheatProcessMemory(cur_pc, &opcode, 4));
+              }
+              std::string asmStr;
+              if (read_ok) {
+                asmStr = DisassembleARM64(opcode, cur_pc);
+                if (asmStr.empty()) {
+                  char raw[16];
+                  std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                  asmStr = raw;
+                }
+              } else {
+                asmStr = "????????";
+              }
+
+              char line[128];
+              std::snprintf(line, sizeof(line), "  M+%lX:  %s", cur_pc - mainBase, asmStr.c_str());
+
+              bool is_current = (cur_pc == m_wd.bp_addr);
+              tsl::Color lineCol = is_current ? tsl::Color{0xF, 0xF, 0x4, 0xF} : tsl::Color{0x8, 0x8, 0x8, 0xF};
+              if (is_current) {
+                line[0] = '>';
+                line[1] = '>';
+              }
+              r->drawString(line, false, 16, yy, 14, lineCol);
+              yy += 18;
+            }
+
+            // Registers Box (draw registers in 2 columns)
+            r->drawString(m_fpuMode ? "FLOATING POINT REGISTERS" : "REGISTERS", false, 16, 210, 14, tsl::Color{0x8, 0x8, 0x8, 0xF});
+            s32 reg_y = 230;
+            for (int i = 0; i < 17; ++i) {
+              char r1[64] = "", r2[64] = "";
+              GetRegisterString(r1, sizeof(r1), i, 0);
+              GetRegisterString(r2, sizeof(r2), i, 1);
+              
+              bool col0_sel = (m_selectedRegRow == i && m_selectedRegCol == 0);
+              bool col1_sel = (m_selectedRegRow == i && m_selectedRegCol == 1);
+              tsl::Color col0_color = col0_sel ? tsl::Color{0xF, 0xF, 0x3, 0xF} : tsl::Color{0x7, 0x9, 0xF, 0xF};
+              tsl::Color col1_color = col1_sel ? tsl::Color{0xF, 0xF, 0x3, 0xF} : tsl::Color{0x7, 0x9, 0xF, 0xF};
+
+              if (col0_sel) {
+                r->drawString(">", false, 10, reg_y, 13, tsl::Color{0xF, 0xF, 0x3, 0xF});
+              }
+              if (col1_sel) {
+                r->drawString(">", false, 190, reg_y, 13, tsl::Color{0xF, 0xF, 0x3, 0xF});
+              }
+
+              r->drawString(r1, false, 24, reg_y, 13, col0_color);
+              r->drawString(r2, false, 204, reg_y, 13, col1_color);
+              reg_y += 16;
+            }
+
+            // Footer instructions
+            r->drawString("L3:Step Into  X:Step Over  Y:Resume  B:Clear&Resume", false, 16, 680, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
+            r->drawString("L:Toggle Int/FPU  R:Toggle Float/Double  A:Edit Reg", false, 16, 698, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
+
+          } else if (m_bpWaiting) {
+            // Draw transparent waiting screen
+            r->fillScreen(tsl::Color{0x0, 0x0, 0x0, 0x6});
+
+            const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
+            char waiting_str[128];
+            std::snprintf(waiting_str, sizeof(waiting_str), "Waiting for breakpoint at M+%lX...", m_bpAddr - mainBase);
+
+            r->drawString(waiting_str, false, 24, 300, 16, tsl::Color{0xF, 0xF, 0x4, 0xF});
+            r->drawString("Press B to Cancel", false, 24, 330, 14, tsl::Color{0xA, 0xA, 0xA, 0xF});
+
+          } else {
+            // Draw Line Selection mode
+            r->fillScreen(tsl::Color{0x1, 0x1, 0x1, 0xE});
+            r->drawString("SELECT LINE TO BREAK ON", false, 16, 24, 18, tsl::Color{0xF, 0xF, 0xF, 0xF});
+            r->drawString("A:Set BP  B:Back", false, 16, 50, 14, tsl::Color{0x8, 0x8, 0x8, 0xF});
+
+            if (m_traceLines.empty()) {
+              r->drawString("(no trace data yet)", false, 16, 120, 16, tsl::Color{0x6, 0x6, 0x6, 0xF});
+              return;
+            }
+
+            s32 yy = 100;
+            for (size_t i = 0; i < m_traceLines.size(); ++i) {
+              bool is_selected = (i == m_selectedLineIdx);
+              tsl::Color col = is_selected ? tsl::Color{0xF, 0xF, 0x3, 0xF} : tsl::Color{0xF, 0xF, 0xF, 0xF};
+              std::string text = (is_selected ? "> " : "  ") + m_traceLines[i].text;
+              r->drawString(text, false, 16, yy, 14, col);
+              yy += 24;
+            }
+          }
+        });
+    return drawer;
+  }
+
+  virtual void update() override {
+    if (m_bpWaiting || m_wd.bp_hit || m_stepActive) {
+      bool need_poll = false;
+      if (m_stepActive) {
+        need_poll = true;
+      } else if ((++m_refreshTick % 6) == 0) { // 10Hz polling
+        need_poll = true;
+      }
+
+      if (need_poll) {
+        if (R_SUCCEEDED(BreezeGen2::Gen2Open())) {
+          BreezeGen2::ReadWatchData(&m_wd);
+          BreezeGen2::Gen2Close();
+        }
+
+        if (m_bpWaiting && m_wd.bp_hit) {
+          m_bpWaiting = false;
+          tsl::hlp::requestForeground(true);
+          if (tsl::notification) {
+            tsl::notification->show("Breakpoint triggered!");
+          }
+        }
+
+        if (m_stepActive && m_wd.bp_hit) {
+          m_stepActive = false;
+        }
+      }
+    }
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysHeld; (void)touchInput;
+    (void)leftJoyStick; (void)rightJoyStick;
+
+    if (m_wd.bp_hit) {
+      if (keysDown & KEY_LSTICK) { // Step Into
+        m_wd.command = BreezeGen2::GEN2_STEP;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        m_stepActive = true;
+        return true;
+      }
+      if (keysDown & KEY_X) { // Step Over
+        m_wd.command = BreezeGen2::GEN2_STEPOVER;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        m_stepActive = true;
+        return true;
+      }
+      if (keysDown & KEY_Y) { // Resume / Continue
+        m_wd.command = BreezeGen2::GEN2_CONT;
+        m_wd.bp_hit = false;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        m_bpWaiting = true;
+        tsl::hlp::requestForeground(false);
+        return true;
+      }
+      if (keysDown & KEY_B) { // Clear BP & Resume
+        m_wd.command = BreezeGen2::GEN2_CLEARB;
+        m_wd.bp_hit = false;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        m_wd.command = BreezeGen2::GEN2_CONT;
+        m_wd.bp_hit = false;
+        m_wd.bp_match_trigger = false;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        m_bpWaiting = false;
+        return true;
+      }
+      if (keysDown & KEY_L) { // Toggle Integer vs FPU Registers
+        m_fpuMode = !m_fpuMode;
+        return true;
+      }
+      if (keysDown & KEY_R) { // Toggle Float vs Double Precision for FPU
+        m_doublePrec = !m_doublePrec;
+        return true;
+      }
+      if (keysDown & KEY_A) { // Edit selected register
+        EditRegister();
+        return true;
+      }
+
+      // Register Navigation
+      if (keysDown & KEY_DUP) {
+        m_selectedRegRow = (m_selectedRegRow + 17 - 1) % 17;
+        return true;
+      }
+      if (keysDown & KEY_DDOWN) {
+        m_selectedRegRow = (m_selectedRegRow + 1) % 17;
+        return true;
+      }
+      if (keysDown & KEY_DLEFT) {
+        m_selectedRegCol = (m_selectedRegCol + 2 - 1) % 2;
+        return true;
+      }
+      if (keysDown & KEY_DRIGHT) {
+        m_selectedRegCol = (m_selectedRegCol + 1) % 2;
+        return true;
+      }
+
+      return true; // block game input when paused
+    }
+
+    if (m_bpWaiting) {
+      if (keysDown & KEY_B) {
+        // Cancel waiting
+        m_bpWaiting = false;
+        m_wd.command = BreezeGen2::GEN2_CLEARB;
+        m_wd.bp_addr = m_bpAddr;
+        m_wd.bp_match_trigger = false;
+        BreezeGen2::ExecuteWatchData(&m_wd);
+        tsl::hlp::requestForeground(true);
+        return true;
+      }
+      return true; // continue passing input to game
+    }
+
+    // Line Selection mode input
+    if (keysDown & KEY_DUP) {
+      if (!m_traceLines.empty()) {
+        m_selectedLineIdx = (m_selectedLineIdx + m_traceLines.size() - 1) % m_traceLines.size();
+      }
+      return true;
+    }
+    if (keysDown & KEY_DDOWN) {
+      if (!m_traceLines.empty()) {
+        m_selectedLineIdx = (m_selectedLineIdx + 1) % m_traceLines.size();
+      }
+      return true;
+    }
+    if (keysDown & KEY_A) {
+      if (m_selectedLineIdx < m_traceLines.size()) {
+        m_bpAddr = m_traceLines[m_selectedLineIdx].target_pc;
+        
+        m_wd.bp_match_trigger = true;
+        m_wd.bp_match_pc = m_traceLines[m_selectedLineIdx].target_pc;
+        m_wd.bp_match_lr = m_traceLines[m_selectedLineIdx].target_lr;
+        m_wd.bp_addr = m_bpAddr;
+        BreezeGen2::WriteWatchData(&m_wd);
+
+        m_bpWaiting = true;
+        tsl::hlp::requestForeground(false);
+      }
+      return true;
+    }
+    if (keysDown & KEY_B) {
+      tsl::goBack();
+      return true;
+    }
+
+    return false;
+  }
+};
+
 // =====================================================================
 // Watch mode menu.
 //
@@ -19148,6 +19726,12 @@ public:
             yy += lineH;
           }
 
+          // Key combo hint line.
+          {
+            r->drawString("L3+Y: Trace Menu", false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+          }
+
           // Determine which fromU member gen2 fills, mirroring Breeze
           // gen2menu.cpp's display logic:
           //
@@ -19297,10 +19881,15 @@ public:
                            touchPosition touchInput,
                            JoystickPosition leftJoyStick,
                            JoystickPosition rightJoyStick) override {
-    (void)keysDown; (void)keysHeld;
+    (void)keysHeld; (void)touchInput;
     (void)leftJoyStick; (void)rightJoyStick;
-    // All input is ignored; game gets controller via requestForeground(false).
-    // Launch combo hides the overlay; re-summon returns to BookmarkMenu.
+    if ((keysDown & KEY_Y) && (keysHeld & KEY_LSTICK)) {
+      // Reclaim focus
+      tsl::hlp::requestForeground(true);
+      // Open the Trace Menu
+      tsl::changeTo<BookmarkTraceMenu>(m_watchAddress, m_watchOffset, m_watchType, m_watchLabel, m_wd);
+      return true;
+    }
     return true;
   }
 };
@@ -19331,19 +19920,13 @@ public:
   }
   virtual void onHide() override {
     // The overlay is being hidden (launch combo pressed, HOME, etc.).
-    // If a gen2 watch is running we tear it down NOW so capture stops
+    // If a gen2 watch/trace is running we tear it down NOW so capture stops
     // immediately instead of continuing to accumulate hits while the
     // overlay is invisible. We also re-attach dmnt:cht so cheats
     // resume.
-    //
-    // The Gui stack is NOT modified here - BookmarkWatchMenu remains on
-    // top. When the user re-summons the overlay, BookmarkOverlay::onShow
-    // calls tsl::goBack() which pops the watch Gui; ~BookmarkWatchMenu
-    // will then call DetachFromGame() + ForceOpenCheatProcess again,
-    // both of which are no-ops because DetachFromGame self-guards on
-    // g_gen2State.gen2_attached_to_game.
     extern std::atomic<bool> g_bmInWatch;
-    if (g_bmInWatch.load(std::memory_order_acquire)) {
+    extern std::atomic<bool> g_bmInTrace;
+    if (g_bmInWatch.load(std::memory_order_acquire) || g_bmInTrace.load(std::memory_order_acquire)) {
       BreezeGen2::DetachFromGame();
       dmntchtForceOpenCheatProcess();
     }
@@ -19362,22 +19945,26 @@ public:
     nsInitialize();
     ncmInitialize();
     ult::settingsInitialized.store(true, std::memory_order_release);
-    // Defensive: ensure monitor-mode and watch-mode flags start clear,
+    // Defensive: ensure monitor-mode, watch-mode, and trace-mode flags start clear,
     // in case static storage somehow survived a previous launch.
     g_bmInMonitor.store(false, std::memory_order_release);
     g_bmInWatch.store(false, std::memory_order_release);
+    g_bmInTrace.store(false, std::memory_order_release);
   }
 
   virtual void exitServices() override {
     // Reclaim input in case the user exited the overlay while a
-    // monitor-mode or watch-mode destructor was bypassed.
+    // monitor-mode, watch-mode, or trace-mode destructor was bypassed.
+    extern std::atomic<bool> g_bmInWatch;
+    extern std::atomic<bool> g_bmInTrace;
     if (g_bmInMonitor.load(std::memory_order_acquire) ||
-        g_bmInWatch.load(std::memory_order_acquire)) {
+        g_bmInWatch.load(std::memory_order_acquire) ||
+        g_bmInTrace.load(std::memory_order_acquire)) {
       tsl::hlp::requestForeground(true);
       g_bmInMonitor.store(false, std::memory_order_release);
-      // If we were in watch mode, do a best-effort gen2 teardown so we
-      // don't leave dmnt:cht detached for the next breezehand launch.
-      if (g_bmInWatch.exchange(false, std::memory_order_acq_rel)) {
+      bool was_watch = g_bmInWatch.exchange(false, std::memory_order_acq_rel);
+      bool was_trace = g_bmInTrace.exchange(false, std::memory_order_acq_rel);
+      if (was_watch || was_trace) {
         BreezeGen2::DetachFromGame();
         dmntchtForceOpenCheatProcess();
       }
