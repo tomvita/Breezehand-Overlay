@@ -19358,7 +19358,7 @@ public:
             }
 
             // Footer instructions
-            r->drawString("L3:Step Into  X:Step Over  Y:Resume  B:Clear&Resume", false, 16, 680, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
+            r->drawString("L3:Step Into  X:Step Over  B:Clear&Resume", false, 16, 680, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
             r->drawString("L:Toggle Int/FPU  R:Toggle Float/Double  A:Edit Reg", false, 16, 698, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
 
           } else if (m_bpWaiting) {
@@ -19446,14 +19446,7 @@ public:
         m_stepActive = true;
         return true;
       }
-      if (keysDown & KEY_Y) { // Resume / Continue
-        m_wd.command = BreezeGen2::GEN2_CONT;
-        m_wd.bp_hit = false;
-        BreezeGen2::ExecuteWatchData(&m_wd);
-        m_bpWaiting = true;
-        tsl::hlp::requestForeground(false);
-        return true;
-      }
+      // Y button handler removed
       if (keysDown & KEY_B) { // Clear BP & Resume
         m_wd.command = BreezeGen2::GEN2_CLEARB;
         m_wd.bp_hit = false;
