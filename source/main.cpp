@@ -187,6 +187,10 @@ std::vector<u32> g_focusFolderIndices; // Folder indices for focus restoration
 std::vector<std::string> g_focusFolderNames; // Folder names for focus restoration
 #endif
 
+#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL)
+std::string g_mainOvlPath = "sdmc:/switch/.overlays/breezehand.ovl";
+#endif
+
 static std::string ReplaceAll(std::string str, const std::string &from,
                               const std::string &to) {
   if (from.empty())
@@ -646,8 +650,10 @@ private:
       if ((keys & KEY_A && !(keys & ~KEY_A & ALL_KEYS_MASK))) {
 
         if (targetMenu == "softwareUpdateMenu") {
+          #ifndef BREEZEHAND_LIGHT
           deleteFileOrDirectory(SETTINGS_PATH + "RELEASE.ini");
           downloadFile(LATEST_RELEASE_INFO_URL, SETTINGS_PATH, false, true);
+          #endif
           // downloadPercentage.store(-1, release);
         } else if (targetMenu == "themeMenu") {
           if (!isFile(THEMES_PATH + "ultra.ini")) {
@@ -982,14 +988,20 @@ private:
             }
           } else if (iniKey == "take_over_ovlmenu") {
             const std::string ovlmenuPath = OVERLAY_PATH + "ovlmenu.ovl";
+            #ifdef BREEZEHAND_LIGHT
+            const std::string breezehandPath = OVERLAY_PATH + "breezehand_light.ovl";
+            const std::string breezehandName = "breezehand_light.ovl";
+            #else
             const std::string breezehandPath = OVERLAY_PATH + "breezehand.ovl";
+            const std::string breezehandName = "breezehand.ovl";
+            #endif
             const std::string backupPath = OVERLAY_PATH + "ovlmenu.ovl.bak";
 
             if (actualState) {
               if (!isFile(breezehandPath)) {
                 if (tsl::notification) {
                   tsl::notification->show(
-                      "Missing breezehand.ovl\nCannot take over ovlmenu");
+                      "Missing " + breezehandName + "\nCannot take over ovlmenu");
                 }
                 setIniFileValue(ULTRAHAND_CONFIG_INI_PATH,
                                 ULTRAHAND_PROJECT_NAME, iniKey, FALSE_STR);
@@ -1145,7 +1157,9 @@ public:
       createToggleListItem(list, "Take over ovlmenu", takeOverOvlmenu,
                            "take_over_ovlmenu", false, false, false, false);
       addListItem(list, SYSTEM, DROPDOWN_SYMBOL, "systemMenu");
+      #ifndef BREEZEHAND_LIGHT
       addListItem(list, SOFTWARE_UPDATE, DROPDOWN_SYMBOL, "softwareUpdateMenu");
+      #endif
       addHeader(list, UI_SETTINGS);
       addListItem(list, THEME, currentTheme, "themeMenu");
       if (expandedMemory) {
@@ -1258,6 +1272,7 @@ public:
         list->addItem(listItem);
         index++;
       }
+    #ifndef BREEZEHAND_LIGHT
     } else if (dropdownSelection == "softwareUpdateMenu") {
       const std::string fullVersionLabel = cleanVersionLabel(
           parseValueFromIniSection((SETTINGS_PATH + "RELEASE.ini"),
@@ -1286,6 +1301,7 @@ public:
           "and many others. ♥";
       addPackageInfo(list, overlayHeader, OVERLAY_STR);
       overlayHeader.clear();
+    #endif
 
     } else if (dropdownSelection == "systemMenu") {
 
@@ -7512,7 +7528,8 @@ bool ParseCheats(const std::string &path) {
   if (pfile != NULL) {
     fseek(pfile, 0, SEEK_END);
     size_t len = ftell(pfile);
-    u8 *s = new u8[len];
+    std::vector<u8> s_vec(len);
+    u8 *s = s_vec.data();
     fseek(pfile, 0, SEEK_SET);
     fread(s, 1, len, pfile);
     // if (strcmp(m_cheatcode_path + (strlen(m_cheatcode_path) - 20),
@@ -7809,6 +7826,9 @@ void LoadToggles(const std::string &path) {
 }
 
 bool TryDownloadCheats(bool notify = true) {
+#ifdef BREEZEHAND_LIGHT
+  return false;
+#else
   EnsureMetadata();
   std::string tid = GetTitleIdString();
   std::string bid = GetBuildIdString();
@@ -7937,6 +7957,7 @@ bool TryDownloadCheats(bool notify = true) {
   if (notify)
     tsl::notification->show("No cheats found\nat current sources");
   return false;
+#endif
 }
 
 u32 ConvertTripleZeroCheatsToFolders() {
@@ -10838,7 +10859,7 @@ public:
         }
       }
 #ifdef EDITCHEAT_OVL
-      std::string path = "sdmc:/switch/.overlays/breezehand.ovl";
+      std::string path = g_mainOvlPath;
       std::string args = "";
       if (!g_focusCheatName.empty()) {
         args = "--focus_cheat_name \"" + g_focusCheatName + "\"";
@@ -15182,6 +15203,11 @@ public:
                     "--cheat_id " + std::to_string(cheat.cheat_id) +
                     " --cheat_name " + cheat.definition.readable_name +
                     " --enabled " + std::to_string(cheat.enabled);
+                #ifdef BREEZEHAND_LIGHT
+                args += " --main_ovl sdmc:/switch/.overlays/breezehand_light.ovl";
+                #else
+                args += " --main_ovl sdmc:/switch/.overlays/breezehand.ovl";
+                #endif
                 
                 // Pass focus info and folder stack for restoration
                 args += " --focus_cheat_name \"" + displayName + "\"";
@@ -17092,7 +17118,9 @@ public:
     if (exitingUltrahand.load(std::memory_order_acquire) && !reloadingBoot)
       executeIniCommands(PACKAGE_PATH + EXIT_PACKAGE_FILENAME, "exit");
 
+    #ifndef BREEZEHAND_LIGHT
     curl_global_cleanup(); // safe cleanup
+    #endif
   }
 };
 #endif
@@ -17162,7 +17190,9 @@ public:
     if (exitingUltrahand.load(std::memory_order_acquire) && !reloadingBoot)
       executeIniCommands(PACKAGE_PATH + EXIT_PACKAGE_FILENAME, "exit");
 
+    #ifndef BREEZEHAND_LIGHT
     curl_global_cleanup(); // safe cleanup
+    #endif
   }
 };
 #endif
@@ -18565,7 +18595,7 @@ public:
         return true;
       }
       persistSelection();
-      std::string path = "sdmc:/switch/.overlays/breezehand.ovl";
+      std::string path = g_mainOvlPath;
       std::string args = "";
       std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
       ult::requestedOverlayPath = path;
@@ -20472,6 +20502,7 @@ tsl::elm::Element *CheatMenu::createUI() {
   });
   list->addItem(loadFileItem);
 
+  #ifndef BREEZEHAND_LIGHT
   auto *downloadItem = new tsl::elm::ListItem("Download from URL");
   downloadItem->setClickListener([](u64 keys) {
     if (keys & KEY_A) {
@@ -20490,6 +20521,7 @@ tsl::elm::Element *CheatMenu::createUI() {
     return false;
   });
   list->addItem(downloadItem);
+  #endif
 
   auto *convertToFolderItem = new tsl::elm::ListItem("Convert to folder");
   convertToFolderItem->setClickListener([](u64 keys) {
@@ -20588,7 +20620,11 @@ tsl::elm::Element *CheatMenu::createUI() {
         }
         std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
         ult::requestedOverlayPath = path;
-        ult::requestedOverlayArgs = "";
+        #ifdef BREEZEHAND_LIGHT
+        ult::requestedOverlayArgs = "--main_ovl sdmc:/switch/.overlays/breezehand_light.ovl";
+        #else
+        ult::requestedOverlayArgs = "--main_ovl sdmc:/switch/.overlays/breezehand.ovl";
+        #endif
         ult::setIniFileValue(ult::ULTRAHAND_CONFIG_INI_PATH,
                              ult::ULTRAHAND_PROJECT_NAME,
                              ult::IN_OVERLAY_STR, ult::TRUE_STR);
@@ -20758,6 +20794,11 @@ int main(int argc, char *argv[]) {
         arg = nextArg;
       }
     }
+#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL)
+    else if (strcmp(argv[arg], "--main_ovl") == 0 && arg + 1 < argc) {
+      g_mainOvlPath = argv[++arg];
+    }
+#endif
 #ifdef EDITCHEAT_OVL
     else if (strcmp(argv[arg], "--cheat_id") == 0 && arg + 1 < argc) {
       g_cheatIdToEdit = std::stoul(argv[++arg]);
