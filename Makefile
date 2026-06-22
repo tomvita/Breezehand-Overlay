@@ -112,6 +112,10 @@ ifeq ($(strip $(TARGET)),breezehand_watch)
     CFLAGS += -DBREEZEHAND_WATCH_OVL
 endif
 
+ifeq ($(strip $(BREEZEHAND_LIGHT)),1)
+    CFLAGS += -DBREEZEHAND_LIGHT
+endif
+
 # Enable fstream (ideally for other overlays want full fstream instead of FILE*)
 #USING_FSTREAM_DIRECTIVE := 0
 #CFLAGS += -DUSING_FSTREAM_DIRECTIVE=$(USING_FSTREAM_DIRECTIVE)
@@ -140,7 +144,11 @@ ASFLAGS := $(ARCH)
 LDFLAGS += -flto -fuse-linker-plugin -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # Essential libraries for Ultrahand Overlay
-LIBS := -lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto -lnx
+ifeq ($(strip $(BREEZEHAND_LIGHT)),1)
+    LIBS := -lz -lminizip -lnx
+else
+    LIBS := -lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto -lnx
+endif
 ifeq ($(strip $(USE_KEYSTONE_ASM)),1)
 LIBS += -lkeystone
 INCLUDES += $(KEYSTONE_ROOT)/include
@@ -282,13 +290,31 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all release full breezehand editcheat bookmark breezehand_watch
+.PHONY: $(BUILD) clean all release full breezehand breezehand_light editcheat bookmark breezehand_watch
 
 #---------------------------------------------------------------------------------
-all: breezehand editcheat bookmark breezehand_watch
+all: breezehand breezehand_light editcheat bookmark breezehand_watch
 
 
 breezehand: $(BUILD)
+
+breezehand_light:
+	@mkdir -p build_light
+	@rm -f breezehand_light.nacp
+	@$(MAKE) --no-print-directory -C build_light -f $(CURDIR)/Makefile \
+		TARGET=breezehand_light \
+		BUILD=build_light \
+		APP_TITLE="Breezehand Light" \
+		APP_VERSION="$(APP_VERSION)" \
+		APP_JSON= \
+		OUTPUT=breezehand_light \
+		DEPSDIR=$(CURDIR)/build_light \
+		NROFLAGS="--nacp=$(CURDIR)/build_light/breezehand_light.nacp" \
+		TOPDIR=$(CURDIR) \
+		BREEZEHAND_LIGHT=1 \
+		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
+	@mkdir -p out/switch/.overlays/
+	@cp build_light/breezehand_light.ovl out/switch/.overlays/breezehand_light.ovl
 
 # Serialize: editcheat and bookmark depend on breezehand so the destructive
 # `rm -rf out/switch` in the breezehand recipe doesn't race with their cp
@@ -401,6 +427,7 @@ $(BUILD):
 #---------------------------------------------------------------------------------
 clean:
 	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+	@rm -fr build_light breezehand_light.ovl breezehand_light.nro breezehand_light.nacp breezehand_light.elf
 	@rm -fr build_editcheat build_editcheatk editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf editcheatk.ovl editcheatk.nro editcheatk.nacp editcheatk.elf
 	@rm -fr build_bookmark bookmark.ovl bookmark.nro bookmark.nacp bookmark.elf
 	@rm -fr build_breezehand_watch breezehand_watch.ovl breezehand_watch.nro breezehand_watch.nacp breezehand_watch.elf
