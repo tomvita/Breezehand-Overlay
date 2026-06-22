@@ -19564,7 +19564,7 @@ public:
         m_wd.bp_match_pc = m_traceLines[m_selectedLineIdx].target_pc;
         m_wd.bp_match_lr = m_traceLines[m_selectedLineIdx].target_lr;
         m_wd.bp_addr = m_bpAddr;
-        m_wd.total_trigger = 0;
+        m_wd.max_trigger = 10;
         m_wd.command = BreezeGen2::GEN2_SETW;
         BreezeGen2::ExecuteWatchData(&m_wd);
 
