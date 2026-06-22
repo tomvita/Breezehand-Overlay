@@ -57,7 +57,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:= Breezehand
 APP_AUTHOR	:= tomvita
-APP_VERSION	:= 0.10.1
+APP_VERSION	:= 0.10.2
 TARGET		:= breezehand
 BUILD		:= build
 SOURCES		:= source common ../capstone ../capstone/arch/AArch64
@@ -106,6 +106,10 @@ endif
 
 ifeq ($(strip $(TARGET)),bookmark)
     CFLAGS += -DBOOKMARK_OVL
+endif
+
+ifeq ($(strip $(TARGET)),breezehand_watch)
+    CFLAGS += -DBREEZEHAND_WATCH_OVL
 endif
 
 # Enable fstream (ideally for other overlays want full fstream instead of FILE*)
@@ -278,10 +282,10 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all release full breezehand editcheat bookmark
+.PHONY: $(BUILD) clean all release full breezehand editcheat bookmark breezehand_watch
 
 #---------------------------------------------------------------------------------
-all: breezehand editcheat bookmark
+all: breezehand editcheat bookmark breezehand_watch
 
 
 breezehand: $(BUILD)
@@ -291,6 +295,7 @@ breezehand: $(BUILD)
 # steps when make is run with parallel jobs.
 editcheat: breezehand
 bookmark: breezehand
+breezehand_watch: breezehand
 
 editcheat:
 	@mkdir -p build_editcheat
@@ -353,6 +358,27 @@ bookmark:
 	@mkdir -p out/switch/.overlays/
 	@cp build_bookmark/bookmark.ovl out/switch/.overlays/bookmark.ovl
 
+breezehand_watch:
+	@mkdir -p build_breezehand_watch
+	@rm -f breezehand_watch.nacp
+	@$(MAKE) --no-print-directory -C build_breezehand_watch -f $(CURDIR)/Makefile \
+		TARGET=breezehand_watch \
+		BUILD=build_breezehand_watch \
+		APP_TITLE="Breezehand Watch" \
+		APP_VERSION="$(APP_VERSION)" \
+		APP_JSON= \
+		OUTPUT=breezehand_watch \
+		DEPSDIR=$(CURDIR)/build_breezehand_watch \
+		NROFLAGS="--nacp=$(CURDIR)/build_breezehand_watch/breezehand_watch.nacp" \
+		TOPDIR=$(CURDIR) \
+		USE_KEYSTONE_ASM=0 \
+		KEYSTONE_ROOT=$(CURDIR)/../keystone \
+		INCLUDE="$(INCLUDE) -I$(CURDIR)/../keystone/include" \
+		LIBPATHS="$(LIBPATHS) -L$(CURDIR)/../keystone/lib" \
+		MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
+	@mkdir -p out/switch/.overlays/
+	@cp build_breezehand_watch/breezehand_watch.ovl out/switch/.overlays/breezehand_watch.ovl
+
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile MAKEFLAGS="$(filter-out -j% -j,$(MAKEFLAGS)) -j"
@@ -377,6 +403,7 @@ clean:
 	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
 	@rm -fr build_editcheat build_editcheatk editcheat.ovl editcheat.nro editcheat.nacp editcheat.elf editcheatk.ovl editcheatk.nro editcheatk.nacp editcheatk.elf
 	@rm -fr build_bookmark bookmark.ovl bookmark.nro bookmark.nacp bookmark.elf
+	@rm -fr build_breezehand_watch breezehand_watch.ovl breezehand_watch.nro breezehand_watch.nacp breezehand_watch.elf
 
 	@rm -rf out/
 	@rm -f $(TARGET).zip

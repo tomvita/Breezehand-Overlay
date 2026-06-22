@@ -1,4 +1,4 @@
-/********************************************************************************
+﻿/********************************************************************************
  * File: main.cpp
  * Author: ppkantorski
  * Description:
@@ -187,7 +187,7 @@ std::vector<u32> g_focusFolderIndices; // Folder indices for focus restoration
 std::vector<std::string> g_focusFolderNames; // Folder names for focus restoration
 #endif
 
-#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL)
+#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL) || defined(BREEZEHAND_WATCH_OVL)
 std::string g_mainOvlPath = "sdmc:/switch/.overlays/breezehand.ovl";
 #endif
 
@@ -988,9 +988,12 @@ private:
             }
           } else if (iniKey == "take_over_ovlmenu") {
             const std::string ovlmenuPath = OVERLAY_PATH + "ovlmenu.ovl";
-            #ifdef BREEZEHAND_LIGHT
+            #if defined(BREEZEHAND_LIGHT)
             const std::string breezehandPath = OVERLAY_PATH + "breezehand_light.ovl";
             const std::string breezehandName = "breezehand_light.ovl";
+            #elif defined(BREEZEHAND_WATCH_OVL)
+            const std::string breezehandPath = OVERLAY_PATH + "breezehand_watch.ovl";
+            const std::string breezehandName = "breezehand_watch.ovl";
             #else
             const std::string breezehandPath = OVERLAY_PATH + "breezehand.ovl";
             const std::string breezehandName = "breezehand.ovl";
@@ -15203,8 +15206,10 @@ public:
                     "--cheat_id " + std::to_string(cheat.cheat_id) +
                     " --cheat_name " + cheat.definition.readable_name +
                     " --enabled " + std::to_string(cheat.enabled);
-                #ifdef BREEZEHAND_LIGHT
+                #if defined(BREEZEHAND_LIGHT)
                 args += " --main_ovl sdmc:/switch/.overlays/breezehand_light.ovl";
+                #elif defined(BREEZEHAND_WATCH_OVL)
+                args += " --main_ovl sdmc:/switch/.overlays/breezehand_watch.ovl";
                 #else
                 args += " --main_ovl sdmc:/switch/.overlays/breezehand.ovl";
                 #endif
@@ -17197,7 +17202,7 @@ public:
 };
 #endif
 
-#ifdef BOOKMARK_OVL
+#if defined(BOOKMARK_OVL) || defined(BREEZEHAND_WATCH_OVL)
 // =====================================================================
 // Bookmark Overlay - displays bookmarks created by Breeze
 //
@@ -18148,6 +18153,7 @@ static void SaveWatchSettings() {
 }
 } // namespace BookmarkSelection
 
+#ifdef BOOKMARK_OVL
 // =====================================================================
 // Normal bookmark menu - lists every entry as a cheat-style toggle row
 // with two-line display (label / address + type + value). Selection is
@@ -19035,6 +19041,7 @@ public:
     return false;
   }
 };
+#endif
 
 class BookmarkTraceMenu : public tsl::Gui {
   u64 m_watchAddress;
@@ -19557,7 +19564,9 @@ public:
         m_wd.bp_match_pc = m_traceLines[m_selectedLineIdx].target_pc;
         m_wd.bp_match_lr = m_traceLines[m_selectedLineIdx].target_lr;
         m_wd.bp_addr = m_bpAddr;
-        BreezeGen2::WriteWatchData(&m_wd);
+        m_wd.total_trigger = 0;
+        m_wd.command = BreezeGen2::GEN2_SETW;
+        BreezeGen2::ExecuteWatchData(&m_wd);
 
         m_bpWaiting = true;
         tsl::hlp::requestForeground(false);
@@ -19590,6 +19599,7 @@ public:
 // normal BookmarkMenu, and that goBack triggers the destructor which
 // tears down the watch + re-attaches dmnt:cht.
 // =====================================================================
+#ifdef BOOKMARK_OVL
 class BookmarkWatchMenu : public tsl::Gui {
   u64 m_watchAddress = 0;
   u64 m_watchOffset = 0;
@@ -20007,6 +20017,340 @@ public:
   }
 };
 #endif // BOOKMARK_OVL
+
+#ifdef BREEZEHAND_WATCH_OVL
+// =====================================================================
+// Breezehand Watch Overlay - Direct watch of active dmnt.gen2 session
+// =====================================================================
+class BreezehandWatchDirectMenu : public tsl::Gui {
+  u32 m_refreshTick = 0;
+  BreezeGen2::WatchData m_wd{};
+  bool m_setupOk = false;
+  std::string m_setupError;
+
+  static constexpr s32 kMarginX = 16;
+  static constexpr s32 kMarginY = 16;
+
+public:
+  BreezehandWatchDirectMenu() {
+    g_bmInWatch.store(true, std::memory_order_release);
+    // Hand input to the game.
+    tsl::hlp::requestForeground(false);
+  }
+
+  virtual ~BreezehandWatchDirectMenu() {
+    tsl::hlp::requestForeground(true);
+    g_bmInWatch.store(false, std::memory_order_release);
+  }
+
+  bool setupOnce() {
+    if (R_FAILED(dmntchtGetCheatProcessMetadata(&g_bmState.metadata))) {
+      dmntchtForceOpenCheatProcess();
+      if (R_FAILED(dmntchtGetCheatProcessMetadata(&g_bmState.metadata))) {
+        m_setupError = "no cheat process";
+        return false;
+      }
+    }
+
+    if (!BreezeGen2::EnsureInitialized()) {
+      m_setupError = "gen2 fork not installed or version mismatch";
+      return false;
+    }
+
+    if (R_SUCCEEDED(BreezeGen2::Gen2Open())) {
+      BreezeGen2::ReadWatchData(&m_wd);
+      BreezeGen2::Gen2Close();
+      m_setupOk = true;
+      return true;
+    } else {
+      m_setupError = "failed to read watch data";
+      return false;
+    }
+  }
+
+  virtual tsl::elm::Element *createUI() override {
+    auto *drawer = new tsl::elm::CustomDrawer(
+        [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+          (void)x; (void)y; (void)w; (void)h;
+          r->fillScreen(tsl::Color{0x0, 0x0, 0x0, 0x0});
+
+          const int fontSize =
+              kMonitorFontSizes[g_bmState.monitorFontSizeIdx];
+          const tsl::Color &col =
+              kMonitorColors[g_bmState.monitorColorIdx].color;
+          const s32 lineH = fontSize + 3;
+
+          s32 yy = kMarginY;
+
+          if (!m_setupOk) {
+            r->drawString(m_setupError.empty()
+                              ? std::string("connecting to gen2...")
+                              : std::string("error: ") + m_setupError,
+                          false, kMarginX, yy, fontSize, col);
+            return;
+          }
+
+          if (m_wd.address == 0) {
+            r->drawString("No active watchpoint. Start one in Breeze first.",
+                          false, kMarginX, yy, fontSize, col);
+            return;
+          }
+
+          const bool memWatch = m_wd.read || m_wd.write;
+          
+          // Header line.
+          {
+            char hdr[256];
+            if (memWatch) {
+              std::string watchValue =
+                  FormatWatchHeaderValue(m_wd.address, BreezeBookmark::BREEZE_TYPE_U32);
+              std::snprintf(hdr, sizeof(hdr), "Watch %s: %s",
+                            m_wd.name, watchValue.c_str());
+            } else {
+              // Disassemble the accessing instruction
+              std::string asmStr;
+              u32 opcode = 0;
+              u64 insnAddr = m_wd.address;
+              if (R_SUCCEEDED(
+                      dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+                asmStr = DisassembleARM64(opcode, insnAddr);
+                if (asmStr.empty()) {
+                  char raw[16];
+                  std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                  asmStr = raw;
+                }
+              }
+              std::snprintf(hdr, sizeof(hdr), "Watch %s: %s",
+                            m_wd.name, asmStr.c_str());
+            }
+            r->drawString(std::string(hdr), false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+          }
+
+          // Stats line.
+          {
+            char stats[160];
+            std::snprintf(stats, sizeof(stats),
+                          "count=%d trig=%llu failed=%d",
+                          m_wd.count,
+                          (unsigned long long)m_wd.total_trigger,
+                          m_wd.failed);
+            r->drawString(std::string(stats), false, kMarginX, yy, fontSize,
+                          col);
+            yy += lineH;
+          }
+
+          // Key combo hint line.
+          {
+            r->drawString("L3+Y: Trace Menu", false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+          }
+
+          const bool useFrom2 =
+              memWatch || (m_wd.stack_check_count > 0);
+          auto appendStackSlots = [&](char *line, size_t lineSize,
+                                      const BreezeGen2::FromStack &fs) {
+            if (!useFrom2 || m_wd.stack_check_count == 0) return;
+            size_t len = std::strlen(line);
+            for (u32 s = 0; s < m_wd.stack_check_count &&
+                            s < BreezeGen2::kMaxCallStack && len < lineSize; s++) {
+              const auto &slot = fs.stack[s];
+              int written = std::snprintf(line + len, lineSize - len,
+                                           " %u,M+%X",
+                                           (unsigned)slot.SP_offset,
+                                           (unsigned)(slot.code_offset << 2));
+              if (written <= 0) break;
+              len += std::min<size_t>((size_t)written, lineSize - len);
+            }
+          };
+          const u64 mainBase = g_bmState.metadata.main_nso_extents.base;
+          const int rows = std::min<int>(m_wd.count, 12);
+          for (int i = 0; i < rows; i++) {
+            u64 address;
+            u32 call_from;
+            int count;
+            const BreezeGen2::FromStack *fromStack = nullptr;
+            if (useFrom2) {
+              const auto &fs = m_wd.fromU.from2[i].from_stack;
+              address   = fs.address;
+              call_from = fs.call_from;
+              count     = m_wd.fromU.from2[i].count;
+              fromStack = &fs;
+            } else {
+              const auto &fe = m_wd.fromU.from[i];
+              address   = fe.address;
+              call_from = fe.call_from;
+              count     = fe.count;
+            }
+            char line[192];
+            if (memWatch) {
+              std::string asmStr;
+              u32 opcode = 0;
+              u64 insnAddr = address;
+              if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(insnAddr, &opcode, 4))) {
+                asmStr = DisassembleARM64(opcode, insnAddr);
+                if (asmStr.empty()) {
+                  char raw[16];
+                  std::snprintf(raw, sizeof(raw), "0x%08X", opcode);
+                  asmStr = raw;
+                }
+              }
+              std::snprintf(line, sizeof(line), "[M+%lX] cf=%lX %s n=%d",
+                            (u64)address - mainBase, (u64)call_from << 2,
+                            asmStr.c_str(), count);
+              if (fromStack != nullptr) appendStackSlots(line, sizeof(line), *fromStack);
+            } else {
+              u64 regVal = address;
+              u64 val = 0;
+              bool readOk = false;
+              u64 targetAddr = regVal + m_wd.offset;
+              if (targetAddr > 0x10000 && targetAddr < 0x8000000000ULL) {
+                if (R_SUCCEEDED(dmntchtReadCheatProcessMemory(targetAddr, &val, 4))) {
+                  readOk = true;
+                }
+              }
+              if (m_wd.two_register) {
+                if (readOk) {
+                  std::snprintf(line, sizeof(line),
+                                "X%u+X%u=0x%lX->0x%08X cf=%lX n=%d",
+                                (unsigned)m_wd.i, (unsigned)m_wd.j, (u64)regVal, (unsigned)val,
+                                (u64)call_from << 2, count);
+                } else {
+                  std::snprintf(line, sizeof(line),
+                                "X%u+X%u=0x%lX cf=%lX n=%d",
+                                (unsigned)m_wd.i, (unsigned)m_wd.j, (u64)regVal,
+                                (u64)call_from << 2, count);
+                }
+              } else {
+                if (m_wd.offset != 0) {
+                  if (readOk) {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX+0x%lX->0x%08X cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (u64)m_wd.offset, (unsigned)val,
+                                  (u64)call_from << 2, count);
+                  } else {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX+0x%lX cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (u64)m_wd.offset,
+                                  (u64)call_from << 2, count);
+                  }
+                } else {
+                  if (readOk) {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX->0x%08X cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal, (unsigned)val,
+                                  (u64)call_from << 2, count);
+                  } else {
+                    std::snprintf(line, sizeof(line),
+                                  "X%u=0x%lX cf=%lX n=%d",
+                                  (unsigned)m_wd.i, (u64)regVal,
+                                  (u64)call_from << 2, count);
+                  }
+                }
+              }
+              if (fromStack != nullptr) appendStackSlots(line, sizeof(line), *fromStack);
+            }
+            r->drawString(std::string(line), false, kMarginX, yy, fontSize,
+                          col);
+            yy += lineH;
+          }
+        });
+    return drawer;
+  }
+
+  virtual void update() override {
+    if (!m_setupOk && m_setupError.empty()) {
+      m_setupOk = setupOnce();
+      m_refreshTick = 0;
+      return;
+    }
+    if ((++m_refreshTick % 12) != 0) return;
+    if (!m_setupOk) return;
+    if (R_FAILED(BreezeGen2::Gen2Open())) return;
+    BreezeGen2::ReadWatchData(&m_wd);
+    BreezeGen2::Gen2Close();
+  }
+
+  virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                           touchPosition touchInput,
+                           JoystickPosition leftJoyStick,
+                           JoystickPosition rightJoyStick) override {
+    (void)keysHeld; (void)touchInput;
+    (void)leftJoyStick; (void)rightJoyStick;
+    if ((keysDown & KEY_Y) && (keysHeld & KEY_LSTICK)) {
+      tsl::hlp::requestForeground(true);
+      tsl::changeTo<BookmarkTraceMenu>(m_wd.address, m_wd.offset, BreezeBookmark::BREEZE_TYPE_U32, m_wd.name, m_wd);
+      return true;
+    }
+    if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
+      int step = (keysDown & KEY_DRIGHT) ? 1 : -1;
+      g_bmState.monitorColorIdx =
+          (g_bmState.monitorColorIdx + step + kMonitorColorCount) %
+          kMonitorColorCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    if (keysDown & (KEY_DUP | KEY_DDOWN) && (keysHeld & KEY_RSTICK)) {
+      int step = (keysDown & KEY_DDOWN) ? -1 : 1;
+      g_bmState.monitorFontSizeIdx =
+          (g_bmState.monitorFontSizeIdx + step + kMonitorFontSizeCount) %
+          kMonitorFontSizeCount;
+      BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    return false;
+  }
+};
+
+class BreezehandWatchOverlay : public tsl::Overlay {
+public:
+  virtual void onShow() override {}
+  virtual void onHide() override {
+    auto wd_ptr = std::make_unique<BreezeGen2::WatchData>();
+    if (BreezeGen2::EnsureInitialized()) {
+      if (R_SUCCEEDED(BreezeGen2::Gen2Open())) {
+        BreezeGen2::ReadWatchData(wd_ptr.get());
+        BreezeGen2::Gen2Close();
+      }
+    }
+    if (wd_ptr->address == 0) {
+      auto *ovl = tsl::Overlay::get();
+      if (ovl != nullptr) {
+        ovl->close();
+      }
+    }
+  }
+
+  virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
+    initializeSettingsAndDirectories();
+    return std::make_unique<BreezehandWatchDirectMenu>();
+  }
+
+  virtual void initServices() override {
+    initializeSettingsAndDirectories();
+    deleteFileOrDirectory(RELOADING_FLAG_FILEPATH);
+    unpackDeviceInfo();
+    dmntchtInitialize();
+    nsInitialize();
+    ncmInitialize();
+    ult::settingsInitialized.store(true, std::memory_order_release);
+    g_bmInWatch.store(false, std::memory_order_release);
+    g_bmInTrace.store(false, std::memory_order_release);
+  }
+
+  virtual void exitServices() override {
+    dmntchtExit();
+    nsExit();
+    CheatUtils::CloseCachedNcmHandles();
+    ncmExit();
+    closeInterpreterThread();
+    if (exitingUltrahand.load(std::memory_order_acquire) && !reloadingBoot)
+      executeIniCommands(PACKAGE_PATH + EXIT_PACKAGE_FILENAME, "exit");
+  }
+};
+#endif
+
+#endif // defined(BOOKMARK_OVL) || defined(BREEZEHAND_WATCH_OVL)
 
 /**
  * @brief The entry point of the application.
@@ -20620,8 +20964,10 @@ tsl::elm::Element *CheatMenu::createUI() {
         }
         std::lock_guard<std::mutex> lock(ult::overlayLaunchMutex);
         ult::requestedOverlayPath = path;
-        #ifdef BREEZEHAND_LIGHT
+        #if defined(BREEZEHAND_LIGHT)
         ult::requestedOverlayArgs = "--main_ovl sdmc:/switch/.overlays/breezehand_light.ovl";
+        #elif defined(BREEZEHAND_WATCH_OVL)
+        ult::requestedOverlayArgs = "--main_ovl sdmc:/switch/.overlays/breezehand_watch.ovl";
         #else
         ult::requestedOverlayArgs = "--main_ovl sdmc:/switch/.overlays/breezehand.ovl";
         #endif
@@ -20794,7 +21140,7 @@ int main(int argc, char *argv[]) {
         arg = nextArg;
       }
     }
-#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL)
+#if defined(EDITCHEAT_OVL) || defined(BOOKMARK_OVL) || defined(BREEZEHAND_WATCH_OVL)
     else if (strcmp(argv[arg], "--main_ovl") == 0 && arg + 1 < argc) {
       g_mainOvlPath = argv[++arg];
     }
@@ -20854,6 +21200,8 @@ int main(int argc, char *argv[]) {
   return tsl::loop<EditCheatOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
 #elif defined(BOOKMARK_OVL)
   return tsl::loop<BookmarkOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+#elif defined(BREEZEHAND_WATCH_OVL)
+  return tsl::loop<BreezehandWatchOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
 #else
   return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 #endif
