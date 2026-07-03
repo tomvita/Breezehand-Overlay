@@ -19713,8 +19713,8 @@ public:
       return true;
     }
     if (keysDown & KEY_B) {
-      m_wd.count = 0;
-      BreezeGen2::ExecuteWatchData(&m_wd);
+      // m_wd.count = 0;
+      // BreezeGen2::ExecuteWatchData(&m_wd);
       tsl::goBack();
       return true;
     }
