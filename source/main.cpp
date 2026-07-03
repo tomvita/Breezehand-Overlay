@@ -17678,7 +17678,13 @@ static Result ReadWatchData(WatchData *out) {
 }
 
 static Result WriteWatchData(const WatchData *wd) {
-  return dmntchtSetGen2WatchData(wd, sizeof(WatchData));
+  WatchData local_wd = *wd;
+  DmntCheatProcessMetadata meta{};
+  if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&meta))) {
+    local_wd.main_start = meta.main_nso_extents.base;
+    local_wd.main_end = meta.main_nso_extents.base + meta.main_nso_extents.size;
+  }
+  return dmntchtSetGen2WatchData(&local_wd, sizeof(WatchData));
 }
 
 // Set execute=true and wait briefly for done=true. Returns 0 on success.
@@ -17855,6 +17861,126 @@ static bool SetWatchpoint(u64 addr, int size,
   ExecuteWatchData(&wd, 200'000'000ULL);
 
   return wd.failed == 0;
+}
+
+static int GetAndIncrementLogCounter() {
+  createDirectory("sdmc:/config/");
+  createDirectory("sdmc:/config/breezehand/");
+  int count = 1;
+  FILE *f = std::fopen("sdmc:/config/breezehand/m_wd_counter.txt", "r");
+  if (f) {
+    if (std::fscanf(f, "%d", &count) == 1) {
+      count++;
+    }
+    std::fclose(f);
+  }
+  f = std::fopen("sdmc:/config/breezehand/m_wd_counter.txt", "w");
+  if (f) {
+    std::fprintf(f, "%d\n", count);
+    std::fclose(f);
+  }
+  return count;
+}
+
+static void LogWatchData(const WatchData &wd, const char *label) {
+  int entryNum = GetAndIncrementLogCounter();
+
+  // 1. Write index entry
+  FILE *fIdx = std::fopen("sdmc:/config/breezehand/m_wd_index.txt", "a");
+  if (fIdx) {
+    std::fprintf(fIdx, "Entry #%d: Label=\"%s\", Addr=0x%lX, Off=0x%lX, Cmd=%d, Hits=%d, BP_Hit=%s, PC=0x%lX, LR=0x%lX\n",
+                 entryNum, label ? label : wd.name, (unsigned long)wd.address, (unsigned long)wd.offset,
+                 (int)wd.command, (int)wd.count, wd.bp_hit ? "true" : "false",
+                 (unsigned long)wd.bp_ctx.pc, (unsigned long)wd.bp_ctx.lr);
+    std::fclose(fIdx);
+  }
+
+  // 2. Write detailed log entry
+  FILE *fLog = std::fopen("sdmc:/config/breezehand/m_wd_log.txt", "a");
+  if (fLog) {
+    std::fprintf(fLog, "========================================================================\n");
+    std::fprintf(fLog, "ENTRY #%d\n", entryNum);
+    std::fprintf(fLog, "Label: %s\n", label ? label : "N/A");
+    std::fprintf(fLog, "------------------------------------------------------------------------\n");
+    std::fprintf(fLog, "execute: %s\n", wd.execute ? "true" : "false");
+    std::fprintf(fLog, "done: %s\n", wd.done ? "true" : "false");
+    std::fprintf(fLog, "command: %d\n", (int)wd.command);
+    std::fprintf(fLog, "count: %d\n", wd.count);
+    std::fprintf(fLog, "i: %u, j: %u, k: %u\n", (unsigned)wd.i, (unsigned)wd.j, (unsigned)wd.k);
+    std::fprintf(fLog, "address: 0x%lX\n", (unsigned long)wd.address);
+    std::fprintf(fLog, "next_address: 0x%lX\n", (unsigned long)wd.next_address);
+    std::fprintf(fLog, "base: 0x%lX\n", (unsigned long)wd.base);
+    std::fprintf(fLog, "offset: 0x%lX\n", (unsigned long)wd.offset);
+    std::fprintf(fLog, "name: %s\n", wd.name);
+    std::fprintf(fLog, "read: %s, next_read: %s\n", wd.read ? "true" : "false", wd.next_read ? "true" : "false");
+    std::fprintf(fLog, "write: %s, next_write: %s\n", wd.write ? "true" : "false", wd.next_write ? "true" : "false");
+    std::fprintf(fLog, "intercepted: %s\n", wd.intercepted ? "true" : "false");
+    std::fprintf(fLog, "x30_catch_type: %d\n", (int)wd.x30_catch_type);
+    std::fprintf(fLog, "next_pc: 0x%lX\n", (unsigned long)wd.next_pc);
+    std::fprintf(fLog, "failed: %d\n", wd.failed);
+    std::fprintf(fLog, "gen2loop_on: %u\n", (unsigned)wd.gen2loop_on);
+    std::fprintf(fLog, "next_pid: 0x%lX\n", (unsigned long)wd.next_pid);
+    std::fprintf(fLog, "attach_success: %s, attached: %s\n", wd.attach_success ? "true" : "false", wd.attached ? "true" : "false");
+    std::fprintf(fLog, "range_check: %s\n", wd.range_check ? "true" : "false");
+    std::fprintf(fLog, "v1: 0x%lX, v2: 0x%lX\n", (unsigned long)wd.v1, (unsigned long)wd.v2);
+    std::fprintf(fLog, "size: %d, vsize: %d\n", wd.size, wd.vsize);
+    std::fprintf(fLog, "version: %s\n", wd.version);
+    std::fprintf(fLog, "x30_match: 0x%X\n", (unsigned)wd.x30_match);
+    std::fprintf(fLog, "check_x30: %s\n", wd.check_x30 ? "true" : "false");
+    std::fprintf(fLog, "two_register: %s\n", wd.two_register ? "true" : "false");
+    std::fprintf(fLog, "stack_check_count: %u\n", (unsigned)wd.stack_check_count);
+    std::fprintf(fLog, "exclusive_search_count: %u\n", (unsigned)wd.exclusive_search_count);
+    std::fprintf(fLog, "exclusive_search_from2: %s\n", wd.exclusive_search_from2 ? "true" : "false");
+    std::fprintf(fLog, "exclusive_search_target_trigger: 0x%X\n", (unsigned)wd.exclusive_search_target_trigger);
+    std::fprintf(fLog, "target_address: 0x%lX\n", (unsigned long)wd.target_address);
+    std::fprintf(fLog, "main_start: 0x%lX, main_end: 0x%lX\n", (unsigned long)wd.main_start, (unsigned long)wd.main_end);
+    std::fprintf(fLog, "total_trigger: %lu\n", (unsigned long)wd.total_trigger);
+    std::fprintf(fLog, "max_trigger: 0x%lX\n", (unsigned long)wd.max_trigger);
+    std::fprintf(fLog, "caller_SP_offset: %u\n", (unsigned)wd.caller_SP_offset);
+    std::fprintf(fLog, "grab_A_address: 0x%lX\n", (unsigned long)wd.grab_A_address);
+    std::fprintf(fLog, "grab_A: %s, grab_R: %s\n", wd.grab_A ? "true" : "false", wd.grab_R ? "true" : "false");
+    std::fprintf(fLog, "Register: %u\n", (unsigned)wd.Register);
+    std::fprintf(fLog, "Register_match_value: 0x%lX\n", (unsigned long)wd.Register_match_value);
+    std::fprintf(fLog, "bp_hit: %s\n", wd.bp_hit ? "true" : "false");
+    std::fprintf(fLog, "bp_addr: 0x%lX\n", (unsigned long)wd.bp_addr);
+    std::fprintf(fLog, "bp_thread_id: %lu\n", (unsigned long)wd.bp_thread_id);
+    std::fprintf(fLog, "bp_match_trigger: %s\n", wd.bp_match_trigger ? "true" : "false");
+    std::fprintf(fLog, "bp_match_pc: 0x%lX, bp_match_lr: 0x%lX\n", (unsigned long)wd.bp_match_pc, (unsigned long)wd.bp_match_lr);
+    std::fprintf(fLog, "bp_original_insn: 0x%08X\n", (unsigned)wd.bp_original_insn);
+
+    std::fprintf(fLog, "WatchThreadContext:\n");
+    for (int r = 0; r < 29; r++) {
+      std::fprintf(fLog, "  r[%2d]: 0x%lX\n", r, (unsigned long)wd.bp_ctx.r[r]);
+    }
+    std::fprintf(fLog, "  fp: 0x%lX, lr: 0x%lX, sp: 0x%lX, pc: 0x%lX\n",
+                 (unsigned long)wd.bp_ctx.fp, (unsigned long)wd.bp_ctx.lr,
+                 (unsigned long)wd.bp_ctx.sp, (unsigned long)wd.bp_ctx.pc);
+    std::fprintf(fLog, "  pstate: 0x%08X\n", (unsigned)wd.bp_ctx.pstate);
+    for (int v = 0; v < 32; v++) {
+      std::fprintf(fLog, "  v[%2d]: lo=0x%lX hi=0x%lX\n", v, (unsigned long)wd.bp_ctx.v[v].lo, (unsigned long)wd.bp_ctx.v[v].hi);
+    }
+    std::fprintf(fLog, "  fpcr: 0x%08X, fpsr: 0x%08X\n", (unsigned)wd.bp_ctx.fpcr, (unsigned)wd.bp_ctx.fpsr);
+    std::fprintf(fLog, "  tpidr: 0x%lX\n", (unsigned long)wd.bp_ctx.tpidr);
+
+    const bool memWatch = wd.read || wd.write;
+    const bool useFrom2 = memWatch || (wd.stack_check_count > 0);
+    int rows = std::min<int>(wd.count, (int)kMaxWatchBuffer);
+    std::fprintf(fLog, "fromU (count = %d):\n", wd.count);
+    for (int row = 0; row < rows; row++) {
+      if (useFrom2) {
+        const auto &fs = wd.fromU.from2[row].from_stack;
+        std::fprintf(fLog, "  [%d]: addr=0x%lX, call_from=0x%X\n", row, (unsigned long)fs.address, (unsigned)(fs.call_from << 2));
+        for (u32 s = 0; s < wd.stack_check_count && s < kMaxCallStack; s++) {
+          std::fprintf(fLog, "    stack[%d]: SP_off=%u, code_offset=0x%X\n", (int)s, (unsigned)fs.stack[s].SP_offset, (unsigned)(fs.stack[s].code_offset << 2));
+        }
+      } else {
+        const auto &fe = wd.fromU.from[row];
+        std::fprintf(fLog, "  [%d]: addr=0x%lX, call_from=0x%X, count=%d\n", row, (unsigned long)fe.address, (unsigned)(fe.call_from << 2), (int)fe.count);
+      }
+    }
+    std::fprintf(fLog, "========================================================================\n\n");
+    std::fclose(fLog);
+  }
 }
 
 } // namespace BreezeGen2
@@ -19560,6 +19686,18 @@ public:
       if (m_selectedLineIdx < m_traceLines.size()) {
         m_bpAddr = m_traceLines[m_selectedLineIdx].target_pc;
         
+        m_wd.bp_hit = false;
+        if (m_wd.attached) {
+          m_wd.command = BreezeGen2::GEN2_DETACH;
+          BreezeGen2::ExecuteWatchData(&m_wd, 100'000'000ULL);
+          dmntchtResumeCheatProcess();
+          svcSleepThread(50'000'000ULL);
+          m_wd.command = BreezeGen2::GEN2_ATTACH_CONT;
+          m_wd.attached = true;
+          BreezeGen2::ExecuteWatchData(&m_wd, 200'000'000ULL);
+          BreezeGen2::ReadWatchData(&m_wd);
+        }
+
         m_wd.bp_match_trigger = true;
         m_wd.bp_match_pc = m_traceLines[m_selectedLineIdx].target_pc;
         m_wd.bp_match_lr = m_traceLines[m_selectedLineIdx].target_lr;
@@ -19567,6 +19705,7 @@ public:
         m_wd.total_trigger = 0;
         m_wd.command = BreezeGen2::GEN2_SETW;
         BreezeGen2::ExecuteWatchData(&m_wd);
+        dmntchtForceOpenCheatProcess();
 
         m_bpWaiting = true;
         tsl::hlp::requestForeground(false);
@@ -19574,6 +19713,8 @@ public:
       return true;
     }
     if (keysDown & KEY_B) {
+      m_wd.count = 0;
+      BreezeGen2::ExecuteWatchData(&m_wd);
       tsl::goBack();
       return true;
     }
@@ -19905,9 +20046,11 @@ public:
     // Refresh ~5 Hz.
     if ((++m_refreshTick % 12) != 0) return;
     if (!m_setupOk) return;
-    if (R_FAILED(BreezeGen2::Gen2Open())) return;
-    BreezeGen2::ReadWatchData(&m_wd);
-    BreezeGen2::Gen2Close();
+    if (R_SUCCEEDED(BreezeGen2::Gen2Open())) {
+      BreezeGen2::ReadWatchData(&m_wd);
+      BreezeGen2::Gen2Close();
+      tsl::hlp::requestForeground(m_wd.bp_hit);
+    }
   }
 
   virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -19917,6 +20060,7 @@ public:
     (void)keysHeld; (void)touchInput;
     (void)leftJoyStick; (void)rightJoyStick;
     if ((keysDown & KEY_Y) && (keysHeld & KEY_LSTICK)) {
+      // BreezeGen2::LogWatchData(m_wd, m_watchLabel.c_str());
       // Reclaim focus
       tsl::hlp::requestForeground(true);
       // Open the Trace Menu
@@ -20266,9 +20410,11 @@ public:
     }
     if ((++m_refreshTick % 12) != 0) return;
     if (!m_setupOk) return;
-    if (R_FAILED(BreezeGen2::Gen2Open())) return;
-    BreezeGen2::ReadWatchData(&m_wd);
-    BreezeGen2::Gen2Close();
+    if (R_SUCCEEDED(BreezeGen2::Gen2Open())) {
+      BreezeGen2::ReadWatchData(&m_wd);
+      BreezeGen2::Gen2Close();
+      tsl::hlp::requestForeground(m_wd.bp_hit);
+    }
   }
 
   virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -20278,6 +20424,7 @@ public:
     (void)keysHeld; (void)touchInput;
     (void)leftJoyStick; (void)rightJoyStick;
     if ((keysDown & KEY_Y) && (keysHeld & KEY_LSTICK)) {
+      // BreezeGen2::LogWatchData(m_wd, m_wd.name);
       tsl::hlp::requestForeground(true);
       tsl::changeTo<BookmarkTraceMenu>(m_wd.address, m_wd.offset, BreezeBookmark::BREEZE_TYPE_U32, m_wd.name, m_wd);
       return true;
