@@ -1,4 +1,4 @@
-﻿/********************************************************************************
+/********************************************************************************
  * File: main.cpp
  * Author: ppkantorski
  * Description:
@@ -19521,7 +19521,11 @@ public:
             }
 
             // Footer instructions
+#ifdef BREEZEHAND_WATCH_OVL
+            r->drawString("L3:Step Into  X:Step Over  L3+B:Clear&Resume", false, 16, 680, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
+#else
             r->drawString("L3:Step Into  X:Step Over  B:Clear&Resume", false, 16, 680, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
+#endif
             r->drawString("L:Toggle Int/FPU  R:Toggle Float/Double  A:Edit Reg", false, 16, 698, 12, tsl::Color{0xA, 0xA, 0xA, 0xF});
 
           } else if (m_bpWaiting) {
@@ -19533,7 +19537,11 @@ public:
             std::snprintf(waiting_str, sizeof(waiting_str), "Waiting for breakpoint at M+%lX...", m_bpAddr - mainBase);
 
             r->drawString(waiting_str, false, 24, 300, 16, tsl::Color{0xF, 0xF, 0x4, 0xF});
+#ifdef BREEZEHAND_WATCH_OVL
+            r->drawString("Press L3+B to Cancel", false, 24, 330, 14, tsl::Color{0xA, 0xA, 0xA, 0xF});
+#else
             r->drawString("Press B to Cancel", false, 24, 330, 14, tsl::Color{0xA, 0xA, 0xA, 0xF});
+#endif
 
           } else {
             // Draw Line Selection mode
@@ -19610,7 +19618,11 @@ public:
         return true;
       }
       // Y button handler removed
+#ifdef BREEZEHAND_WATCH_OVL
+      if ((keysDown & KEY_B) && (keysHeld & KEY_LSTICK)) { // Clear BP & Resume
+#else
       if (keysDown & KEY_B) { // Clear BP & Resume
+#endif
         m_wd.command = BreezeGen2::GEN2_CLEARB;
         m_wd.bp_hit = false;
         BreezeGen2::ExecuteWatchData(&m_wd);
@@ -19656,7 +19668,11 @@ public:
     }
 
     if (m_bpWaiting) {
+#ifdef BREEZEHAND_WATCH_OVL
+      if ((keysDown & KEY_B) && (keysHeld & KEY_LSTICK)) {
+#else
       if (keysDown & KEY_B) {
+#endif
         // Cancel waiting
         m_bpWaiting = false;
         m_wd.command = BreezeGen2::GEN2_CLEARB;
@@ -20429,7 +20445,7 @@ public:
       tsl::changeTo<BookmarkTraceMenu>(m_wd.address, m_wd.offset, BreezeBookmark::BREEZE_TYPE_U32, m_wd.name, m_wd);
       return true;
     }
-    if (keysDown & (KEY_DLEFT | KEY_DRIGHT)) {
+    if ((keysDown & (KEY_DLEFT | KEY_DRIGHT)) && (keysHeld & KEY_LSTICK)) {
       int step = (keysDown & KEY_DRIGHT) ? 1 : -1;
       g_bmState.monitorColorIdx =
           (g_bmState.monitorColorIdx + step + kMonitorColorCount) %
@@ -20443,6 +20459,15 @@ public:
           (g_bmState.monitorFontSizeIdx + step + kMonitorFontSizeCount) %
           kMonitorFontSizeCount;
       BookmarkSelection::SaveDisplaySettings();
+      return true;
+    }
+    if (keysDown & KEY_B) {
+      if (keysHeld & KEY_LSTICK) {
+        auto *ovl = tsl::Overlay::get();
+        if (ovl != nullptr) {
+          ovl->close();
+        }
+      }
       return true;
     }
     return false;
