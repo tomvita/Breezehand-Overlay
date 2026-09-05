@@ -9,7 +9,21 @@
 #include <thread>
 #include <vector>
 
+/* The overlay builds against libultrahand; the breezehand_net sysmodule does
+ * not (and must not -- it has no UI and a tight memory budget). The only thing
+ * this file needs from it is a mkdir, so provide that directly when building
+ * without ultra. */
+#if defined(BREEZE_SEARCH_NO_ULTRA)
+#include <sys/stat.h>
+namespace {
+    inline void breeze_create_directory(const char *p) { ::mkdir(p, 0777); }
+}
+#else
 #include <ultra.hpp>
+namespace {
+    inline void breeze_create_directory(const char *p) { ult::createDirectory(p); }
+}
+#endif
 
 #include "breeze_search_compat.hpp"
 #include "search_exec_template.hpp"
@@ -17,8 +31,17 @@
 namespace breeze {
 namespace {
 
-constexpr size_t kFixedScanBuffer = 2 * 1024 * 1024;
-constexpr size_t kOutputBuffer = 512 * 1024;
+/* Overridable so the breezehand_net sysmodule can run leaner: it lives in the
+ * limited sysmodule pool, where a 2 MB scan buffer competes with the user's
+ * other modules. The overlay keeps the original sizes. */
+#ifndef BREEZE_SCAN_BUFFER_BYTES
+#define BREEZE_SCAN_BUFFER_BYTES (2 * 1024 * 1024)
+#endif
+#ifndef BREEZE_OUTPUT_BUFFER_BYTES
+#define BREEZE_OUTPUT_BUFFER_BYTES (512 * 1024)
+#endif
+constexpr size_t kFixedScanBuffer = BREEZE_SCAN_BUFFER_BYTES;
+constexpr size_t kOutputBuffer = BREEZE_OUTPUT_BUFFER_BYTES;
 constexpr size_t kContinueInputBuffer = kFixedScanBuffer / 2;
 constexpr size_t kContinueMemoryBuffer = kFixedScanBuffer / 2;
 
@@ -106,7 +129,7 @@ size_t SelectScanBufferBytes() {
 }
 
 bool EnsureBreezeDir() {
-  ult::createDirectory("sdmc:/switch/Breeze/");
+  breeze_create_directory("sdmc:/switch/Breeze/");
   return true;
 }
 
