@@ -17208,13 +17208,21 @@ public:
 //
 // Reads Breeze bookmark file format:
 //   sdmc:/switch/breeze/cheats/<TITLE_ID>/<BUILD_ID>(NNN).bmk
-// File starts with BreezeFileHeader_t (magic "BREEZE00E"), then an array
-// of bookmark_t structs (packed). See Breeze: source/action.hpp / bookmark.cpp
+// File starts with BreezeFileHeader_t (magic "BREEZE00F"), then an array
+// of bookmark_t structs. See Breeze: source/action.hpp / bookmark.cpp
+//
+// Two on-disk record layouts exist, told apart by the header magic:
+//   "BREEZE00F" (Breeze beta108.8+3b and later): MAX_POINTER_DEPTH 15,
+//                record size 184 bytes. This is the in-memory layout.
+//   "BREEZE00E" (older Breeze): MAX_POINTER_DEPTH 12, record size 160
+//                bytes. Converted to the new layout on load.
 // =====================================================================
 namespace BreezeBookmark {
 
-#define BREEZE_FILEVERSION_LABEL "BREEZE00E"
-#define BREEZE_MAX_POINTER_DEPTH 12
+#define BREEZE_FILEVERSION_LABEL "BREEZE00F"
+#define BREEZE_FILEVERSION_LABEL_LEGACY "BREEZE00E"
+#define BREEZE_MAX_POINTER_DEPTH 15
+#define BREEZE_MAX_POINTER_DEPTH_LEGACY 12
 
 // Mirror of Breeze searchType_t (action.hpp)
 enum BreezeSearchType : u32 {
@@ -17245,26 +17253,58 @@ struct BreezePointerChain {
 };
 
 // IMPORTANT: Breeze declares bookmark_t with `NX_PACKED` placed BEFORE the
-// `struct` keyword (action.hpp line 190). GCC silently IGNORES that attribute
+// `struct` keyword (action.hpp). GCC silently IGNORES that attribute
 // placement and compiles bookmark_t with natural alignment instead. As a
-// result the on-disk record size is 160 bytes, not the 149 a packed layout
+// result the on-disk record size is 184 bytes, not the 173 a packed layout
 // would produce. We mirror the natural layout exactly here.
 struct BreezeBookmarkEntry {
   char label[19];               // offset 0
   // 1 byte pad (offset 19)
   BreezeSearchType type;        // offset 20  (u32)
-  BreezePointerChain pointer;   // offset 24  (u64 depth + 13 * s64 offset = 112 bytes)
-  u32 heap;                     // offset 136 (MemoryAccessType: 0=Main..4=Blank)
-  bool start_from_main;         // offset 140
-  // 3 bytes pad (offset 141..143)
-  s64 offset;                   // offset 144
-  bool deleted;                 // offset 152
-  // 7 bytes trailing pad (offset 153..159)  -> sizeof = 160
+  BreezePointerChain pointer;   // offset 24  (u64 depth + 16 * s64 offset = 136 bytes)
+  u32 heap;                     // offset 160 (MemoryAccessType: 0=Main..4=Blank)
+  bool start_from_main;         // offset 164
+  // 3 bytes pad (offset 165..167)
+  s64 offset;                   // offset 168
+  bool deleted;                 // offset 176
+  // 7 bytes trailing pad (offset 177..183)  -> sizeof = 184
 };
-static_assert(sizeof(BreezePointerChain) == 112,
+static_assert(sizeof(BreezePointerChain) == 136,
               "BreezePointerChain size mismatch");
-static_assert(sizeof(BreezeBookmarkEntry) == 160,
+static_assert(sizeof(BreezeBookmarkEntry) == 184,
               "BreezeBookmarkEntry size mismatch (must match Breeze layout)");
+
+// Legacy "BREEZE00E" record (MAX_POINTER_DEPTH 12): same shape with a
+// shorter offset array. Read only; converted to BreezeBookmarkEntry.
+struct BreezePointerChainLegacy {
+  u64 depth;
+  s64 offset[BREEZE_MAX_POINTER_DEPTH_LEGACY + 1];
+};
+struct BreezeBookmarkEntryLegacy {
+  char label[19];
+  BreezeSearchType type;
+  BreezePointerChainLegacy pointer;
+  u32 heap;
+  bool start_from_main;
+  s64 offset;
+  bool deleted;
+};
+static_assert(sizeof(BreezeBookmarkEntryLegacy) == 160,
+              "BreezeBookmarkEntryLegacy size mismatch");
+
+static BreezeBookmarkEntry
+UpgradeLegacyEntry(const BreezeBookmarkEntryLegacy &in) {
+  BreezeBookmarkEntry out{};
+  std::memcpy(out.label, in.label, sizeof(out.label));
+  out.type = in.type;
+  out.pointer.depth = in.pointer.depth;
+  std::memcpy(out.pointer.offset, in.pointer.offset, sizeof(in.pointer.offset));
+  out.heap = in.heap;
+  out.start_from_main = in.start_from_main;
+  out.offset = in.offset;
+  out.deleted = in.deleted;
+  return out;
+}
 
 // Breeze BreezeFileHeader_t layout. We don't need every field but we need
 // the correct size to seek past it. Mirror the C++ default-init order:
@@ -17384,7 +17424,8 @@ static u64 BaseOffset(u64 address, const DmntCheatProcessMetadata &meta) {
   return address;
 }
 
-// Read bookmark file: locate "HEADER@" then read packed bookmark_t array.
+// Read bookmark file: locate "HEADER@" then read the bookmark_t array.
+// The header magic selects the record layout (current or legacy).
 static bool ReadBookmarkFile(const std::string &path,
                              std::vector<BreezeBookmarkEntry> &out) {
   out.clear();
@@ -17405,15 +17446,22 @@ static bool ReadBookmarkFile(const std::string &path,
   }
   std::fclose(fp);
 
-  // Verify magic.
-  if (std::memcmp(data.data(), BREEZE_FILEVERSION_LABEL,
-                  std::strlen(BREEZE_FILEVERSION_LABEL)) != 0)
+  // Verify magic and pick the record layout it implies.
+  const size_t magicLen = std::strlen(BREEZE_FILEVERSION_LABEL);
+  bool legacy = false;
+  if (std::memcmp(data.data(), BREEZE_FILEVERSION_LABEL, magicLen) == 0) {
+    legacy = false;
+  } else if (std::memcmp(data.data(), BREEZE_FILEVERSION_LABEL_LEGACY,
+                         magicLen) == 0) {
+    legacy = true;
+  } else {
     return false;
+  }
 
   // Locate "HEADER@" + NUL within first ~4KB to find end-of-header.
   long headerEnd = -1;
   long searchLimit = std::min<long>(fsize - (long)kBreezeHeaderEndLen, 0x2000);
-  for (long i = std::strlen(BREEZE_FILEVERSION_LABEL); i <= searchLimit; i++) {
+  for (long i = (long)magicLen; i <= searchLimit; i++) {
     if (std::memcmp(data.data() + i, kBreezeHeaderEnd, kBreezeHeaderEndLen) ==
         0) {
       headerEnd = i + (long)kBreezeHeaderEndLen;
@@ -17423,6 +17471,17 @@ static bool ReadBookmarkFile(const std::string &path,
   if (headerEnd < 0) return false;
   long bodySize = fsize - headerEnd;
   if (bodySize <= 0) return true; // empty bookmark file, valid header
+  if (legacy) {
+    const size_t entrySize = sizeof(BreezeBookmarkEntryLegacy);
+    size_t n = (size_t)bodySize / entrySize;
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+      BreezeBookmarkEntryLegacy e;
+      std::memcpy(&e, data.data() + headerEnd + i * entrySize, entrySize);
+      out.push_back(UpgradeLegacyEntry(e));
+    }
+    return true;
+  }
   const size_t entrySize = sizeof(BreezeBookmarkEntry);
   size_t n = (size_t)bodySize / entrySize;
   if (n == 0) return true;
