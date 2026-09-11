@@ -57,7 +57,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:= Breezehand
 APP_AUTHOR	:= tomvita
-APP_VERSION	:= 0.10.3a
+APP_VERSION	:= 0.10.3b
 TARGET		:= breezehand
 BUILD		:= build
 SOURCES		:= source common ../capstone ../capstone/arch/AArch64
@@ -319,6 +319,7 @@ breezehand_light:
 # Serialize: editcheat and bookmark depend on breezehand so the destructive
 # `rm -rf out/switch` in the breezehand recipe doesn't race with their cp
 # steps when make is run with parallel jobs.
+breezehand_light: breezehand
 editcheat: breezehand
 bookmark: breezehand
 breezehand_watch: breezehand
