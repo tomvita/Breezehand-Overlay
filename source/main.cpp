@@ -17560,6 +17560,9 @@ static std::vector<int> ListBookmarkFiles() {
 namespace BreezeGen2 {
 
 constexpr const char *kGen2Version = "v0.15";
+// Later forks only append after bp_original_insn (gen2 asserts that block
+// size as GEN2_SAVED_SIZE), so any v0.15 or newer takes our shorter block.
+constexpr int kGen2MinMinor = 15;
 constexpr size_t kMaxCallStack     = 5;
 constexpr size_t kMaxWatchBuffer   = 0x200;
 
@@ -17770,7 +17773,8 @@ static bool EnsureInitialized() {
   Result rc = ReadWatchData(&wd);
   if (R_FAILED(rc)) return false;
   g_gen2State.version_matched =
-      (std::strncmp(wd.version, kGen2Version, sizeof(wd.version)) == 0);
+      wd.version[0] == 'v' && wd.version[1] == '0' && wd.version[2] == '.' &&
+      std::atoi(wd.version + 3) >= kGen2MinMinor;
   return g_gen2State.version_matched;
 }
 
