@@ -17639,8 +17639,38 @@ enum X30CatchType : u8 {
   X30_STACK,
   X30_R_MATCH,
   X30_EXCLUSIVE_SEARCH,
+  X30_UNIQUE_SEARCH,
   X30_END_OF_TYPE,
+  // Breeze-only watch types (gen2 v0.17+). Their results are not rows of
+  // from/from2, so this overlay only reports them.
+  X30_FIELD_WATCH,
+  X30_FIELD_SWEEP,
+  X30_METHOD_WATCH,
+  X30_CODE_WATCH,
 };
+
+// METHOD_WATCH result entry in fromU; mirrors gen2's m_method_t.
+#pragma pack(push, 1)
+struct MethodEntry {
+  u32 method;
+  u32 caller : 28;
+  u32 state : 4;
+  u64 self;
+};
+#pragma pack(pop)
+static_assert(sizeof(MethodEntry) == 16, "m_method_t layout");
+constexpr u32 kMethodCalled = 1;
+
+// The name of a Breeze-only watch type, or nullptr for one this overlay shows.
+static const char *BreezeOnlyWatchName(X30CatchType t) {
+  switch (t) {
+    case X30_FIELD_WATCH:  return "field watch";
+    case X30_FIELD_SWEEP:  return "field sweep";
+    case X30_METHOD_WATCH: return "method watch";
+    case X30_CODE_WATCH:   return "code watch";
+    default:               return nullptr;
+  }
+}
 
 struct alignas(16) WatchThreadContext {
   u64 r[29];
@@ -20319,6 +20349,38 @@ public:
             return;
           }
 
+          if (const char *kind = BreezeGen2::BreezeOnlyWatchName(m_wd.x30_catch_type)) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "Breeze is running a %s.", kind);
+            r->drawString(std::string(line), false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+            const u8 *raw = reinterpret_cast<const u8 *>(&m_wd.fromU);
+            if (m_wd.x30_catch_type == BreezeGen2::X30_CODE_WATCH) {
+              std::snprintf(line, sizeof(line), "%llu functions called",
+                            (unsigned long long)m_wd.total_trigger);
+            } else if (m_wd.x30_catch_type == BreezeGen2::X30_METHOD_WATCH) {
+              const int total = std::clamp<int>(
+                  m_wd.size, 0, (int)(sizeof(m_wd.fromU) / sizeof(BreezeGen2::MethodEntry)));
+              int called = 0;
+              for (int i = 0; i < total; i++) {
+                BreezeGen2::MethodEntry e;
+                std::memcpy(&e, raw + i * sizeof(e), sizeof(e));
+                if (e.state == BreezeGen2::kMethodCalled) called++;
+              }
+              std::snprintf(line, sizeof(line), "%d of %d methods called", called, total);
+            } else {
+              const int bytes = std::clamp<int>(m_wd.size, 0, (int)sizeof(m_wd.fromU) * 8);
+              int seen = 0;
+              for (int i = 0; i < bytes; i++)
+                if (raw[i >> 3] & (1u << (i & 7))) seen++;
+              std::snprintf(line, sizeof(line), "%d of %d bytes accessed", seen, bytes);
+            }
+            r->drawString(std::string(line), false, kMarginX, yy, fontSize, col);
+            yy += lineH;
+            r->drawString("See the results in Breeze.", false, kMarginX, yy, fontSize, col);
+            return;
+          }
+
           const bool memWatch = m_wd.read || m_wd.write;
           
           // Header line.
@@ -20503,6 +20565,8 @@ public:
     (void)keysHeld; (void)touchInput;
     (void)leftJoyStick; (void)rightJoyStick;
     if ((keysDown & KEY_Y) && (keysHeld & KEY_LSTICK)) {
+      // Trace breaks through an ordinary watch; it cannot run on these.
+      if (BreezeGen2::BreezeOnlyWatchName(m_wd.x30_catch_type) != nullptr) return true;
       // BreezeGen2::LogWatchData(m_wd, m_wd.name);
       tsl::hlp::requestForeground(true);
       tsl::changeTo<BookmarkTraceMenu>(m_wd.address, m_wd.offset, BreezeBookmark::BREEZE_TYPE_U32, m_wd.name, m_wd);
