@@ -884,7 +884,7 @@ void powerOffAllControllers() {
         return;
     }
     
-    BtmConnectedDeviceV13 connected_devices[8];
+    BtmDeviceCondition connected_devices[8];
     rc = btmGetDeviceCondition(BtmProfile_None, connected_devices, 8, &g_connected_count);
     if (R_SUCCEEDED(rc)) {
         for (s32 i = 0; i != g_connected_count; ++i) {
