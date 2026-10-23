@@ -7486,6 +7486,226 @@ std::string GetTitleIdString() {
   return ss.str();
 }
 
+// The game's folder under sdmc:/switch/breeze/cheats/, as Breeze names it
+// (searchmanager.cpp Gamedir()): the title ID, or with Breeze's "use title
+// id" setting off, the game's title folded the way Breeze folds it
+// (action.cpp init_cheat_system).  Without Breeze, the title ID.
+
+// BreezeOptions is Breeze's struct Options written raw after its 10 byte
+// magic.  Offsets measured from Breeze's action.hpp (offsetof) for the
+// BREEZE00F layout; use_titleid sits ahead of anything that has moved, so a
+// later layout keeps it, replace_space only holds for this one.
+static bool ReadBreezeOptions(bool &use_titleid, bool &replace_space) {
+  constexpr long kMagic = 10, kUseTitleId = 144, kReplaceSpace = 25248;
+  FILE *fp = fopen("sdmc:/switch/Breeze/BreezeOptions", "rb");
+  if (fp == nullptr)
+    return false;
+  char magic[kMagic] = {};
+  u8 b = 1;
+  bool ok = fread(magic, 1, kMagic, fp) == (size_t)kMagic &&
+            std::strncmp(magic, "BREEZE", 6) == 0 &&
+            fseek(fp, kMagic + kUseTitleId, SEEK_SET) == 0 &&
+            fread(&b, 1, 1, fp) == 1;
+  use_titleid = b != 0;
+  replace_space = false;
+  if (ok && std::strcmp(magic, "BREEZE00F") == 0 &&
+      fseek(fp, kMagic + kReplaceSpace, SEEK_SET) == 0 && fread(&b, 1, 1, fp) == 1)
+    replace_space = b != 0;
+  fclose(fp);
+  return ok;
+}
+
+// The title as Breeze reads it: ns control data (masked id, then ACD2 slots,
+// then the unmasked id), nacpGetLanguageEntry, and for compressed language
+// data the first non-empty decompressed entry.
+static std::string BreezeRawTitle(u64 title_id) {
+  NsApplicationControlData *acd =
+      (NsApplicationControlData *)malloc(sizeof(NsApplicationControlData));
+  if (acd == nullptr)
+    return "";
+  NacpLanguageEntry *entry = nullptr;
+  auto empty = [&]() { return entry == nullptr || entry->name[0] == '\0'; };
+  const u64 masked = title_id & 0xFFFFFFFFFFFFFFF0ull;
+  auto legacy = [&](u64 id) {
+    size_t size = 0;
+    std::memset(acd, 0, sizeof *acd);
+    entry = nullptr;
+    if (R_SUCCEEDED(nsGetApplicationControlData(
+            NsApplicationControlSource_Storage, id, acd, sizeof *acd, &size)))
+      nacpGetLanguageEntry(&acd->nacp, &entry);
+    return !empty();
+  };
+  auto acd2 = [&](u64 id) {
+    for (u8 i = 1; i <= 3; i++) {
+      u64 actual = 0;
+      u32 unk = 0;
+      std::memset(acd, 0, sizeof *acd);
+      entry = nullptr;
+      if (R_SUCCEEDED(nsGetApplicationControlData2(
+              NsApplicationControlSource_Storage, id, acd, sizeof *acd, 0, i,
+              &actual, &unk))) {
+        nacpGetLanguageEntry(&acd->nacp, &entry);
+        if (!empty())
+          return true;
+      }
+    }
+    return false;
+  };
+  bool got = legacy(masked) || acd2(masked);
+  if (!got && title_id != masked)
+    got = legacy(title_id) || acd2(title_id);
+  std::string name;
+  if (got) {
+    name = entry->name;
+    if (acd->nacp.titles_data_format == 1) {
+      const u16 size = acd->nacp.lang_data.compressed_data.buffer_size;
+      const u8 *buf = acd->nacp.lang_data.compressed_data.buffer;
+      NacpLanguageEntry *lang =
+          (NacpLanguageEntry *)calloc(32, sizeof(NacpLanguageEntry));
+      if (lang != nullptr && size > 0 &&
+          size <= sizeof(acd->nacp.lang_data.compressed_data.buffer)) {
+        z_stream zs = {};
+        zs.next_in = const_cast<Bytef *>(buf);
+        zs.avail_in = size;
+        zs.next_out = (Bytef *)lang;
+        zs.avail_out = 32 * sizeof(NacpLanguageEntry);
+        if (inflateInit2(&zs, -15) == Z_OK) {
+          const int zr = inflate(&zs, Z_FINISH);
+          inflateEnd(&zs);
+          if ((zr == Z_STREAM_END || zr == Z_OK) && lang[0].name[0] != '\0')
+            for (int i = 0; i < 32; i++)
+              if (lang[i].name[0] != '\0') {
+                name = lang[i].name;
+                break;
+              }
+        }
+      }
+      free(lang);
+    }
+  }
+  free(acd);
+  if (name.empty()) {
+    char tid[24];
+    std::snprintf(tid, sizeof tid, "TID_%016lX", title_id);
+    name = tid;
+  }
+  return name;
+}
+
+static void ReplaceAllIn(std::string &s, const std::string &from,
+                         const std::string &to, bool step) {
+  size_t pos = 0;
+  while ((pos = s.find(from, pos)) != std::string::npos) {
+    s.replace(pos, from.size(), to);
+    if (step)
+      pos += 1;
+  }
+}
+
+// Breeze moves a shared folder of a mostly folded name to the name with the
+// title ID once it knows the folder is this game's (claim_shared_title_dir).
+static void ClaimSharedTitleDir(const std::string &shared,
+                                const std::string &unique, u64 title_id,
+                                const u8 *bid) {
+  const std::string oldDir = "sdmc:/switch/breeze/cheats/" + shared;
+  const std::string newDir = "sdmc:/switch/breeze/cheats/" + unique;
+  struct stat st;
+  if (stat(oldDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+    return;
+  if (stat(newDir.c_str(), &st) == 0)
+    return;
+  bool ours = false;
+  const std::string tid =
+      ult::parseValueFromIniSection(oldDir + "/game_id", "Nx", "title_id");
+  if (!tid.empty()) {
+    ours = std::strtoull(tid.c_str(), nullptr, 16) == title_id;
+  } else {
+    char bidStr[17];
+    std::snprintf(bidStr, sizeof bidStr, "%02X%02X%02X%02X%02X%02X%02X%02X",
+                  bid[0], bid[1], bid[2], bid[3], bid[4], bid[5], bid[6],
+                  bid[7]);
+    if (DIR *dir = opendir(oldDir.c_str())) {
+      while (struct dirent *e = readdir(dir))
+        if (strncasecmp(e->d_name, bidStr, 16) == 0) {
+          ours = true;
+          break;
+        }
+      closedir(dir);
+    }
+  }
+  if (ours)
+    rename(oldDir.c_str(), newDir.c_str());
+}
+
+// Breeze's m_titleName.
+static std::string BreezeTitleFolderName(const DmntCheatProcessMetadata &md,
+                                         bool replace_space) {
+  std::string name = BreezeRawTitle(md.title_id);
+  ReplaceAllIn(name, ":", "", false);
+  if (replace_space)
+    ReplaceAllIn(name, " ", "_", true);
+  ReplaceAllIn(name, "®", "", false); // (R)
+  ReplaceAllIn(name, "–", "-", true); // en dash
+  ReplaceAllIn(name, "™", "", false); // (TM)
+  ReplaceAllIn(name, "\\", "", false);
+  ReplaceAllIn(name, "/", "", false);
+  ReplaceAllIn(name, "é", "e", true);
+  ReplaceAllIn(name, "\"", "", false);
+  size_t pos = 0;
+  while ((pos = name.find_first_of("*?<>|", pos)) != std::string::npos)
+    name.replace(pos, 1, "");
+  // Non-ASCII to an apostrophe: the SD filesystem does not keep such names.
+  size_t folded = 0;
+  pos = 0;
+  while (pos < name.size()) {
+    const unsigned char c = (unsigned char)name[pos];
+    if (c >= 0x80) {
+      if (c >= 0xF0)
+        name.replace(pos, 4, "'");
+      else if (c >= 0xE0)
+        name.replace(pos, 3, "'");
+      else if (c >= 0xC0)
+        name.replace(pos, 2, "'");
+      folded++;
+    }
+    pos++;
+  }
+  size_t readable = 0;
+  for (unsigned char c : name)
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z'))
+      readable++;
+  if (folded > readable) {
+    const std::string shared = name;
+    char tid[24];
+    std::snprintf(tid, sizeof tid, " %016lX", md.title_id);
+    name += tid;
+    ClaimSharedTitleDir(shared, name, md.title_id, md.main_nso_build_id);
+  }
+  return name;
+}
+
+std::string GameDir() {
+  static const std::string root = "sdmc:/switch/breeze/cheats/";
+  DmntCheatProcessMetadata md;
+  if (R_FAILED(dmntchtGetCheatProcessMetadata(&md)))
+    return root + GetTitleIdString() + "/";
+  static u64 cachedTid = 0;
+  static std::string cached;
+  if (!cached.empty() && cachedTid == md.title_id)
+    return cached;
+  char tid[17];
+  std::snprintf(tid, sizeof tid, "%016lX", md.title_id);
+  bool use_titleid = true, replace_space = false;
+  ReadBreezeOptions(use_titleid, replace_space);
+  cached = root +
+           (use_titleid ? std::string(tid)
+                        : BreezeTitleFolderName(md, replace_space)) +
+           "/";
+  cachedTid = md.title_id;
+  return cached;
+}
+
 void SaveToggles(const std::string &path) {
   FILE *file = fopen(path.c_str(), "w");
   if (!file)
@@ -7523,9 +7743,488 @@ void ClearCheats() {
   }
 }
 
+// --- Breeze split ASM cheats and mods (Breeze beta127.00) ---
+//
+// Breeze's cheat source file splits an ASM cheat in two:
+//
+//   [code cave] folder   after the list: one cheat per cave, named like its
+//                        hook, nothing but type 0 main stores, plus
+//                        "<label> (off)" holding the store that puts the
+//                        game's instruction back.  Breeze keeps the folder out
+//                        of dmnt (it would take cheat slots and opcode budget
+//                        for words that never change) and writes the caves
+//                        into the game itself.
+//   hook cheat           1405000H CCCCCCCC FFFFFFFF  if the cave is filled
+//                        0400000H HHHHHHHH BBBBBBBB      the branch
+//                        20000000
+//                        (inside 8kkkkkkk .. 20000000 with a key).  The first
+//                        form also wrote the original in an Else.
+//
+// A mod is a value in a cave as a list of cheats, "<mod> = <value>" (the
+// first one "... (default)"), or "<mod> <label>" for a labelled value: only
+// one is on at a time, and turning one off writes the default back.
+// The names come from [mod <name>] sections of <TitleID>.ini when the game
+// folder has it, else from the "<mod> = <value>" form of the cheat names.
+
+// The name without leading key hint glyphs and spaces (Breeze's
+// cave_label_key).
+std::string CaveLabelKey(const char *name) {
+  if (name == nullptr)
+    return "";
+  const unsigned char *p = (const unsigned char *)name;
+  while (*p != 0 && (*p >= 0x80 || *p == ' '))
+    p++;
+  return (const char *)p;
+}
+
+static bool IsCaveFolderName(const char *name) {
+  return ult::stringToLowercase(CaveLabelKey(name)) == "code cave";
+}
+
+static bool IsOffName(const std::string &name) {
+  return name.size() > 6 && name.compare(name.size() - 6, 6, " (off)") == 0;
+}
+
+std::vector<DmntCheatDefinition> g_caveFills; // fills and off cheats
+u64 g_caveFillsTid = 0;
+u64 g_caveFillsBid = 0;
+bool g_caveFillsKnown = false; // read for that game, maybe empty
+
+static bool GetProcessMetadata(DmntCheatProcessMetadata &md) {
+  return R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&md));
+}
+
+static u64 BidOf(const DmntCheatProcessMetadata &md) {
+  u64 bid = 0;
+  std::memcpy(&bid, md.main_nso_build_id, sizeof bid);
+  return bid;
+}
+
+static void ResetCaveFills(const DmntCheatProcessMetadata &md) {
+  g_caveFills.clear();
+  g_caveFillsTid = md.title_id;
+  g_caveFillsBid = BidOf(md);
+  g_caveFillsKnown = true;
+}
+
+static void SetCaveFill(const DmntCheatDefinition &d) {
+  const std::string key = CaveLabelKey(d.readable_name);
+  for (auto &f : g_caveFills)
+    if (CaveLabelKey(f.readable_name) == key) {
+      f = d;
+      return;
+    }
+  g_caveFills.push_back(d);
+}
+
+// The [code cave] folder of the game's cheat file, read once per game when
+// nothing loaded it in this run (the cheats came from Breeze or from dmnt at
+// boot), so a save does not drop it.
+void EnsureCaveFills() {
+  DmntCheatProcessMetadata md;
+  if (!GetProcessMetadata(md))
+    return;
+  if (g_caveFillsKnown && g_caveFillsTid == md.title_id &&
+      g_caveFillsBid == BidOf(md))
+    return;
+  ResetCaveFills(md);
+  std::string path = GameDir() + GetBuildIdString() + ".txt";
+  FILE *fp = fopen(path.c_str(), "r");
+  if (fp == nullptr)
+    return;
+  char line[1024];
+  bool inside = false;
+  DmntCheatDefinition d = {};
+  auto flush = [&]() {
+    if (d.num_opcodes != 0)
+      SetCaveFill(d);
+    d = {};
+  };
+  while (fgets(line, sizeof line, fp) != nullptr) {
+    std::string t = line;
+    ult::trim(t);
+    if (t.empty())
+      continue;
+    if (t[0] == '[' && t.back() == ']') {
+      const std::string name = t.substr(1, t.size() - 2);
+      if (!inside) {
+        inside = IsCaveFolderName(name.c_str());
+        continue;
+      }
+      flush();
+      if (ult::stringToLowercase(CaveLabelKey(name.c_str())) ==
+          "code cave end")
+        break;
+      std::snprintf(d.readable_name, sizeof d.readable_name, "%s",
+                    name.c_str());
+      continue;
+    }
+    if (!inside || d.readable_name[0] == 0)
+      continue;
+    size_t at = 0;
+    while (at < t.size()) {
+      while (at < t.size() && std::isspace((unsigned char)t[at]))
+        at++;
+      size_t end = at;
+      while (end < t.size() && !std::isspace((unsigned char)t[end]))
+        end++;
+      if (end > at && d.num_opcodes < sizeof d.opcodes / sizeof(u32))
+        d.opcodes[d.num_opcodes++] =
+            (u32)std::strtoul(t.substr(at, end - at).c_str(), nullptr, 16);
+      at = end;
+    }
+  }
+  flush();
+  fclose(fp);
+}
+
+static const DmntCheatDefinition *FindCaveFill(const std::string &label) {
+  const std::string key = CaveLabelKey(label.c_str());
+  for (const auto &f : g_caveFills)
+    if (CaveLabelKey(f.readable_name) == key)
+      return &f;
+  return nullptr;
+}
+
+// 0TMR00AA AAAAAAAA value(s): a store with no register.  Its region, address,
+// width and value; the words it takes, 0 when it is not one.
+static u32 StoreAt(const u32 *op, u32 left, u32 &region, u64 &address,
+                   u32 &width, u64 &value) {
+  if (left < 3)
+    return 0;
+  const u32 w = op[0];
+  if ((w & 0xF000FF00) != 0 || ((w >> 16) & 0xF) != 0)
+    return 0; // type 0, no register
+  width = (w >> 24) & 0xF;
+  region = (w >> 20) & 0xF;
+  address = ((u64)(w & 0xFF) << 32) | op[1];
+  if (width == 8) {
+    if (left < 4)
+      return 0;
+    value = ((u64)op[2] << 32) | op[3];
+    return 4;
+  }
+  if (width != 1 && width != 2 && width != 4)
+    return 0;
+  value = op[2];
+  return 3;
+}
+
+static bool WriteStore(const DmntCheatProcessMetadata &md, u32 region,
+                       u64 address, u32 width, u64 value) {
+  u64 base = 0;
+  if (region == 0)
+    base = md.main_nso_extents.base;
+  else if (region == 1)
+    base = md.heap_extents.base;
+  else
+    return false;
+  return R_SUCCEEDED(
+      dmntchtWriteCheatProcessMemory(base + address, &value, width));
+}
+
+// Every store of a fill (or off cheat) into the game.
+static bool WriteFill(const DmntCheatProcessMetadata &md,
+                      const DmntCheatDefinition &d) {
+  bool ok = d.num_opcodes > 0;
+  for (u32 i = 0; i < d.num_opcodes;) {
+    u32 region = 0, width = 0;
+    u64 address = 0, value = 0;
+    const u32 n =
+        StoreAt(d.opcodes + i, d.num_opcodes - i, region, address, width, value);
+    if (n == 0)
+      return false;
+    if (!WriteStore(md, region, address, width, value))
+      ok = false;
+    i += n;
+  }
+  return ok;
+}
+
+void WriteAllCaveFills() {
+  DmntCheatProcessMetadata md;
+  if (!GetProcessMetadata(md))
+    return;
+  for (const auto &f : g_caveFills)
+    if (!IsOffName(f.readable_name))
+      WriteFill(md, f);
+}
+
+struct SplitHook {
+  u64 cave = 0;
+  u32 first = 0;
+  u64 hook = 0;
+  u32 original = 0;
+  bool hasOriginal = false; // the first form: the original in an Else
+};
+
+static bool ParseSplitHook(const DmntCheatDefinition &d, SplitHook &out) {
+  out = SplitHook();
+  const u32 *op = d.opcodes;
+  const u32 n = d.num_opcodes;
+  u32 at = 0;
+  bool keyed = false;
+  if (n > 0 && (op[0] & 0xF0000000) == 0x80000000) {
+    keyed = true;
+    at = 1;
+  }
+  if (n < at + 7 || (op[at] & 0xFFFFFF00) != 0x14050000)
+    return false;
+  out.cave = ((u64)(op[at] & 0xFF) << 32) | op[at + 1];
+  out.first = op[at + 2];
+  u32 region = 0, width = 0;
+  u64 value = 0;
+  if (StoreAt(op + at + 3, n - at - 3, region, out.hook, width, value) != 3 ||
+      region != 0 || width != 4)
+    return false;
+  if (op[at + 6] == 0x20000000)
+    return n == at + 7 + (keyed ? 1 : 0);
+  // The first form: 21000000 0400000H HHHHHHHH OOOOOOOO 20000000
+  u64 a2 = 0, v2 = 0;
+  if (op[at + 6] != 0x21000000 || n < at + 11 ||
+      StoreAt(op + at + 7, n - at - 7, region, a2, width, v2) != 3 ||
+      a2 != out.hook)
+    return false;
+  out.original = (u32)v2;
+  out.hasOriginal = true;
+  return true;
+}
+
+static bool CaveFilled(const DmntCheatProcessMetadata &md, const SplitHook &h) {
+  u32 now = 0;
+  if (R_FAILED(dmntchtReadCheatProcessMemory(md.main_nso_extents.base + h.cave,
+                                             &now, sizeof now)))
+    return false;
+  return now == h.first;
+}
+
+// A split hook that is on needs its cave in the game, or its guard never
+// branches (a game restarted, or cheats loaded by dmnt at boot).
+void FillCavesOfEnabledHooks() {
+  EnsureCaveFills();
+  if (g_caveFills.empty())
+    return;
+  DmntCheatProcessMetadata md;
+  if (!GetProcessMetadata(md))
+    return;
+  u64 count = 0;
+  if (R_FAILED(dmntchtGetCheatCount(&count)) || count == 0)
+    return;
+  std::vector<DmntCheatEntry> cheats(count);
+  if (R_FAILED(dmntchtGetCheats(cheats.data(), count, 0, &count)))
+    return;
+  for (u64 i = 0; i < count; i++) {
+    SplitHook h;
+    if (!cheats[i].enabled || !ParseSplitHook(cheats[i].definition, h))
+      continue;
+    const DmntCheatDefinition *fill =
+        FindCaveFill(cheats[i].definition.readable_name);
+    if (fill != nullptr && !CaveFilled(md, h))
+      WriteFill(md, *fill);
+  }
+}
+
+// Mod names from the [mod <name>] sections of <TitleID>.ini, as Breeze names
+// the value cheats: key = cheat name, value = mod name.
+static std::map<std::string, std::string> g_modValueNames;
+static u64 g_modNamesTid = ~0ull;
+
+static void EnsureModNames() {
+  const std::string tid = GetTitleIdString();
+  const u64 tidValue = std::strtoull(tid.c_str(), nullptr, 16);
+  if (g_modNamesTid == tidValue)
+    return;
+  g_modNamesTid = tidValue;
+  g_modValueNames.clear();
+  std::ifstream file(GameDir() + tid + ".ini");
+  if (!file)
+    return;
+  std::string line, mod, at, values;
+  auto flush = [&]() {
+    if (!mod.empty()) {
+      size_t index = 0, start = 0;
+      while (start <= values.size()) {
+        size_t semi = values.find(';', start);
+        if (semi == std::string::npos)
+          semi = values.size();
+        std::string item = values.substr(start, semi - start);
+        ult::trim(item);
+        start = semi + 1;
+        if (item.empty())
+          continue;
+        std::string label, value = item;
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+          label = item.substr(0, eq);
+          value = item.substr(eq + 1);
+          ult::trim(label);
+          ult::trim(value);
+        }
+        const std::string tail = index == 0 && !at.empty() ? " (default)" : "";
+        g_modValueNames[label.empty() ? mod + " = " + value + tail
+                                      : mod + " " + label + tail] = mod;
+        index++;
+      }
+    }
+    mod.clear();
+    at.clear();
+    values.clear();
+  };
+  while (std::getline(file, line)) {
+    ult::trim(line);
+    if (line.empty() || line[0] == ';' || line[0] == '#')
+      continue;
+    if (line[0] == '[') {
+      flush();
+      if (line.back() == ']' && line.compare(0, 5, "[mod ") == 0) {
+        mod = line.substr(5, line.size() - 6);
+        ult::trim(mod);
+      }
+      continue;
+    }
+    if (mod.empty())
+      continue;
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos)
+      continue;
+    std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+    ult::trim(k);
+    ult::trim(v);
+    if (k == "at")
+      at = v;
+    else if (k == "values")
+      values = v;
+  }
+  flush();
+}
+
+// The mod a cheat is a value of, or "".
+static std::string ModOf(const char *name) {
+  const std::string key = CaveLabelKey(name);
+  auto it = g_modValueNames.find(key);
+  if (it != g_modValueNames.end())
+    return it->second;
+  std::string n = key;
+  if (n.size() > 10 && n.compare(n.size() - 10, 10, " (default)") == 0)
+    n.erase(n.size() - 10);
+  const size_t eq = n.rfind(" = ");
+  if (eq == std::string::npos || eq == 0 || eq + 3 >= n.size())
+    return "";
+  return n.substr(0, eq);
+}
+
+static bool IsDefaultName(const char *name) {
+  const std::string n = CaveLabelKey(name);
+  return n.size() > 10 && n.compare(n.size() - 10, 10, " (default)") == 0;
+}
+
+// After a cheat was toggled in the list.  True when other cheats changed
+// state too (the list needs drawing again).
+bool AfterCheatToggled(u32 cheat_id) {
+  DmntCheatEntry entry;
+  if (R_FAILED(dmntchtGetCheatById(&entry, cheat_id)))
+    return false;
+  DmntCheatProcessMetadata md;
+  if (!GetProcessMetadata(md))
+    return false;
+
+  SplitHook h;
+  if (ParseSplitHook(entry.definition, h)) {
+    EnsureCaveFills();
+    if (entry.enabled) {
+      const DmntCheatDefinition *fill =
+          FindCaveFill(entry.definition.readable_name);
+      if (fill != nullptr && !CaveFilled(md, h))
+        WriteFill(md, *fill);
+    } else if (h.hasOriginal) {
+      WriteStore(md, 0, h.hook, 4, h.original);
+    } else {
+      const DmntCheatDefinition *off = FindCaveFill(
+          CaveLabelKey(entry.definition.readable_name) + " (off)");
+      if (off != nullptr)
+        WriteFill(md, *off);
+    }
+    return false;
+  }
+
+  EnsureModNames();
+  const std::string mod = ModOf(entry.definition.readable_name);
+  if (mod.empty())
+    return false;
+  u64 count = 0;
+  if (R_FAILED(dmntchtGetCheatCount(&count)) || count == 0)
+    return false;
+  std::vector<DmntCheatEntry> cheats(count);
+  if (R_FAILED(dmntchtGetCheats(cheats.data(), count, 0, &count)))
+    return false;
+  bool changed = false;
+  for (u64 i = 0; i < count; i++) {
+    const auto &other = cheats[i];
+    if (other.cheat_id == cheat_id ||
+        ModOf(other.definition.readable_name) != mod)
+      continue;
+    if (entry.enabled && other.enabled) {
+      dmntchtToggleCheat(other.cheat_id);
+      changed = true;
+    } else if (!entry.enabled &&
+               IsDefaultName(other.definition.readable_name)) {
+      // A value in a cave goes back to what the code holds; a pointer
+      // chain's mod has no default (the game's own value).
+      const u32 *op = other.definition.opcodes;
+      const u32 at = (op[0] & 0xF0000000) == 0x80000000 ? 1 : 0;
+      u32 region = 0, width = 0;
+      u64 address = 0, value = 0;
+      if (StoreAt(op + at, other.definition.num_opcodes - at, region, address,
+                  width, value) != 0)
+        WriteStore(md, region, address, width, value);
+    }
+  }
+  // Turning the default itself off writes it too, as Breeze does.
+  if (!entry.enabled && IsDefaultName(entry.definition.readable_name)) {
+    const u32 *op = entry.definition.opcodes;
+    const u32 at = (op[0] & 0xF0000000) == 0x80000000 ? 1 : 0;
+    u32 region = 0, width = 0;
+    u64 address = 0, value = 0;
+    if (StoreAt(op + at, entry.definition.num_opcodes - at, region, address,
+                width, value) != 0)
+      WriteStore(md, region, address, width, value);
+  }
+  return changed;
+}
+
+// A cheat of the file being loaded goes to dmnt, unless it is in the
+// [code cave] folder: those stay out of dmnt and are written here.
+static bool g_loadingCaveFolder = false;
+static void LoadAdd(DmntCheatEntry &entry) {
+  const DmntCheatDefinition &d = entry.definition;
+  const bool header = d.num_opcodes == 1 && d.opcodes[0] == 0x20000000;
+  const bool closer = d.num_opcodes == 1 && d.opcodes[0] == 0x20000001;
+  if (header && IsCaveFolderName(d.readable_name)) {
+    g_loadingCaveFolder = true;
+    return;
+  }
+  if (g_loadingCaveFolder) {
+    if (closer || header)
+      g_loadingCaveFolder = false;
+    if (closer)
+      return;
+    if (!header) {
+      SetCaveFill(d);
+      return;
+    }
+  }
+  dmntchtAddCheat(&(entry.definition), entry.enabled, &(entry.cheat_id));
+}
+
 bool ParseCheats(const std::string &path) {
   // Clear existing cheats before loading new ones
   ClearCheats();
+  g_loadingCaveFolder = false;
+  {
+    DmntCheatProcessMetadata md;
+    if (GetProcessMetadata(md))
+      ResetCaveFills(md);
+  }
   FILE *pfile;
   pfile = fopen(path.c_str(), "rb");
   if (pfile != NULL) {
@@ -7558,8 +8257,7 @@ bool ParseCheats(const std::string &path) {
           if (cheatentry.enabled == true)
             dmntchtSetMasterCheat(&(cheatentry.definition));
           else
-            dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                            &(cheatentry.cheat_id));
+            LoadAdd(cheatentry);
         }
         /* Parse a normal cheat set to off */
         cheatentry.definition.num_opcodes = 0;
@@ -7593,8 +8291,7 @@ bool ParseCheats(const std::string &path) {
         i = j + 1;
       } else if (s[i] == '{') {
         if (cheatentry.definition.num_opcodes != 0) {
-          dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                          &(cheatentry.cheat_id));
+          LoadAdd(cheatentry);
         }
         /* We're parsing a master cheat. Turn it on */
         cheatentry.definition.num_opcodes = 0;
@@ -7625,8 +8322,7 @@ bool ParseCheats(const std::string &path) {
         if (cheatentry.definition.num_opcodes >=
             sizeof(cheatentry.definition.opcodes) / 4) {
           if (cheatentry.definition.num_opcodes != 0) {
-            dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                            &(cheatentry.cheat_id));
+            LoadAdd(cheatentry);
           }
           return false;
         }
@@ -7637,8 +8333,7 @@ bool ParseCheats(const std::string &path) {
           if (i + j >= len ||
               !std::isxdigit(static_cast<unsigned char>(s[i + j]))) {
             if (cheatentry.definition.num_opcodes != 0) {
-              dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                              &(cheatentry.cheat_id));
+              LoadAdd(cheatentry);
             }
             return false;
           }
@@ -7655,18 +8350,18 @@ bool ParseCheats(const std::string &path) {
       } else {
         /* Unexpected character encountered. */
         if (cheatentry.definition.num_opcodes != 0) {
-          dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                          &(cheatentry.cheat_id));
+          LoadAdd(cheatentry);
         }
         return false;
       }
     }
     if (cheatentry.definition.num_opcodes != 0) {
-      dmntchtAddCheat(&(cheatentry.definition), cheatentry.enabled,
-                      &(cheatentry.cheat_id));
+      LoadAdd(cheatentry);
     }
     fclose(
         pfile); // take note that if any error occured above this isn't closed
+    // The caves before any hook that guards on them is turned on.
+    WriteAllCaveFills();
     return true;
   }
   return false;
@@ -7694,6 +8389,7 @@ void SaveCheatsToDir(const std::string &directory, bool append = false) {
     file = fopen(path.c_str(), "w");
   }
 
+  EnsureCaveFills();
   if (file) {
     fprintf(file, "[Breezehand %s TID: %s BID: %s]\n\n", APP_VERSION,
             tid.c_str(), bid.c_str());
@@ -7775,6 +8471,35 @@ void SaveCheatsToDir(const std::string &directory, bool append = false) {
           }
           fprintf(file, "\n");
         }
+        cheats.resize(cheatCount);
+      }
+      // The cave fills kept out of dmnt go last, in their folder (unless an
+      // older load put the folder into dmnt, where it was just written).
+      bool folderInList = false;
+      for (const auto &cheat : cheats)
+        if (cheat.definition.num_opcodes == 1 &&
+            cheat.definition.opcodes[0] == 0x20000000 &&
+            IsCaveFolderName(cheat.definition.readable_name))
+          folderInList = true;
+      if (!folderInList && !g_caveFills.empty()) {
+        fprintf(file, "[code cave]\n20000000\n\n");
+        for (const auto &f : g_caveFills) {
+          fprintf(file, "[%s]\n", f.readable_name);
+          for (u32 j = 0; j < f.num_opcodes;) {
+            u32 region = 0, width = 0;
+            u64 address = 0, value = 0;
+            u32 n = StoreAt(f.opcodes + j, f.num_opcodes - j, region, address,
+                            width, value);
+            if (n == 0)
+              n = 1;
+            for (u32 k = 0; k < n; k++)
+              fprintf(file, "%08X ", f.opcodes[j + k]);
+            fprintf(file, "\n");
+            j += n;
+          }
+          fprintf(file, "\n");
+        }
+        fprintf(file, "[code cave end]\n20000001\n\n");
       }
     }
     fclose(file);
@@ -7785,7 +8510,7 @@ void SaveCheatsToDir(const std::string &directory, bool append = false) {
 }
 
 void SaveCheatsToFile() {
-  SaveCheatsToDir("sdmc:/switch/breeze/cheats/" + GetTitleIdString() + "/");
+  SaveCheatsToDir(GameDir());
 }
 
 void LoadToggles(const std::string &path) {
@@ -7838,8 +8563,7 @@ bool TryDownloadCheats(bool notify = true) {
   std::string bid_low = ult::stringToLowercase(bid);
 
   std::string title = tid;
-  std::string titleFilePath =
-      "sdmc:/switch/breeze/cheats/" + tid + "/title.txt";
+  std::string titleFilePath = GameDir() + "title.txt";
   if (ult::isFile(titleFilePath)) {
     std::ifstream tfile(titleFilePath);
     if (std::getline(tfile, title))
@@ -7882,7 +8606,7 @@ bool TryDownloadCheats(bool notify = true) {
     return false;
   }
 
-  std::string targetDir = "sdmc:/switch/breeze/cheats/" + tid + "/";
+  std::string targetDir = GameDir();
   ult::createDirectory(targetDir);
   std::string dest = targetDir + bid + ".txt";
 
@@ -10633,8 +11357,7 @@ public:
     DmntCheatProcessMetadata metadata;
     if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
       std::stringstream ss;
-      ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16)
-         << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+      ss << CheatUtils::GameDir() << "notes.txt";
       m_notesPath = ss.str();
     }
 
@@ -13241,8 +13964,7 @@ public:
     }
     if (m_notesPath.empty()) {
       std::stringstream ss;
-      ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16)
-         << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+      ss << CheatUtils::GameDir() << "notes.txt";
       m_notesPath = ss.str();
     }
     if (!m_fontLoaded && !m_notesPath.empty()) {
@@ -14838,9 +15560,7 @@ public:
 
         if (m_notesPath.empty()) {
           std::stringstream ss;
-          ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0')
-             << std::setw(16) << std::uppercase << std::hex << metadata.title_id
-             << "/notes.txt";
+          ss << CheatUtils::GameDir() << "notes.txt";
           m_notesPath = ss.str();
         }
 
@@ -14903,7 +15623,7 @@ public:
         if (titleStr.empty()) {
           titleStr = tidStr;
           std::string titleFilePath =
-              "sdmc:/switch/breeze/cheats/" + tidStr + "/title.txt";
+              CheatUtils::GameDir() + "title.txt";
           if (ult::isFile(titleFilePath)) {
             std::ifstream tfile(titleFilePath);
             if (std::getline(tfile, titleStr))
@@ -15028,8 +15748,7 @@ public:
     std::string notesPath;
     if (R_SUCCEEDED(dmntchtGetCheatProcessMetadata(&metadata))) {
       std::stringstream ss;
-      ss << "sdmc:/switch/breeze/cheats/" << std::setfill('0') << std::setw(16)
-         << std::uppercase << std::hex << metadata.title_id << "/notes.txt";
+      ss << CheatUtils::GameDir() << "notes.txt";
       m_notesPath = ss.str();
     }
 
@@ -15054,6 +15773,8 @@ public:
       std::vector<DmntCheatEntry> cheats(cheatCount);
       if (R_SUCCEEDED(
               dmntchtGetCheats(cheats.data(), cheatCount, 0, &cheatCount))) {
+
+        CheatUtils::FillCavesOfEnabledHooks();
 
         if (!g_cheatFolderNameStack.empty()) {
           auto *backItem = new tsl::elm::ListItem(".. [Back]");
@@ -15161,8 +15882,17 @@ public:
             } else {
               auto *toggleItem = new CheatUtils::CheatToggleItem(
                   displayName, cheat.enabled, cheat.cheat_id, m_cheatFontSize);
-              toggleItem->setStateChangedListener(
-                  [cheat](bool state) { dmntchtToggleCheat(cheat.cheat_id); });
+              toggleItem->setStateChangedListener([cheat,
+                                                   displayName](bool state) {
+                dmntchtToggleCheat(cheat.cheat_id);
+                // A mod value turned on turns the others off: draw again.
+                if (CheatUtils::AfterCheatToggled(cheat.cheat_id)) {
+                  jumpItemName = displayName;
+                  jumpItemExactMatch.store(true, release);
+                  skipJumpReset.store(true, release);
+                  refreshPage.store(true, std::memory_order_release);
+                }
+              });
               item = toggleItem;
             }
 
@@ -15263,7 +15993,7 @@ public:
         std::string tidStr = CheatUtils::GetTitleIdString();
         std::string bidStr = CheatUtils::GetBuildIdString();
         std::string localPath =
-            "sdmc:/switch/breeze/cheats/" + tidStr + "/" + bidStr + ".txt";
+            CheatUtils::GameDir() + bidStr + ".txt";
 
         if (ult::isFile(localPath)) {
           if (CheatUtils::ParseCheats(localPath)) {
@@ -17492,8 +18222,7 @@ static bool ReadBookmarkFile(const std::string &path,
 
 // Build per-game bookmark directory.
 static std::string GameBookmarkDir() {
-  return std::string("sdmc:/switch/breeze/cheats/") +
-         CheatUtils::GetTitleIdString() + "/";
+  return CheatUtils::GameDir();
 }
 
 // Build path to a specific bookmark file. fileNo: -1 = default (no suffix),
@@ -21127,9 +21856,8 @@ tsl::elm::Element *CheatMenu::createUI() {
       std::string bid = CheatUtils::GetBuildIdString();
       std::string tid = CheatUtils::GetTitleIdString();
       std::string path =
-          "sdmc:/switch/breeze/cheats/" + tid + "/" + bid + ".txt";
-      std::string toggles =
-          "sdmc:/switch/breeze/cheats/" + tid + "/toggles.txt";
+          CheatUtils::GameDir() + bid + ".txt";
+      std::string toggles = CheatUtils::GameDir() + "toggles.txt";
 
       if (CheatUtils::ParseCheats(path)) {
         CheatUtils::LoadToggles(toggles);
@@ -21213,8 +21941,7 @@ tsl::elm::Element *CheatMenu::createUI() {
     auto *saveToBreezeItem = new tsl::elm::ListItem("Save to File (Breeze)");
     saveToBreezeItem->setClickListener([this](u64 keys) {
       if (keys & KEY_A) {
-        CheatUtils::SaveCheatsToDir("sdmc:/switch/breeze/cheats/" +
-                                    CheatUtils::GetTitleIdString() + "/");
+        CheatUtils::SaveCheatsToDir(CheatUtils::GameDir());
         tsl::notification->show("Saved to Breeze directory");
         refreshPage.store(true, std::memory_order_release);
         tsl::goBack();
