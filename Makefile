@@ -57,7 +57,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:= Breezehand
 APP_AUTHOR	:= tomvita
-APP_VERSION	:= 0.10.4
+APP_VERSION	:= 0.10.5
 TARGET		:= breezehand
 BUILD		:= build
 SOURCES		:= source common ../capstone ../capstone/arch/AArch64

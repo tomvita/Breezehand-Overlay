@@ -36,6 +36,7 @@
 #include <tesla.hpp>
 #include <ultra.hpp>
 
+#include "code_patch.hpp"
 #include "disasm.hpp"
 #include <dmntcht.h>
 #include <cctype>
@@ -8118,6 +8119,126 @@ static bool IsDefaultName(const char *name) {
   return n.size() > 10 && n.compare(n.size() - 10, 10, " (default)") == 0;
 }
 
+// R1 as the master cheat leaves it: main + R1 = a loaded module's code, which
+// Breeze's code-patch cheats reach with 04010000 stores. Breezehand runs no
+// cheat VM, so the master's register steps are worked out here, as Breeze's
+// get_D1 does: register loads from memory (5), statics (4) and arithmetic
+// (7, 9). Other opcodes (stores, conditions) are passed over. Read only.
+static bool MasterR1(const DmntCheatProcessMetadata &md, u64 &r1) {
+  DmntCheatEntry master;
+  if (R_FAILED(dmntchtGetCheatById(&master, 0)) ||
+      master.definition.num_opcodes == 0)
+    return false;
+  const u32 *op = master.definition.opcodes;
+  const u32 n = master.definition.num_opcodes;
+  u64 reg[16] = {};
+  auto base = [&](u32 m) -> u64 {
+    return m == 0 ? md.main_nso_extents.base
+         : m == 1 ? md.heap_extents.base
+         : m == 2 ? md.alias_extents.base
+         : m == 3 ? md.address_space_extents.base
+                  : 0;
+  };
+  auto mask = [](u32 width, u64 v) -> u64 {
+    return width >= 8 ? v : (v & ((1ULL << (8 * width)) - 1));
+  };
+  auto math = [&](u32 width, u32 kind, u64 a, u64 b, u64 &out) -> bool {
+    switch (kind) {
+    case 0: out = a + b; break;
+    case 1: out = a - b; break;
+    case 2: out = a * b; break;
+    case 3: out = a << b; break;
+    case 4: out = a >> b; break;
+    case 5: out = a & b; break;
+    case 6: out = a | b; break;
+    case 7: out = ~a; break;
+    case 8: out = a ^ b; break;
+    case 9: out = a; break;
+    default: return false;
+    }
+    out = mask(width, out);
+    return true;
+  };
+  for (u32 i = 0; i < n;) {
+    const u32 len = breeze_core::codepatch::opcode_words(op + i, n - i);
+    if (len == 0)
+      return false;
+    const u32 w = op[i];
+    const u32 type = w >> 28, width = (w >> 24) & 0xF;
+    const u32 r = (w >> 16) & 0xF;
+    if (type == 0x4) { // 400R0000 VVVVVVVV VVVVVVVV
+      reg[r] = (static_cast<u64>(op[i + 1]) << 32) | op[i + 2];
+    } else if (type == 0x5) { // 5TMRI0AA AAAAAAAA (I: 0 region, 1 register, 2 register S)
+      const u64 rel = (static_cast<u64>(w & 0xFF) << 32) | op[i + 1];
+      const u32 from = (w >> 12) & 0xF;
+      u64 at = 0;
+      if (from == 0)
+        at = base((w >> 20) & 0xF) + rel;
+      else if (from == 1)
+        at = reg[r] + rel;
+      else if (from == 2)
+        at = reg[(w >> 8) & 0xF] + rel;
+      else
+        return false;
+      u64 value = 0;
+      if (width == 0 || width > 8 ||
+          R_FAILED(dmntchtReadCheatProcessMemory(at, &value, width)))
+        return false;
+      reg[r] = value;
+    } else if (type == 0x7) { // 7T0RC000 VVVVVVVV
+      if (!math(width, (w >> 12) & 0xF, reg[r], op[i + 1], reg[r]))
+        return false;
+    } else if (type == 0x9) { // 9TCRS0s0, 9TCRS100 V(V)
+      const u32 kind = (w >> 20) & 0xF, s = (w >> 12) & 0xF;
+      u64 other = 0;
+      if ((w >> 8) & 0xF)
+        other = width == 8 ? (static_cast<u64>(op[i + 1]) << 32) | op[i + 2]
+                           : op[i + 1];
+      else
+        other = reg[(w >> 4) & 0xF];
+      if (!math(width, kind, reg[s], other, reg[r]))
+        return false;
+    }
+    i += len;
+  }
+  r1 = reg[1];
+  return r1 != 0;
+}
+
+// A code-patch cheat in Breeze's form (code_patch.hpp: the game's instructions
+// in a block that never runs) turned off: the originals go back where the
+// game still holds the patch; a word holding anything else is left alone.
+// False when the cheat is not in that form.
+static bool RestoreCodePatches(const DmntCheatProcessMetadata &md,
+                               const DmntCheatDefinition &d) {
+  namespace cp = breeze_core::codepatch;
+  cp::Parsed parsed;
+  if (!cp::parse(d.opcodes, d.num_opcodes, parsed))
+    return false;
+  u64 r1 = 0;
+  bool asked = false, have_r1 = false;
+  for (const auto &p : parsed.patches) {
+    if (p.hack == p.original)
+      continue;
+    u64 address = md.main_nso_extents.base + cp::rel_address(p);
+    if (cp::uses_r1(p)) {
+      if (!asked) {
+        asked = true;
+        have_r1 = MasterR1(md, r1);
+      }
+      if (!have_r1)
+        continue;
+      address += r1;
+    }
+    u32 now = 0;
+    if (R_FAILED(dmntchtReadCheatProcessMemory(address, &now, sizeof now)) ||
+        now != p.hack)
+      continue;
+    dmntchtWriteCheatProcessMemory(address, &p.original, sizeof p.original);
+  }
+  return true;
+}
+
 // After a cheat was toggled in the list.  True when other cheats changed
 // state too (the list needs drawing again).
 bool AfterCheatToggled(u32 cheat_id) {
@@ -8146,6 +8267,9 @@ bool AfterCheatToggled(u32 cheat_id) {
     }
     return false;
   }
+
+  if (!entry.enabled && RestoreCodePatches(md, entry.definition))
+    return false;
 
   EnsureModNames();
   const std::string mod = ModOf(entry.definition.readable_name);
