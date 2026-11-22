@@ -110,8 +110,16 @@ inline uint32_t opcode_words(const uint32_t *op, uint32_t left) {
     return len <= left ? len : 0;
 }
 
+// Words of a keypress condition opening the cheat: 8kkkkkkk (1) or Breeze's extended
+// C4r00000 kkkkkkkk kkkkkkkk (3); 0 when it does not open with one.
+inline uint32_t key_length(const uint32_t *op, uint32_t n) {
+    if (n >= 1 && (op[0] >> 28) == 0x8) return 1;
+    if (n >= 3 && (op[0] >> 24) == 0xC4) return 3;
+    return 0;
+}
+
 struct Parsed {
-    uint32_t key = 0;          // the keypress word wrapping the cheat, 0 for none
+    std::vector<uint32_t> key; // the keypress condition wrapping the cheat (1 or 3 words), empty for none
     uint32_t block_at = 0;     // index of kNever
     uint32_t block_end = 0;    // index just after the block's kEnd
     std::vector<Patch> patches;
@@ -120,11 +128,8 @@ struct Parsed {
 // Reads a cheat in the form above. False for any other cheat (out is then unspecified).
 inline bool parse(const uint32_t *op, uint32_t n, Parsed &out) {
     out = Parsed{};
-    uint32_t i = 0;
-    if (n > 0 && (op[0] >> 28) == 0x8) {
-        out.key = op[0];
-        i = 1;
-    }
+    uint32_t i = key_length(op, n);
+    out.key.assign(op, op + i);
     if (i >= n || op[i] != kNever) return false;
     out.block_at = i++;
     while (i < n && op[i] != kEnd) {
@@ -163,9 +168,8 @@ inline bool parse(const uint32_t *op, uint32_t n, Parsed &out) {
 
 // The cheat's opcodes for patches: block, then the hacks in the same order; key, when not 0,
 // wraps the whole cheat.
-inline std::vector<uint32_t> build(const std::vector<Patch> &patches, uint32_t key = 0) {
-    std::vector<uint32_t> ops;
-    if (key) ops.push_back(key);
+inline std::vector<uint32_t> build(const std::vector<Patch> &patches, const std::vector<uint32_t> &key = {}) {
+    std::vector<uint32_t> ops(key);
     ops.push_back(kNever);
     for (const Patch &p : patches) {
         ops.push_back(p.header);
@@ -178,7 +182,7 @@ inline std::vector<uint32_t> build(const std::vector<Patch> &patches, uint32_t k
         ops.push_back(p.offset);
         ops.push_back(p.hack);
     }
-    if (key) ops.push_back(kEnd);
+    if (!key.empty()) ops.push_back(kEnd);
     return ops;
 }
 
